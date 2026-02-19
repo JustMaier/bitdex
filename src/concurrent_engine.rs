@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
 
 use crate::cache::TrieCache;
@@ -38,6 +39,7 @@ pub struct InnerEngine {
 pub struct ConcurrentEngine {
     inner: Arc<RwLock<InnerEngine>>,
     sender: MutationSender,
+    doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<DocStore>,
     config: Arc<Config>,
     in_flight: InFlightTracker,
@@ -84,6 +86,12 @@ impl ConcurrentEngine {
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Arc::new(config);
 
+        // Docstore write channel — bounded for backpressure, same capacity as mutation channel
+        let (doc_tx, doc_rx): (Sender<(u32, StoredDoc)>, Receiver<(u32, StoredDoc)>) =
+            crossbeam_channel::bounded(config.channel_capacity);
+
+        let docstore = Arc::new(docstore);
+
         // Collect filter field names for cache invalidation in the flush thread
         let filter_field_names: Vec<String> = config
             .filter_fields
@@ -94,6 +102,7 @@ impl ConcurrentEngine {
         let flush_handle = {
             let inner = Arc::clone(&inner);
             let shutdown = Arc::clone(&shutdown);
+            let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
             let field_names = filter_field_names;
 
@@ -101,10 +110,53 @@ impl ConcurrentEngine {
                 let min_sleep = Duration::from_micros(flush_interval_us);
                 let max_sleep = Duration::from_micros(flush_interval_us * 10); // 10x base = ~1ms at default
                 let mut current_sleep = min_sleep;
+                let mut doc_batch: Vec<(u32, StoredDoc)> = Vec::new();
 
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
 
+                    // Phase 1: Take write lock, flush bitmap mutations
+                    let bitmap_count = {
+                        let mut guard = inner.write();
+                        let ie = &mut *guard;
+                        let count = coalescer.flush(
+                            &mut ie.slots,
+                            &mut ie.filters,
+                            &mut ie.sorts,
+                        );
+
+                        if count > 0 {
+                            let mut cache = ie.cache.lock();
+                            for name in &field_names {
+                                cache.invalidate_field(name);
+                            }
+                        }
+                        count
+                    };
+                    // Write lock released here
+
+                    // Phase 2: Drain docstore channel and batch write OUTSIDE the RwLock
+                    // (redb has its own internal locking — no need to hold bitmap lock)
+                    doc_batch.clear();
+                    while let Ok(item) = doc_rx.try_recv() {
+                        doc_batch.push(item);
+                    }
+                    let doc_count = doc_batch.len();
+                    if doc_count > 0 {
+                        if let Err(e) = docstore.put_batch(&doc_batch) {
+                            eprintln!("docstore batch write failed: {e}");
+                        }
+                    }
+
+                    if bitmap_count > 0 || doc_count > 0 {
+                        current_sleep = min_sleep;
+                    } else {
+                        current_sleep = (current_sleep * 2).min(max_sleep);
+                    }
+                }
+
+                // Final flush on shutdown
+                {
                     let mut guard = inner.write();
                     let ie = &mut *guard;
                     let count = coalescer.flush(
@@ -112,34 +164,22 @@ impl ConcurrentEngine {
                         &mut ie.filters,
                         &mut ie.sorts,
                     );
-
                     if count > 0 {
-                        // Invalidate cache generations for all filter fields
                         let mut cache = ie.cache.lock();
                         for name in &field_names {
                             cache.invalidate_field(name);
                         }
-                        drop(cache);
-                        current_sleep = min_sleep;
-                    } else {
-                        // Exponential backoff when idle
-                        current_sleep = (current_sleep * 2).min(max_sleep);
                     }
-                    drop(guard);
                 }
 
-                // Final flush on shutdown
-                let mut guard = inner.write();
-                let ie = &mut *guard;
-                let count = coalescer.flush(
-                    &mut ie.slots,
-                    &mut ie.filters,
-                    &mut ie.sorts,
-                );
-                if count > 0 {
-                    let mut cache = ie.cache.lock();
-                    for name in &field_names {
-                        cache.invalidate_field(name);
+                // Final docstore drain
+                doc_batch.clear();
+                while let Ok(item) = doc_rx.try_recv() {
+                    doc_batch.push(item);
+                }
+                if !doc_batch.is_empty() {
+                    if let Err(e) = docstore.put_batch(&doc_batch) {
+                        eprintln!("docstore final batch write failed: {e}");
                     }
                 }
             })
@@ -148,7 +188,8 @@ impl ConcurrentEngine {
         Ok(Self {
             inner,
             sender,
-            docstore: Arc::new(docstore),
+            doc_tx,
+            docstore,
             config,
             in_flight: InFlightTracker::new(),
             shutdown,
@@ -163,24 +204,22 @@ impl ConcurrentEngine {
     /// 3. Read old doc from docstore if upsert
     /// 4. Diff old vs new -> MutationOps
     /// 5. Send ops to coalescer channel
-    /// 6. Write new doc to docstore
+    /// 6. Enqueue doc write to docstore channel (flush thread batches these)
     /// 7. Clear in-flight
     pub fn put(&self, id: u32, doc: &Document) -> Result<()> {
         self.in_flight.mark_in_flight(id);
 
         let result = (|| -> Result<()> {
-            // Check if this is an upsert (briefly take read lock)
-            let is_upsert = {
+            // Check alive status and allocation in a single read lock
+            let (is_upsert, was_allocated) = {
                 let guard = self.inner.read();
-                guard.slots.is_alive(id)
-            };
-
-            // Check if slot was ever allocated (for stale bit cleanup)
-            let was_allocated = if !is_upsert {
-                let guard = self.inner.read();
-                guard.slots.was_ever_allocated(id)
-            } else {
-                false
+                let alive = guard.slots.is_alive(id);
+                let alloc = if !alive {
+                    guard.slots.was_ever_allocated(id)
+                } else {
+                    false
+                };
+                (alive, alloc)
             };
 
             // Read old doc from docstore if needed
@@ -200,11 +239,15 @@ impl ConcurrentEngine {
                 )
             })?;
 
-            // Write new doc to docstore
+            // Enqueue doc write — flush thread will batch these into a single redb transaction
             let stored = StoredDoc {
                 fields: doc.fields.clone(),
             };
-            self.docstore.put(id, &stored)?;
+            self.doc_tx.send((id, stored)).map_err(|_| {
+                crate::error::BitdexError::CapacityExceeded(
+                    "docstore channel disconnected".to_string(),
+                )
+            })?;
 
             Ok(())
         })();

@@ -193,6 +193,8 @@ struct Args {
     json_output: bool,
     stages: Vec<String>,
     threads: usize,
+    channel_capacity: usize,
+    flush_interval_us: u64,
 }
 
 fn parse_args() -> Args {
@@ -202,6 +204,8 @@ fn parse_args() -> Args {
     let mut json_output = false;
     let mut stages = vec!["all".to_string()];
     let mut threads: usize = 1;
+    let mut channel_capacity: usize = 0; // 0 = auto
+    let mut flush_interval_us: u64 = 100;
 
     let mut i = 1;
     while i < args.len() {
@@ -225,6 +229,14 @@ fn parse_args() -> Args {
                 i += 1;
                 threads = args[i].parse().expect("--threads must be a number");
                 if threads == 0 { threads = 1; }
+            }
+            "--channel-capacity" => {
+                i += 1;
+                channel_capacity = args[i].parse().expect("--channel-capacity must be a number");
+            }
+            "--flush-interval-us" => {
+                i += 1;
+                flush_interval_us = args[i].parse().expect("--flush-interval-us must be a number");
             }
             other => {
                 eprintln!("Unknown argument: {other}");
@@ -250,7 +262,7 @@ fn parse_args() -> Args {
         std::process::exit(1);
     });
 
-    Args { data_path, limit, json_output, stages, threads }
+    Args { data_path, limit, json_output, stages, threads, channel_capacity, flush_interval_us }
 }
 
 fn should_run(stages: &[String], name: &str) -> bool {
@@ -562,10 +574,12 @@ fn main() {
     println!("  Bitdex V2 Benchmark Harness");
     println!("==========================================================");
     println!();
-    println!("Data:    {}", args.data_path.display());
-    println!("Limit:   {}", args.limit.map_or("all".to_string(), |n| n.to_string()));
-    println!("Threads: {}", args.threads);
-    println!("Stages:  {:?}", args.stages);
+    println!("Data:       {}", args.data_path.display());
+    println!("Limit:      {}", args.limit.map_or("all".to_string(), |n| n.to_string()));
+    println!("Threads:    {}", args.threads);
+    println!("Channel:    {}", if args.channel_capacity > 0 { args.channel_capacity.to_string() } else { "auto".to_string() });
+    println!("Flush us:   {}", args.flush_interval_us);
+    println!("Stages:     {:?}", args.stages);
     println!();
 
     let limit = args.limit.unwrap_or(usize::MAX);
@@ -687,7 +701,17 @@ fn main() {
         println!("  Loaded {} records in {:.2}s (parse + to_document)", records.len(), load_elapsed.as_secs_f64());
 
         let rss_before = rss_bytes();
-        let engine = Arc::new(ConcurrentEngine::new(civitai_config()).unwrap());
+        // Use tunable config for concurrent benchmarks
+        let mut config = civitai_config();
+        // Auto-size channel capacity: ~50 ops per doc * batch_count to avoid backpressure
+        if args.channel_capacity > 0 {
+            config.channel_capacity = args.channel_capacity;
+        } else {
+            config.channel_capacity = (records.len() * 50).max(100_000).min(10_000_000);
+        }
+        config.flush_interval_us = args.flush_interval_us;
+        println!("  Channel capacity: {}, flush interval: {}us", config.channel_capacity, config.flush_interval_us);
+        let engine = Arc::new(ConcurrentEngine::new(config).unwrap());
 
         // Split records into chunks for each thread
         let chunk_size = (records.len() + args.threads - 1) / args.threads;
@@ -698,7 +722,7 @@ fn main() {
 
         let total_inserted = Arc::new(AtomicUsize::new(0));
 
-        println!("  Inserting with {} threads ({} records/thread avg)...", args.threads, chunk_size);
+        println!("  Inserting with {} threads ({} records/thread avg, auto-coalesced)...", args.threads, chunk_size);
         let wall_start = Instant::now();
 
         let handles: Vec<_> = chunks
@@ -708,6 +732,7 @@ fn main() {
                 let counter = Arc::clone(&total_inserted);
                 thread::spawn(move || {
                     let mut count = 0usize;
+                    // Simple put() calls — docstore writes are auto-coalesced by the flush thread
                     for (id, doc) in &chunk {
                         engine.put(*id, doc).unwrap();
                         count += 1;

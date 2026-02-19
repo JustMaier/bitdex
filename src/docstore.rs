@@ -105,6 +105,34 @@ impl DocStore {
         Ok(())
     }
 
+    /// Store multiple documents in a single write transaction.
+    /// Much faster than calling put() in a loop since redb serializes write transactions.
+    pub fn put_batch(&self, docs: &[(u32, StoredDoc)]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(DOCS_TABLE)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            for (id, doc) in docs {
+                let bytes =
+                    bincode::serialize(doc).map_err(|e| BitdexError::DocStore(e.to_string()))?;
+                table
+                    .insert(*id, bytes.as_slice())
+                    .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        Ok(())
+    }
+
     /// Delete a document by slot ID.
     pub fn delete(&self, id: u32) -> Result<()> {
         let write_txn = self
