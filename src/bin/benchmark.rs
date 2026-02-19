@@ -11,7 +11,7 @@
 //!   --limit <N>       Max records to load (default: all)
 //!   --json            Output machine-readable JSON report
 //!   --stages <LIST>   Comma-separated stages to run: insert,update,query,concurrent,mixed,all (default: all)
-//!   --threads <N>     Number of threads for concurrent benchmarks (default: 1, >1 uses ConcurrentEngine)
+//!   --threads <N>     Number of threads for concurrent benchmarks (default: 4)
 //!   --in-memory-docstore  Use in-memory docstore instead of on-disk (default: on-disk)
 
 use std::collections::HashMap;
@@ -205,7 +205,7 @@ fn parse_args() -> Args {
     let mut limit: Option<usize> = None;
     let mut json_output = false;
     let mut stages = vec!["all".to_string()];
-    let mut threads: usize = 1;
+    let mut threads: usize = 4;
     let mut channel_capacity: usize = 0; // 0 = auto
     let mut flush_interval_us: u64 = 100;
     let mut remap_ids = false;
@@ -566,9 +566,9 @@ fn load_records(path: &PathBuf, limit: usize, remap_ids: bool) -> Vec<(u32, Docu
 
 /// Print a detailed bitmap memory breakdown from the ConcurrentEngine.
 fn print_bitmap_memory(engine: &ConcurrentEngine) {
-    let (slot_bytes, filter_bytes, sort_bytes, filter_details, sort_details) =
+    let (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details) =
         engine.bitmap_memory_report();
-    let total = slot_bytes + filter_bytes + sort_bytes;
+    let total = slot_bytes + filter_bytes + sort_bytes + cache_bytes;
 
     println!("--- Bitmap Memory (pure Bitdex, excludes docstore/allocator) ---");
     println!("  Slots (alive+clean):  {:>10}", format_bytes(slot_bytes as u64));
@@ -580,6 +580,7 @@ fn print_bitmap_memory(engine: &ConcurrentEngine) {
     for (name, bytes) in &sort_details {
         println!("    {:<22}              {:>10}", name, format_bytes(*bytes as u64));
     }
+    println!("  Trie cache:           {:>10}  ({} entries)", format_bytes(cache_bytes as u64), cache_entries);
     println!("  ----------------------------------------");
     println!("  Total bitmap memory:  {:>10}", format_bytes(total as u64));
     println!();
@@ -1208,6 +1209,9 @@ fn main() {
             });
         }
         println!();
+
+        // Show bitmap memory after queries (trie cache is now populated)
+        print_bitmap_memory(&engine);
     }
 
     // -----------------------------------------------------------------------

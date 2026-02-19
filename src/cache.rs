@@ -295,6 +295,24 @@ impl TrieCache {
         self.entry_count == 0
     }
 
+    /// Return the total serialized byte size of all cached bitmaps.
+    pub fn bitmap_bytes(&self) -> usize {
+        Self::node_bitmap_bytes(&self.root)
+    }
+
+    fn node_bitmap_bytes(node: &TrieNode) -> usize {
+        let self_bytes = node
+            .entry
+            .as_ref()
+            .map_or(0, |e| e.bitmap.serialized_size());
+        let child_bytes: usize = node
+            .children
+            .values()
+            .map(|c| Self::node_bitmap_bytes(c))
+            .sum();
+        self_bytes + child_bytes
+    }
+
     /// Clear all cached entries.
     pub fn clear(&mut self) {
         self.root = TrieNode::new();

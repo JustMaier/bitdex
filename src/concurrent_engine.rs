@@ -401,15 +401,21 @@ impl ConcurrentEngine {
 
     /// Report bitmap memory usage broken down by component (requires read lock).
     ///
-    /// Returns (slot_bytes, filter_bytes, sort_bytes, filter_details, sort_details)
+    /// Returns (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes,
+    ///          filter_details, sort_details)
     /// where all sizes are serialized bitmap bytes — no allocator or redb overhead.
+    #[allow(clippy::type_complexity)]
     pub fn bitmap_memory_report(
         &self,
-    ) -> (usize, usize, usize, Vec<(String, usize, usize)>, Vec<(String, usize)>) {
+    ) -> (usize, usize, usize, usize, usize, Vec<(String, usize, usize)>, Vec<(String, usize)>) {
         let guard = self.inner.read();
         let slot_bytes = guard.slots.bitmap_bytes();
         let filter_bytes = guard.filters.bitmap_bytes();
         let sort_bytes = guard.sorts.bitmap_bytes();
+        let cache = guard.cache.lock();
+        let cache_entries = cache.len();
+        let cache_bytes = cache.bitmap_bytes();
+        drop(cache);
         let filter_details: Vec<(String, usize, usize)> = guard
             .filters
             .per_field_bytes()
@@ -422,7 +428,7 @@ impl ConcurrentEngine {
             .into_iter()
             .map(|(name, bytes)| (name.to_string(), bytes))
             .collect();
-        (slot_bytes, filter_bytes, sort_bytes, filter_details, sort_details)
+        (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details)
     }
 
     /// Get a reference to the config.
