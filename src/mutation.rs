@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use roaring::RoaringBitmap;
 
 use crate::config::Config;
+use crate::docstore::{DocStore, StoredDoc};
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
 use crate::query::Value;
@@ -18,7 +19,7 @@ pub struct Document {
 }
 
 /// A field value in a mutation payload.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum FieldValue {
     /// Single value for single_value and boolean fields.
     Single(Value),
@@ -64,6 +65,7 @@ pub struct MutationEngine<'a> {
     filters: &'a mut FilterIndex,
     sorts: &'a mut SortIndex,
     config: &'a Config,
+    docstore: &'a DocStore,
 }
 
 impl<'a> MutationEngine<'a> {
@@ -72,59 +74,168 @@ impl<'a> MutationEngine<'a> {
         filters: &'a mut FilterIndex,
         sorts: &'a mut SortIndex,
         config: &'a Config,
+        docstore: &'a DocStore,
     ) -> Self {
         Self {
             slots,
             filters,
             sorts,
             config,
+            docstore,
         }
     }
 
     /// PUT(id, document) -- full replace with upsert semantics.
     ///
-    /// 1. Clear any old bits for this slot (handles both live updates and
-    ///    re-inserts of previously deleted slots with stale bits)
-    /// 2. Allocate slot (sets alive bit)
-    /// 3. Set filter bitmaps based on document fields
-    /// 4. Set sort layer bitmaps
+    /// If slot is alive (upsert): read old doc from docstore, diff each field,
+    /// update only the bitmaps that actually changed. O(changed fields).
+    ///
+    /// If slot is NOT alive (fresh insert): set all bitmaps directly. No diff needed.
+    ///
+    /// Always writes the new doc to docstore after bitmap updates.
     pub fn put(&mut self, id: u32, doc: &Document) -> Result<()> {
-        // Always clear old bits -- covers both live updates (upsert) and
-        // re-inserts of deleted slots that still have stale filter/sort bits.
-        // remove_from_all is a no-op for slots with no bits set.
-        for (_, field) in self.filters.fields_mut() {
-            field.remove_from_all(id);
-        }
-        for (_, sort_field) in self.sorts.fields_mut() {
-            sort_field.remove(id);
+        let is_upsert = self.slots.is_alive(id);
+
+        if is_upsert {
+            // Upsert: read old doc from docstore and diff
+            let old_doc = self.docstore.get(id)?;
+            self.diff_and_update(id, old_doc.as_ref(), doc)?;
+        } else {
+            // Fresh insert (or re-insert of dead slot with stale bits):
+            // If slot was ever allocated, it may have stale bits from before deletion.
+            // The docstore tells us exactly what those old bits were.
+            if self.slots.was_ever_allocated(id) {
+                let old_doc = self.docstore.get(id)?;
+                if let Some(old) = &old_doc {
+                    // Clear stale bits using the old doc (targeted, not scan-all)
+                    self.clear_old_bitmaps(id, old);
+                }
+            }
+
+            // Set all bitmaps for the new document
+            self.set_all_bitmaps(id, doc);
         }
 
-        // Allocate slot (sets alive bit)
+        // Allocate slot (sets alive bit) -- idempotent for upserts
         self.slots.allocate(id)?;
 
-        // Set filter bitmaps
+        // Write new doc to docstore
+        let stored = StoredDoc {
+            fields: doc.fields.clone(),
+        };
+        self.docstore.put(id, &stored)?;
+
+        Ok(())
+    }
+
+    /// Diff old vs new doc and update only changed bitmaps. Used for upserts.
+    fn diff_and_update(
+        &mut self,
+        id: u32,
+        old_doc: Option<&StoredDoc>,
+        new_doc: &Document,
+    ) -> Result<()> {
+        let empty_fields = HashMap::new();
+        let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
+
+        // Process filter fields
         for filter_config in &self.config.filter_fields {
-            if let Some(field_value) = doc.fields.get(&filter_config.name) {
+            let field_name = &filter_config.name;
+            let old_val = old_fields.get(field_name);
+            let new_val = new_doc.fields.get(field_name);
+
+            // Skip if both are identical
+            if Self::field_values_equal(old_val, new_val) {
+                continue;
+            }
+
+            if let Some(filter_field) = self.filters.get_field_mut(field_name) {
+                // Clear old bitmap bits
+                if let Some(old) = old_val {
+                    Self::clear_filter_bits(filter_field, id, old);
+                }
+                // Set new bitmap bits
+                if let Some(new) = new_val {
+                    Self::set_filter_bits(filter_field, id, new);
+                }
+            }
+        }
+
+        // Process sort fields
+        for sort_config in &self.config.sort_fields {
+            let field_name = &sort_config.name;
+            let old_val = old_fields.get(field_name);
+            let new_val = new_doc.fields.get(field_name);
+
+            if Self::field_values_equal(old_val, new_val) {
+                continue;
+            }
+
+            if let Some(sort_field) = self.sorts.get_field_mut(field_name) {
+                let old_sort = old_val.and_then(|v| {
+                    if let FieldValue::Single(val) = v {
+                        value_to_sort_u32(val)
+                    } else {
+                        None
+                    }
+                });
+                let new_sort = new_val.and_then(|v| {
+                    if let FieldValue::Single(val) = v {
+                        value_to_sort_u32(val)
+                    } else {
+                        None
+                    }
+                });
+
+                match (old_sort, new_sort) {
+                    (Some(old_s), Some(new_s)) => {
+                        sort_field.update(id, old_s, new_s);
+                    }
+                    (Some(_), None) => {
+                        sort_field.remove(id);
+                    }
+                    (None, Some(new_s)) => {
+                        sort_field.insert(id, new_s);
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear stale bitmaps for a dead slot being re-inserted, using the old stored doc.
+    fn clear_old_bitmaps(&mut self, id: u32, old_doc: &StoredDoc) {
+        for filter_config in &self.config.filter_fields {
+            if let Some(old_val) = old_doc.fields.get(&filter_config.name) {
                 if let Some(filter_field) = self.filters.get_field_mut(&filter_config.name) {
-                    match field_value {
-                        FieldValue::Single(val) => {
-                            if let Some(key) = value_to_bitmap_key(val) {
-                                filter_field.insert(key, id);
-                            }
-                        }
-                        FieldValue::Multi(vals) => {
-                            for val in vals {
-                                if let Some(key) = value_to_bitmap_key(val) {
-                                    filter_field.insert(key, id);
-                                }
-                            }
+                    Self::clear_filter_bits(filter_field, id, old_val);
+                }
+            }
+        }
+        for sort_config in &self.config.sort_fields {
+            if let Some(old_val) = old_doc.fields.get(&sort_config.name) {
+                if let Some(sort_field) = self.sorts.get_field_mut(&sort_config.name) {
+                    if let FieldValue::Single(val) = old_val {
+                        if value_to_sort_u32(val).is_some() {
+                            sort_field.remove(id);
                         }
                     }
                 }
             }
         }
+    }
 
-        // Set sort layer bitmaps
+    /// Set all bitmaps for a fresh insert (no diffing).
+    fn set_all_bitmaps(&mut self, id: u32, doc: &Document) {
+        for filter_config in &self.config.filter_fields {
+            if let Some(field_value) = doc.fields.get(&filter_config.name) {
+                if let Some(filter_field) = self.filters.get_field_mut(&filter_config.name) {
+                    Self::set_filter_bits(filter_field, id, field_value);
+                }
+            }
+        }
         for sort_config in &self.config.sort_fields {
             if let Some(field_value) = doc.fields.get(&sort_config.name) {
                 if let Some(sort_field) = self.sorts.get_field_mut(&sort_config.name) {
@@ -136,8 +247,76 @@ impl<'a> MutationEngine<'a> {
                 }
             }
         }
+    }
 
-        Ok(())
+    /// Compare two optional FieldValues for equality.
+    fn field_values_equal(a: Option<&FieldValue>, b: Option<&FieldValue>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(FieldValue::Single(va)), Some(FieldValue::Single(vb))) => {
+                Self::values_equal(va, vb)
+            }
+            (Some(FieldValue::Multi(va)), Some(FieldValue::Multi(vb))) => {
+                va.len() == vb.len()
+                    && va.iter().zip(vb.iter()).all(|(a, b)| Self::values_equal(a, b))
+            }
+            _ => false,
+        }
+    }
+
+    /// Compare two Values for equality.
+    fn values_equal(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Clear filter bitmap bits for a field value.
+    fn clear_filter_bits(
+        filter_field: &mut crate::filter::FilterField,
+        id: u32,
+        val: &FieldValue,
+    ) {
+        match val {
+            FieldValue::Single(v) => {
+                if let Some(key) = value_to_bitmap_key(v) {
+                    filter_field.remove(key, id);
+                }
+            }
+            FieldValue::Multi(vals) => {
+                for v in vals {
+                    if let Some(key) = value_to_bitmap_key(v) {
+                        filter_field.remove(key, id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set filter bitmap bits for a field value.
+    fn set_filter_bits(
+        filter_field: &mut crate::filter::FilterField,
+        id: u32,
+        val: &FieldValue,
+    ) {
+        match val {
+            FieldValue::Single(v) => {
+                if let Some(key) = value_to_bitmap_key(v) {
+                    filter_field.insert(key, id);
+                }
+            }
+            FieldValue::Multi(vals) => {
+                for v in vals {
+                    if let Some(key) = value_to_bitmap_key(v) {
+                        filter_field.insert(key, id);
+                    }
+                }
+            }
+        }
     }
 
     /// PATCH(id, partial_fields) -- merge only provided fields.
@@ -257,11 +436,12 @@ mod tests {
         }
     }
 
-    fn setup() -> (SlotAllocator, FilterIndex, SortIndex, Config) {
+    fn setup() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocStore) {
         let config = test_config();
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
+        let docstore = DocStore::open_temp().unwrap();
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -270,7 +450,7 @@ mod tests {
             sorts.add_field(sc.clone());
         }
 
-        (slots, filters, sorts, config)
+        (slots, filters, sorts, config, docstore)
     }
 
     fn make_doc(fields: Vec<(&str, FieldValue)>) -> Document {
@@ -284,8 +464,9 @@ mod tests {
 
     #[test]
     fn test_put_insert() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
 
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -338,8 +519,9 @@ mod tests {
 
     #[test]
     fn test_put_upsert_replaces_old_values() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
 
         let doc1 = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -381,8 +563,9 @@ mod tests {
 
     #[test]
     fn test_patch_filter_field() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
 
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -421,8 +604,9 @@ mod tests {
 
     #[test]
     fn test_patch_sort_field_uses_xor() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
 
         let doc = make_doc(vec![
             ("reactionCount", FieldValue::Single(Value::Integer(100))),
@@ -453,8 +637,9 @@ mod tests {
 
     #[test]
     fn test_patch_multi_value_field() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
 
         let doc = make_doc(vec![(
             "tagIds",
@@ -500,8 +685,9 @@ mod tests {
 
     #[test]
     fn test_delete_only_clears_alive() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
 
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -532,15 +718,17 @@ mod tests {
 
     #[test]
     fn test_delete_nonexistent() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
         assert!(engine.delete(999).is_err());
     }
 
     #[test]
     fn test_patch_nonexistent() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
         let patch = PatchPayload {
             fields: HashMap::new(),
         };
@@ -549,11 +737,12 @@ mod tests {
 
     #[test]
     fn test_delete_where() {
-        let (mut slots, mut filters, mut sorts, config) = setup();
+        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
 
         // Insert docs
         {
-            let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+            let mut engine =
+                MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
             for i in 0..10u32 {
                 let doc = make_doc(vec![(
                     "nsfwLevel",
@@ -564,8 +753,14 @@ mod tests {
         }
 
         // Get matching bitmap, then delete
-        let matching = filters.get_field("nsfwLevel").unwrap().get(1).unwrap().clone();
-        let mut engine = MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config);
+        let matching = filters
+            .get_field("nsfwLevel")
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .clone();
+        let mut engine =
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
         let deleted = engine.delete_where(&matching).unwrap();
         assert_eq!(deleted, 5);
         assert_eq!(slots.alive_count(), 5);

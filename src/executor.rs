@@ -165,6 +165,18 @@ impl<'a> QueryExecutor<'a> {
         })
     }
 
+    /// Check if a single slot matches all the given filter clauses.
+    /// Used by post-validation to revalidate slots that overlap with in-flight writes.
+    pub fn slot_matches_filters(&self, slot: u32, clauses: &[FilterClause]) -> Result<bool> {
+        for clause in clauses {
+            let bitmap = self.evaluate_clause(clause)?;
+            if !bitmap.contains(slot) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Compute the combined filter bitmap from a list of filter clauses.
     /// Top-level clauses are implicitly ANDed together.
     /// Clauses are expected to be pre-ordered by the planner for optimal evaluation.
@@ -431,6 +443,7 @@ mod tests {
         filters: FilterIndex,
         sorts: SortIndex,
         config: Config,
+        docstore: crate::docstore::DocStore,
     }
 
     impl TestHarness {
@@ -439,6 +452,7 @@ mod tests {
             let slots = SlotAllocator::new();
             let mut filters = FilterIndex::new();
             let mut sorts = SortIndex::new();
+            let docstore = crate::docstore::DocStore::open_temp().unwrap();
 
             for fc in &config.filter_fields {
                 filters.add_field(fc.clone());
@@ -447,7 +461,7 @@ mod tests {
                 sorts.add_field(sc.clone());
             }
 
-            Self { slots, filters, sorts, config }
+            Self { slots, filters, sorts, config, docstore }
         }
 
         fn put(&mut self, id: u32, doc: &Document) {
@@ -456,6 +470,7 @@ mod tests {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
+                &self.docstore,
             );
             engine.put(id, doc).unwrap();
         }
@@ -687,6 +702,7 @@ mod tests {
                 &mut h.filters,
                 &mut h.sorts,
                 &h.config,
+                &h.docstore,
             );
             engine.delete(1).unwrap();
         }

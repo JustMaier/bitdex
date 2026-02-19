@@ -222,6 +222,7 @@ mod tests {
         filters: FilterIndex,
         sorts: SortIndex,
         config: Config,
+        docstore: crate::docstore::DocStore,
     }
 
     impl TestHarness {
@@ -230,6 +231,7 @@ mod tests {
             let slots = SlotAllocator::new();
             let mut filters = FilterIndex::new();
             let mut sorts = SortIndex::new();
+            let docstore = crate::docstore::DocStore::open_temp().unwrap();
 
             for fc in &config.filter_fields {
                 filters.add_field(fc.clone());
@@ -238,7 +240,7 @@ mod tests {
                 sorts.add_field(sc.clone());
             }
 
-            Self { slots, filters, sorts, config }
+            Self { slots, filters, sorts, config, docstore }
         }
 
         fn put(&mut self, id: u32, doc: &Document) {
@@ -247,6 +249,7 @@ mod tests {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
+                &self.docstore,
             );
             engine.put(id, doc).unwrap();
         }

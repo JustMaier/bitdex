@@ -2,12 +2,12 @@
 
 ## What is Bitdex?
 
-Bitdex is a purpose-built, in-memory bitmap index engine written in Rust. Its only job is to take filter predicates and sort parameters and return an ordered list of integer IDs. It stores no documents. It serves no content. It is bitmaps all the way down.
+Bitdex is a purpose-built, in-memory bitmap index engine written in Rust. Its primary job is to take filter predicates and sort parameters and return an ordered list of integer IDs. Indexing is bitmaps all the way down.
 
 **In:** Filter predicates + sort field + sort direction + limit
 **Out:** Ordered `Vec<i64>` of IDs
 
-Everything else — document retrieval, content serving, full-text search — happens downstream.
+Documents are stored on disk (via an embedded key-value store like redb) keyed by slot ID. This serves two purposes: (1) enabling efficient targeted bitmap updates on upsert by diffing old vs new field values, and (2) optionally serving document content alongside query results. Full-text search happens downstream.
 
 ---
 
@@ -15,13 +15,13 @@ Everything else — document retrieval, content serving, full-text search — ha
 
 These are non-negotiable. Any agent working on this project MUST follow these rules. Violating them is grounds for rejecting a PR.
 
-1. **Everything is a bitmap.** There are no other data structures for indexed data. No Vecs for column storage. No skip lists. No sorted arrays. No forward maps. No reverse indexes. No document storage. The only non-bitmap structures are a HashMap for the trie cache and Prometheus metrics counters.
+1. **Bitmaps are the index.** All filtering and sorting is done via roaring bitmap operations. No Vecs for column storage. No skip lists. No sorted arrays. No forward maps. No reverse indexes as index structures.
 
-2. **No document storage.** Bitdex returns IDs only. If you're tempted to store field values, stop. That's what V1 did and it failed.
+2. **Documents are stored on disk.** An embedded key-value store (redb) stores documents keyed by slot ID. On upsert, the old document is read from disk, diffed against the new one, and only the changed bitmaps are updated. This makes writes O(changed fields) instead of O(all bitmaps). Documents can also be served alongside query results.
 
 3. **No sorted data structures.** No sorted Vecs, no skip lists, no B-trees for maintaining sort order. Sorting is done via bit-layer bitmap traversal. Period.
 
-4. **No forward maps, no reverse indexes.** WAL events carry old and new values. Diff from the event. For DELETE WHERE on high-cardinality fields, scan the bitmaps.
+4. **No in-memory forward maps or reverse indexes.** The on-disk document store replaces the need for these. On upsert, read old doc from disk to determine which bitmaps to update. For DELETE WHERE on high-cardinality fields, scan the bitmaps.
 
 5. **Deletes only clear the alive bit.** No cleanup of other bitmaps on delete. Autovac handles that in the background.
 
@@ -44,6 +44,16 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 - Deleted slots are NOT immediately recycled — the alive bitmap hides them
 - An autovac process periodically produces a clean bitmap of recycled slots
 - New inserts check the clean bitmap first (grab first set bit), append only if none available
+
+### Document Store
+
+- Embedded key-value store on disk (redb) keyed by slot ID
+- Stores the full document fields (filter values, sort values, multi-value arrays)
+- On PUT upsert: read old doc from disk, diff old vs new, update only changed bitmaps
+- On fresh insert (slot not alive): write doc to disk, set bitmaps directly — no diff needed
+- On DELETE: clear alive bit (doc stays on disk until autovac cleans it)
+- NVMe random reads are microseconds — disk lookup adds negligible latency to writes
+- Documents can optionally be returned alongside query result IDs
 
 ### Bitmap Categories
 
@@ -117,8 +127,9 @@ Postgres WAL consumer, backfill pipeline, shadow mode, end-to-end tests.
 | Filter bitmaps (all fields) | ~4.6-6.8GB |
 | Sort bitmaps (5 fields x 32 layers) | ~2.5-4GB |
 | Trie cache (configurable) | ~1-2GB |
-| **Total** | **~7-11GB** |
+| **Total in-memory** | **~7-11GB** |
 
+Document store on disk (redb): scales with document count, NVMe random reads are ~microseconds.
 Snapshot on disk with zstd compression: ~1-3GB.
 
 ---

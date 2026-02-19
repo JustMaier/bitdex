@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod concurrency;
 pub mod config;
+pub mod docstore;
 pub mod engine;
 pub mod error;
 pub mod executor;

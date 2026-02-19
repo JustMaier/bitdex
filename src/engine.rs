@@ -1,8 +1,10 @@
 use std::cell::RefCell;
+use std::path::Path;
 
 use crate::cache::TrieCache;
 use crate::concurrency::InFlightTracker;
 use crate::config::Config;
+use crate::docstore::DocStore;
 use crate::error::Result;
 use crate::executor::QueryExecutor;
 use crate::filter::FilterIndex;
@@ -23,18 +25,20 @@ pub struct Engine {
     sorts: SortIndex,
     cache: RefCell<TrieCache>,
     in_flight: InFlightTracker,
+    docstore: DocStore,
     config: Config,
 }
 
 impl Engine {
-    /// Create a new engine from configuration.
-    pub fn new(config: Config) -> Result<Self> {
+    /// Create a new engine with an on-disk docstore at the given path.
+    pub fn new_with_path(config: Config, docstore_path: &Path) -> Result<Self> {
         config.validate()?;
 
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
         let cache = TrieCache::new(config.cache.clone());
+        let docstore = DocStore::open(docstore_path)?;
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -49,6 +53,35 @@ impl Engine {
             sorts,
             cache: RefCell::new(cache),
             in_flight: InFlightTracker::new(),
+            docstore,
+            config,
+        })
+    }
+
+    /// Create a new engine with an in-memory docstore (for testing).
+    pub fn new(config: Config) -> Result<Self> {
+        config.validate()?;
+
+        let slots = SlotAllocator::new();
+        let mut filters = FilterIndex::new();
+        let mut sorts = SortIndex::new();
+        let cache = TrieCache::new(config.cache.clone());
+        let docstore = DocStore::open_temp()?;
+
+        for fc in &config.filter_fields {
+            filters.add_field(fc.clone());
+        }
+        for sc in &config.sort_fields {
+            sorts.add_field(sc.clone());
+        }
+
+        Ok(Self {
+            slots,
+            filters,
+            sorts,
+            cache: RefCell::new(cache),
+            in_flight: InFlightTracker::new(),
+            docstore,
             config,
         })
     }
@@ -72,6 +105,7 @@ impl Engine {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
+                &self.docstore,
             );
             engine.put(id, doc)
         };
@@ -100,6 +134,7 @@ impl Engine {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
+                &self.docstore,
             );
             engine.patch(id, patch)
         };
@@ -121,6 +156,7 @@ impl Engine {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
+                &self.docstore,
             );
             engine.delete(id)
         };
@@ -157,6 +193,7 @@ impl Engine {
             &mut self.filters,
             &mut self.sorts,
             &self.config,
+            &self.docstore,
         );
         engine.delete_where(&matching)
     }
@@ -169,13 +206,17 @@ impl Engine {
             &self.sorts,
             self.config.max_page_size,
         );
-        executor.execute_with_cache(
+        let mut result = executor.execute_with_cache(
             &query.filters,
             query.sort.as_ref(),
             query.limit,
             query.cursor.as_ref(),
             &mut self.cache.borrow_mut(),
-        )
+        )?;
+
+        // Post-validation: check for in-flight write overlap and revalidate
+        self.post_validate(&mut result, &query.filters, &executor)?;
+        Ok(result)
     }
 
     /// Execute a query from individual components.
@@ -191,7 +232,58 @@ impl Engine {
             &self.sorts,
             self.config.max_page_size,
         );
-        executor.execute_with_cache(filters, sort, limit, None, &mut self.cache.borrow_mut())
+        let mut result =
+            executor.execute_with_cache(filters, sort, limit, None, &mut self.cache.borrow_mut())?;
+
+        // Post-validation: check for in-flight write overlap and revalidate
+        self.post_validate(&mut result, filters, &executor)?;
+        Ok(result)
+    }
+
+    /// Post-validate query results against in-flight writes.
+    ///
+    /// After computing results, checks if any result IDs overlap with the
+    /// in-flight set. For overlapping IDs, re-checks if they still match
+    /// all filter predicates and are still alive. Removes any that no longer qualify.
+    fn post_validate(
+        &self,
+        result: &mut QueryResult,
+        filters: &[FilterClause],
+        executor: &QueryExecutor,
+    ) -> Result<()> {
+        // Fast path: no in-flight writes means nothing to revalidate
+        if !self.in_flight.has_in_flight() {
+            return Ok(());
+        }
+
+        let overlapping = self.in_flight.find_overlapping(&result.ids);
+        if overlapping.is_empty() {
+            return Ok(());
+        }
+
+        // Revalidate each overlapping slot: must be alive AND match all filters
+        let alive = self.slots.alive_bitmap();
+        let mut invalid_slots: Vec<u32> = Vec::new();
+
+        for slot in &overlapping {
+            // Check alive first (cheapest check)
+            if !alive.contains(*slot) {
+                invalid_slots.push(*slot);
+                continue;
+            }
+
+            // Check all filter predicates
+            if !executor.slot_matches_filters(*slot, filters)? {
+                invalid_slots.push(*slot);
+            }
+        }
+
+        // Remove invalid slots from results
+        if !invalid_slots.is_empty() {
+            result.ids.retain(|id| !invalid_slots.contains(&(*id as u32)));
+        }
+
+        Ok(())
     }
 
     /// Get the number of alive documents.
@@ -466,6 +558,133 @@ mod tests {
         };
 
         let result = engine.execute_query(&query).unwrap();
+        assert_eq!(result.ids, vec![1]);
+    }
+
+    #[test]
+    fn test_post_validation_removes_in_flight_slot_that_no_longer_matches() {
+        // Set up engine with 3 documents, all matching nsfwLevel=1
+        let mut engine = Engine::new(test_config()).unwrap();
+
+        engine.put(1, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+        ])).unwrap();
+        engine.put(2, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+        ])).unwrap();
+        engine.put(3, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+        ])).unwrap();
+
+        // Simulate a concurrent writer changing slot 2's nsfwLevel from 1 to 2:
+        // 1. Mark slot 2 as in-flight (writer does this before mutation)
+        engine.in_flight.mark_in_flight(2);
+
+        // 2. Mutate the filter bitmaps directly (simulating the write in progress)
+        //    Move slot 2 from nsfwLevel=1 bitmap to nsfwLevel=2 bitmap
+        let filter_field = engine.filters.get_field_mut("nsfwLevel").unwrap();
+        filter_field.remove(1, 2);  // remove from old value
+        filter_field.insert(2, 2);  // add to new value
+
+        // Now query for nsfwLevel=1. Without post-validation, slot 2 might
+        // still appear in results due to bitmap state during write.
+        // With post-validation, the reader should detect slot 2 is in-flight,
+        // revalidate it, find it no longer matches nsfwLevel=1, and remove it.
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            100,
+        ).unwrap();
+
+        // Slot 2 should NOT appear in results (it no longer matches nsfwLevel=1)
+        assert!(!result.ids.contains(&2), "in-flight slot that no longer matches should be removed");
+        // Slots 1 and 3 should still be present
+        assert!(result.ids.contains(&1));
+        assert!(result.ids.contains(&3));
+
+        // Clean up: clear the in-flight mark (writer would do this after mutation)
+        engine.in_flight.clear_in_flight(2);
+    }
+
+    #[test]
+    fn test_post_validation_keeps_in_flight_slot_that_still_matches() {
+        // Verify that post-validation does NOT remove an in-flight slot
+        // that still matches the filter predicates.
+        let mut engine = Engine::new(test_config()).unwrap();
+
+        engine.put(1, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+            ("reactionCount", FieldValue::Single(Value::Integer(100))),
+        ])).unwrap();
+        engine.put(2, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+            ("reactionCount", FieldValue::Single(Value::Integer(200))),
+        ])).unwrap();
+
+        // Mark slot 2 as in-flight (simulating a write to its sort field,
+        // which doesn't affect the filter predicate)
+        engine.in_flight.mark_in_flight(2);
+
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            100,
+        ).unwrap();
+
+        // Slot 2 still matches nsfwLevel=1, so it should remain in results
+        assert!(result.ids.contains(&1));
+        assert!(result.ids.contains(&2));
+
+        engine.in_flight.clear_in_flight(2);
+    }
+
+    #[test]
+    fn test_post_validation_removes_deleted_in_flight_slot() {
+        // If a slot is being deleted (alive bit cleared) while in-flight,
+        // post-validation should detect it's no longer alive and remove it.
+        let mut engine = Engine::new(test_config()).unwrap();
+
+        engine.put(1, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+        ])).unwrap();
+        engine.put(2, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+        ])).unwrap();
+
+        // Simulate a concurrent delete of slot 2:
+        // Mark in-flight, then clear the alive bit directly
+        engine.in_flight.mark_in_flight(2);
+        engine.slots_mut().delete(2).unwrap();
+
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            100,
+        ).unwrap();
+
+        // Slot 2 is dead — should not appear even if filter bitmaps still have it
+        assert_eq!(result.ids, vec![1]);
+
+        engine.in_flight.clear_in_flight(2);
+    }
+
+    #[test]
+    fn test_post_validation_no_overhead_when_no_in_flight() {
+        // When there are no in-flight writes, post-validation is a no-op
+        let mut engine = Engine::new(test_config()).unwrap();
+
+        engine.put(1, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+        ])).unwrap();
+
+        assert!(!engine.in_flight().has_in_flight());
+
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            100,
+        ).unwrap();
+
         assert_eq!(result.ids, vec![1]);
     }
 }
