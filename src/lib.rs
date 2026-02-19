@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod concurrency;
+pub mod concurrent_engine;
 pub mod config;
 pub mod docstore;
 pub mod engine;
@@ -13,3 +14,4 @@ pub mod query;
 pub mod slot;
 pub mod sort;
 pub mod types;
+pub mod write_coalescer;

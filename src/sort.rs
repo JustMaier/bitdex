@@ -75,18 +75,40 @@ impl SortField {
         }
     }
 
+    /// Bulk-set a bit layer for multiple slots. Slots should be sorted for performance.
+    pub fn set_layer_bulk(&mut self, bit: usize, slots: impl IntoIterator<Item = u32>) {
+        if let Some(layer) = self.bit_layers.get_mut(bit) {
+            layer.extend(slots);
+        }
+    }
+
+    /// Bulk-clear a bit layer for multiple slots.
+    pub fn clear_layer_bulk(&mut self, bit: usize, slots: &[u32]) {
+        if let Some(layer) = self.bit_layers.get_mut(bit) {
+            for &slot in slots {
+                layer.remove(slot);
+            }
+        }
+    }
+
     /// Get a reference to a specific bit layer.
     pub fn layer(&self, bit: usize) -> Option<&RoaringBitmap> {
         self.bit_layers.get(bit)
     }
 
-    /// Perform top-N sort traversal on a candidate set.
+    /// Perform top-N sort traversal on a candidate set using MSB-to-LSB bifurcation.
     ///
-    /// Traverses from MSB to LSB. At each layer:
+    /// Traverses from MSB to LSB using pure bitmap AND operations to narrow candidates:
     /// - For descending: prefer slots with the bit SET (higher values first)
     /// - For ascending: prefer slots with the bit CLEAR (lower values first)
     ///
-    /// Returns ordered slot IDs.
+    /// At each bit layer, the candidates are split into "preferred" (matching the desired
+    /// bit state) and "rest". If preferred has >= limit slots, narrow to preferred.
+    /// If preferred has < limit, those are all winners — collect them, reduce limit,
+    /// and continue with the rest.
+    ///
+    /// After collecting the top-N slot IDs, reconstructs values ONLY for those N slots
+    /// (not all candidates) to produce the final ordered output.
     pub fn top_n(
         &self,
         candidates: &RoaringBitmap,
@@ -98,69 +120,191 @@ impl SortField {
             return Vec::new();
         }
 
-        // Apply cursor: partition candidates into groups based on sort value relative to cursor
-        if let Some((cursor_sort_value, cursor_slot_id)) = cursor {
-            return self.top_n_with_cursor(
-                candidates,
-                limit,
-                descending,
-                cursor_sort_value,
-                cursor_slot_id,
-            );
-        }
-
-        // Collect all candidates with their reconstructed sort values
-        let mut entries: Vec<(u32, u32)> = Vec::new(); // (slot, value)
-        for slot in candidates.iter() {
-            let value = self.reconstruct_value(slot);
-            entries.push((slot, value));
-        }
-
-        // Sort by value
-        if descending {
-            entries.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+        // Apply cursor filtering if present
+        let effective_candidates;
+        let candidates = if let Some((cursor_sort_value, cursor_slot_id)) = cursor {
+            effective_candidates =
+                self.apply_cursor_filter(candidates, descending, cursor_sort_value, cursor_slot_id);
+            &effective_candidates
         } else {
-            entries.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            candidates
+        };
+
+        if candidates.is_empty() {
+            return Vec::new();
         }
 
-        entries.iter().take(limit).map(|(slot, _)| *slot).collect()
+        // MSB-to-LSB bifurcation: collect top-N slots via bitmap AND operations
+        let top_n_bitmap = self.bifurcate(candidates, limit, descending);
+
+        // Reconstruct values ONLY for the final top-N slots and sort them
+        self.order_results(&top_n_bitmap, descending)
     }
 
-    /// Top-N with cursor-based pagination.
-    fn top_n_with_cursor(
+    /// MSB-to-LSB bifurcation traversal.
+    ///
+    /// Walks bit layers from MSB to LSB, narrowing candidates at each layer.
+    /// Returns a bitmap containing exactly min(limit, candidates.len()) top slots.
+    fn bifurcate(
         &self,
         candidates: &RoaringBitmap,
         limit: usize,
         descending: bool,
-        cursor_sort_value: u64,
-        cursor_slot_id: u32,
-    ) -> Vec<u32> {
-        let cursor_value = cursor_sort_value as u32;
+    ) -> RoaringBitmap {
+        let total = candidates.len() as usize;
+        if total <= limit {
+            return candidates.clone();
+        }
 
-        let mut entries: Vec<(u32, u32)> = Vec::new();
-        for slot in candidates.iter() {
-            let value = self.reconstruct_value(slot);
-            let include = if descending {
-                // For descending: value < cursor_value, OR (value == cursor_value AND slot < cursor_slot_id)
-                value < cursor_value
-                    || (value == cursor_value && slot < cursor_slot_id)
+        // result accumulates confirmed winners; remaining is the working set
+        let mut result = RoaringBitmap::new();
+        let mut remaining = candidates.clone();
+        let mut remaining_limit = limit;
+
+        for bit in (0..self.num_bits).rev() {
+            if remaining_limit == 0 || remaining.is_empty() {
+                break;
+            }
+
+            let layer = &self.bit_layers[bit];
+
+            // preferred = slots that have the "better" bit value at this position
+            let preferred = if descending {
+                // Descending: prefer bit SET (higher values)
+                &remaining & layer
             } else {
-                // For ascending: value > cursor_value, OR (value == cursor_value AND slot > cursor_slot_id)
-                value > cursor_value
-                    || (value == cursor_value && slot > cursor_slot_id)
+                // Ascending: prefer bit CLEAR (lower values)
+                &remaining - layer
             };
-            if include {
-                entries.push((slot, value));
+
+            let preferred_count = preferred.len() as usize;
+
+            if preferred_count == 0 {
+                // No slots have the preferred bit — all remaining are equivalent at
+                // this layer, continue to next bit with the same remaining set
+                continue;
+            } else if preferred_count >= remaining_limit {
+                // More preferred slots than we need — narrow to preferred and continue
+                remaining = preferred;
+            } else {
+                // Fewer preferred slots than limit — all preferred are winners.
+                // Collect them, reduce limit, continue with the rest.
+                result |= &preferred;
+                remaining -= &preferred;
+                remaining_limit -= preferred_count;
             }
         }
 
-        if descending {
-            entries.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
-        } else {
-            entries.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        // After all layers, if we still need more slots, take them from remaining
+        if remaining_limit > 0 && !remaining.is_empty() {
+            // remaining slots all have equal sort values at this point;
+            // take up to remaining_limit from them
+            let mut taken = 0;
+            for slot in remaining.iter() {
+                if taken >= remaining_limit {
+                    break;
+                }
+                result.insert(slot);
+                taken += 1;
+            }
         }
 
-        entries.iter().take(limit).map(|(slot, _)| *slot).collect()
+        result
+    }
+
+    /// Order the top-N result bitmap into a sorted Vec.
+    ///
+    /// Reconstructs sort values ONLY for the small result set (not all candidates),
+    /// then sorts by value with slot ID tiebreaker.
+    fn order_results(&self, result_bitmap: &RoaringBitmap, descending: bool) -> Vec<u32> {
+        let mut entries: Vec<(u32, u32)> = result_bitmap
+            .iter()
+            .map(|slot| (slot, self.reconstruct_value(slot)))
+            .collect();
+
+        if descending {
+            entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+        } else {
+            entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        }
+
+        entries.into_iter().map(|(slot, _)| slot).collect()
+    }
+
+    /// Apply cursor-based filtering to candidates using bitmap operations.
+    ///
+    /// Walks bit layers from MSB to LSB, using the cursor's sort value bits to partition
+    /// candidates into "strictly better than cursor", "equal so far", and "strictly worse".
+    /// Only "strictly better" and the portion of "equal" that passes the slot ID tiebreaker
+    /// are retained.
+    fn apply_cursor_filter(
+        &self,
+        candidates: &RoaringBitmap,
+        descending: bool,
+        cursor_sort_value: u64,
+        cursor_slot_id: u32,
+    ) -> RoaringBitmap {
+        let cursor_value = cursor_sort_value as u32;
+
+        // We partition candidates into three groups as we descend bit layers:
+        // - confirmed: slots whose sort value is strictly "better" than cursor (definitely included)
+        // - equal: slots whose sort value matches cursor at all bits examined so far (still ambiguous)
+        // - excluded: everything else (dropped)
+        let mut confirmed = RoaringBitmap::new();
+        let mut equal = candidates.clone();
+
+        for bit in (0..self.num_bits).rev() {
+            if equal.is_empty() {
+                break;
+            }
+
+            let cursor_bit_set = (cursor_value >> bit) & 1 == 1;
+            let layer = &self.bit_layers[bit];
+
+            let equal_with_bit_set = &equal & layer;
+            let equal_with_bit_clear = &equal - layer;
+
+            if descending {
+                // Descending: we want slots with value LESS than cursor (they come after cursor)
+                if cursor_bit_set {
+                    // Cursor has bit set. Slots with bit clear have LOWER value → confirmed (after cursor).
+                    // Slots with bit set are still equal.
+                    confirmed |= &equal_with_bit_clear;
+                    equal = equal_with_bit_set;
+                } else {
+                    // Cursor has bit clear. Slots with bit set have HIGHER value → exclude (before cursor).
+                    // Slots with bit clear are still equal.
+                    equal = equal_with_bit_clear;
+                }
+            } else {
+                // Ascending: we want slots with value GREATER than cursor (they come after cursor)
+                if cursor_bit_set {
+                    // Cursor has bit set. Slots with bit clear have LOWER value → exclude (before cursor).
+                    // Slots with bit set are still equal.
+                    equal = equal_with_bit_set;
+                } else {
+                    // Cursor has bit clear. Slots with bit set have HIGHER value → confirmed (after cursor).
+                    // Slots with bit clear are still equal.
+                    confirmed |= &equal_with_bit_set;
+                    equal = equal_with_bit_clear;
+                }
+            }
+        }
+
+        // After all bits: `equal` contains slots with the exact same sort value as cursor.
+        // Apply slot ID tiebreaker.
+        for slot in equal.iter() {
+            let dominated = if descending {
+                slot < cursor_slot_id
+            } else {
+                slot > cursor_slot_id
+            };
+            if dominated {
+                confirmed.insert(slot);
+            }
+        }
+
+        confirmed
     }
 
     /// Reconstruct the sort value for a given slot by reading its bits.

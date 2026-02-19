@@ -56,6 +56,27 @@ impl FilterField {
         }
     }
 
+    /// Bulk-insert multiple slots into the bitmap for the given value.
+    /// Slots should be sorted for maximum roaring-rs `extend()` performance.
+    pub fn insert_bulk(&mut self, value: u64, slots: impl IntoIterator<Item = u32>) {
+        self.bitmaps
+            .entry(value)
+            .or_insert_with(RoaringBitmap::new)
+            .extend(slots);
+    }
+
+    /// Bulk-remove multiple slots from the bitmap for the given value.
+    pub fn remove_bulk(&mut self, value: u64, slots: &[u32]) {
+        if let Some(bm) = self.bitmaps.get_mut(&value) {
+            for &slot in slots {
+                bm.remove(slot);
+            }
+            if bm.is_empty() {
+                self.bitmaps.remove(&value);
+            }
+        }
+    }
+
     /// Clear a slot's bit from ALL bitmaps in this field.
     /// Used by autovac to clean dead slots from filter bitmaps.
     pub fn remove_from_all(&mut self, slot: u32) {

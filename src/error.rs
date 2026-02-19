@@ -24,4 +24,7 @@ pub enum BitdexError {
 
     #[error("capacity exceeded: {0}")]
     CapacityExceeded(String),
+
+    #[error("docstore error: {0}")]
+    DocStore(String),
 }

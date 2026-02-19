@@ -9,6 +9,7 @@ use crate::filter::FilterIndex;
 use crate::query::Value;
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
+use crate::write_coalescer::MutationOp;
 
 /// A document mutation payload for PUT operations.
 /// Contains field name -> value mappings for both filter and sort fields.
@@ -40,6 +41,300 @@ pub struct PatchPayload {
 pub struct PatchField {
     pub old: FieldValue,
     pub new: FieldValue,
+}
+
+/// Pure diff function: given old doc (if any), new doc, config, and slot ID,
+/// returns the list of MutationOps needed to update bitmaps.
+///
+/// This does NOT touch any bitmap state — it only computes what mutations
+/// are needed. Used by ConcurrentEngine to send ops to the coalescer channel.
+pub fn diff_document(
+    slot: u32,
+    old_doc: Option<&StoredDoc>,
+    new_doc: &Document,
+    config: &Config,
+    is_upsert: bool,
+) -> Vec<MutationOp> {
+    let mut ops = Vec::new();
+
+    if is_upsert {
+        // Upsert: diff old vs new, only emit ops for changed fields
+        let empty_fields = HashMap::new();
+        let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
+
+        for filter_config in &config.filter_fields {
+            let field_name = &filter_config.name;
+            let old_val = old_fields.get(field_name);
+            let new_val = new_doc.fields.get(field_name);
+
+            if field_values_equal(old_val, new_val) {
+                continue;
+            }
+
+            // Clear old filter bits
+            if let Some(old) = old_val {
+                collect_filter_remove_ops(&mut ops, field_name, slot, old);
+            }
+            // Set new filter bits
+            if let Some(new) = new_val {
+                collect_filter_insert_ops(&mut ops, field_name, slot, new);
+            }
+        }
+
+        for sort_config in &config.sort_fields {
+            let field_name = &sort_config.name;
+            let old_val = old_fields.get(field_name);
+            let new_val = new_doc.fields.get(field_name);
+
+            if field_values_equal(old_val, new_val) {
+                continue;
+            }
+
+            let old_sort = old_val.and_then(|v| match v {
+                FieldValue::Single(val) => value_to_sort_u32(val),
+                _ => None,
+            });
+            let new_sort = new_val.and_then(|v| match v {
+                FieldValue::Single(val) => value_to_sort_u32(val),
+                _ => None,
+            });
+
+            let num_bits = sort_config.bits as usize;
+            match (old_sort, new_sort) {
+                (Some(old_s), Some(new_s)) => {
+                    let diff = old_s ^ new_s;
+                    for bit in 0..num_bits {
+                        if (diff >> bit) & 1 == 1 {
+                            if (new_s >> bit) & 1 == 1 {
+                                ops.push(MutationOp::SortSet {
+                                    field: field_name.clone(),
+                                    bit_layer: bit,
+                                    slot,
+                                });
+                            } else {
+                                ops.push(MutationOp::SortClear {
+                                    field: field_name.clone(),
+                                    bit_layer: bit,
+                                    slot,
+                                });
+                            }
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    // Remove all sort layers
+                    for bit in 0..num_bits {
+                        ops.push(MutationOp::SortClear {
+                            field: field_name.clone(),
+                            bit_layer: bit,
+                            slot,
+                        });
+                    }
+                }
+                (None, Some(new_s)) => {
+                    for bit in 0..num_bits {
+                        if (new_s >> bit) & 1 == 1 {
+                            ops.push(MutationOp::SortSet {
+                                field: field_name.clone(),
+                                bit_layer: bit,
+                                slot,
+                            });
+                        }
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+    } else {
+        // Fresh insert: set all bitmaps, but first clear stale bits if old doc exists
+        if let Some(old) = old_doc {
+            for filter_config in &config.filter_fields {
+                if let Some(old_val) = old.fields.get(&filter_config.name) {
+                    collect_filter_remove_ops(&mut ops, &filter_config.name, slot, old_val);
+                }
+            }
+            for sort_config in &config.sort_fields {
+                if let Some(old_val) = old.fields.get(&sort_config.name) {
+                    if let FieldValue::Single(val) = old_val {
+                        if let Some(old_s) = value_to_sort_u32(val) {
+                            let num_bits = sort_config.bits as usize;
+                            for bit in 0..num_bits {
+                                if (old_s >> bit) & 1 == 1 {
+                                    ops.push(MutationOp::SortClear {
+                                        field: sort_config.name.clone(),
+                                        bit_layer: bit,
+                                        slot,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Set all new bitmaps
+        for filter_config in &config.filter_fields {
+            if let Some(field_value) = new_doc.fields.get(&filter_config.name) {
+                collect_filter_insert_ops(&mut ops, &filter_config.name, slot, field_value);
+            }
+        }
+        for sort_config in &config.sort_fields {
+            if let Some(field_value) = new_doc.fields.get(&sort_config.name) {
+                if let FieldValue::Single(val) = field_value {
+                    if let Some(sort_val) = value_to_sort_u32(val) {
+                        let num_bits = sort_config.bits as usize;
+                        for bit in 0..num_bits {
+                            if (sort_val >> bit) & 1 == 1 {
+                                ops.push(MutationOp::SortSet {
+                                    field: sort_config.name.clone(),
+                                    bit_layer: bit,
+                                    slot,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Alive insert (for both fresh insert and upsert — idempotent)
+    ops.push(MutationOp::AliveInsert { slot });
+
+    ops
+}
+
+/// Pure diff for PATCH: given old/new field values, returns MutationOps.
+pub fn diff_patch(slot: u32, patch: &PatchPayload, config: &Config) -> Vec<MutationOp> {
+    let mut ops = Vec::new();
+
+    for (field_name, change) in &patch.fields {
+        // Check if this is a filter field
+        let is_filter = config.filter_fields.iter().any(|f| f.name == *field_name);
+        if is_filter {
+            collect_filter_remove_ops(&mut ops, field_name, slot, &change.old);
+            collect_filter_insert_ops(&mut ops, field_name, slot, &change.new);
+        }
+
+        // Check if this is a sort field
+        if let Some(sort_config) = config.sort_fields.iter().find(|s| s.name == *field_name) {
+            if let (FieldValue::Single(old_val), FieldValue::Single(new_val)) =
+                (&change.old, &change.new)
+            {
+                if let (Some(old_sort), Some(new_sort)) =
+                    (value_to_sort_u32(old_val), value_to_sort_u32(new_val))
+                {
+                    let diff = old_sort ^ new_sort;
+                    let num_bits = sort_config.bits as usize;
+                    for bit in 0..num_bits {
+                        if (diff >> bit) & 1 == 1 {
+                            if (new_sort >> bit) & 1 == 1 {
+                                ops.push(MutationOp::SortSet {
+                                    field: field_name.clone(),
+                                    bit_layer: bit,
+                                    slot,
+                                });
+                            } else {
+                                ops.push(MutationOp::SortClear {
+                                    field: field_name.clone(),
+                                    bit_layer: bit,
+                                    slot,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ops
+}
+
+/// Collect FilterRemove ops for a field value.
+fn collect_filter_remove_ops(
+    ops: &mut Vec<MutationOp>,
+    field_name: &str,
+    slot: u32,
+    val: &FieldValue,
+) {
+    match val {
+        FieldValue::Single(v) => {
+            if let Some(key) = value_to_bitmap_key(v) {
+                ops.push(MutationOp::FilterRemove {
+                    field: field_name.to_string(),
+                    value: key,
+                    slot,
+                });
+            }
+        }
+        FieldValue::Multi(vals) => {
+            for v in vals {
+                if let Some(key) = value_to_bitmap_key(v) {
+                    ops.push(MutationOp::FilterRemove {
+                        field: field_name.to_string(),
+                        value: key,
+                        slot,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Collect FilterInsert ops for a field value.
+fn collect_filter_insert_ops(
+    ops: &mut Vec<MutationOp>,
+    field_name: &str,
+    slot: u32,
+    val: &FieldValue,
+) {
+    match val {
+        FieldValue::Single(v) => {
+            if let Some(key) = value_to_bitmap_key(v) {
+                ops.push(MutationOp::FilterInsert {
+                    field: field_name.to_string(),
+                    value: key,
+                    slot,
+                });
+            }
+        }
+        FieldValue::Multi(vals) => {
+            for v in vals {
+                if let Some(key) = value_to_bitmap_key(v) {
+                    ops.push(MutationOp::FilterInsert {
+                        field: field_name.to_string(),
+                        value: key,
+                        slot,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Compare two optional FieldValues for equality (public for reuse).
+fn field_values_equal(a: Option<&FieldValue>, b: Option<&FieldValue>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(FieldValue::Single(va)), Some(FieldValue::Single(vb))) => values_equal(va, vb),
+        (Some(FieldValue::Multi(va)), Some(FieldValue::Multi(vb))) => {
+            va.len() == vb.len()
+                && va.iter().zip(vb.iter()).all(|(a, b)| values_equal(a, b))
+        }
+        _ => false,
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::String(a), Value::String(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Convert a Value to a u64 bitmap key for filter indexing.

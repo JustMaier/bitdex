@@ -94,6 +94,13 @@ impl SlotAllocator {
         self.alive.contains(slot)
     }
 
+    /// Check if a slot was ever allocated (alive or dead with stale bits).
+    /// Returns true if the slot ID is below the high-water mark, meaning it
+    /// was previously used and may have stale filter/sort bits that need clearing.
+    pub fn was_ever_allocated(&self, slot: u32) -> bool {
+        slot < self.next_slot.load(Ordering::Relaxed)
+    }
+
     /// Get a reference to the alive bitmap. This is ANDed into every query.
     pub fn alive_bitmap(&self) -> &RoaringBitmap {
         &self.alive

@@ -42,6 +42,14 @@ pub struct Config {
     /// Prometheus metrics port.
     #[serde(default = "default_prometheus_port")]
     pub prometheus_port: u16,
+
+    /// Flush interval for the concurrent engine's background flush thread, in microseconds.
+    #[serde(default = "default_flush_interval_us")]
+    pub flush_interval_us: u64,
+
+    /// Bounded channel capacity for the write coalescer.
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
 }
 
 fn default_max_page_size() -> usize {
@@ -59,6 +67,12 @@ fn default_wal_flush_strategy() -> String {
 fn default_prometheus_port() -> u16 {
     9090
 }
+fn default_flush_interval_us() -> u64 {
+    100
+}
+fn default_channel_capacity() -> usize {
+    100_000
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -71,6 +85,8 @@ impl Default for Config {
             snapshot_interval_secs: default_snapshot_interval(),
             wal_flush_strategy: default_wal_flush_strategy(),
             prometheus_port: default_prometheus_port(),
+            flush_interval_us: default_flush_interval_us(),
+            channel_capacity: default_channel_capacity(),
         }
     }
 }

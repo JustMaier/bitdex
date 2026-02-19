@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["full"] }
 
 # Concurrency
 dashmap = "6"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
 
 # On-disk document store
 redb = "2"

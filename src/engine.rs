@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::path::Path;
 
 use crate::cache::TrieCache;
@@ -23,7 +23,7 @@ pub struct Engine {
     slots: SlotAllocator,
     filters: FilterIndex,
     sorts: SortIndex,
-    cache: RefCell<TrieCache>,
+    cache: Mutex<TrieCache>,
     in_flight: InFlightTracker,
     docstore: DocStore,
     config: Config,
@@ -51,7 +51,7 @@ impl Engine {
             slots,
             filters,
             sorts,
-            cache: RefCell::new(cache),
+            cache: Mutex::new(cache),
             in_flight: InFlightTracker::new(),
             docstore,
             config,
@@ -79,7 +79,7 @@ impl Engine {
             slots,
             filters,
             sorts,
-            cache: RefCell::new(cache),
+            cache: Mutex::new(cache),
             in_flight: InFlightTracker::new(),
             docstore,
             config,
@@ -95,7 +95,7 @@ impl Engine {
         // Invalidate cache for all filter fields in the document
         for field_name in doc.fields.keys() {
             if self.filters.get_field(field_name).is_some() {
-                self.cache.get_mut().invalidate_field(field_name);
+                self.cache.lock().invalidate_field(field_name);
             }
         }
 
@@ -124,7 +124,7 @@ impl Engine {
         // Invalidate cache for changed filter fields
         for field_name in patch.fields.keys() {
             if self.filters.get_field(field_name).is_some() {
-                self.cache.get_mut().invalidate_field(field_name);
+                self.cache.lock().invalidate_field(field_name);
             }
         }
 
@@ -178,7 +178,7 @@ impl Engine {
             None,
             u32::MAX as usize,
             None,
-            &mut self.cache.borrow_mut(),
+            &mut self.cache.lock(),
         )?;
 
         // Build a bitmap of matching slots
@@ -211,7 +211,7 @@ impl Engine {
             query.sort.as_ref(),
             query.limit,
             query.cursor.as_ref(),
-            &mut self.cache.borrow_mut(),
+            &mut self.cache.lock(),
         )?;
 
         // Post-validation: check for in-flight write overlap and revalidate
@@ -233,7 +233,7 @@ impl Engine {
             self.config.max_page_size,
         );
         let mut result =
-            executor.execute_with_cache(filters, sort, limit, None, &mut self.cache.borrow_mut())?;
+            executor.execute_with_cache(filters, sort, limit, None, &mut self.cache.lock())?;
 
         // Post-validation: check for in-flight write overlap and revalidate
         self.post_validate(&mut result, filters, &executor)?;
@@ -337,13 +337,13 @@ impl Engine {
     }
 
     /// Get a reference to the cache (for stats/admin).
-    pub fn cache(&self) -> &RefCell<TrieCache> {
+    pub fn cache(&self) -> &Mutex<TrieCache> {
         &self.cache
     }
 
     /// Run cache maintenance cycle (decay + eviction).
     pub fn cache_maintenance(&self) {
-        self.cache.borrow_mut().maintenance_cycle();
+        self.cache.lock().maintenance_cycle();
     }
 
     /// Get a reference to the in-flight tracker (for concurrent access).
