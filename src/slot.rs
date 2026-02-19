@@ -154,6 +154,11 @@ impl SlotAllocator {
     pub fn slot_counter(&self) -> u32 {
         self.next_slot.load(Ordering::Relaxed)
     }
+
+    /// Return the serialized byte size of all bitmaps owned by the slot allocator.
+    pub fn bitmap_bytes(&self) -> usize {
+        self.alive.serialized_size() + self.clean.serialized_size()
+    }
 }
 
 impl Default for SlotAllocator {

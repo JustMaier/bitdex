@@ -317,6 +317,11 @@ impl SortField {
         }
         value
     }
+
+    /// Return the serialized byte size of all bit layer bitmaps.
+    pub fn bitmap_bytes(&self) -> usize {
+        self.bit_layers.iter().map(|bm| bm.serialized_size()).sum()
+    }
 }
 
 /// Manages all sort fields.
@@ -356,6 +361,19 @@ impl SortIndex {
     /// Iterate mutably over all fields.
     pub fn fields_mut(&mut self) -> impl Iterator<Item = (&String, &mut SortField)> {
         self.fields.iter_mut()
+    }
+
+    /// Return the serialized byte size of all bitmaps across all sort fields.
+    pub fn bitmap_bytes(&self) -> usize {
+        self.fields.values().map(|f| f.bitmap_bytes()).sum()
+    }
+
+    /// Return per-field bitmap byte sizes (field_name, bytes).
+    pub fn per_field_bytes(&self) -> Vec<(&str, usize)> {
+        self.fields
+            .iter()
+            .map(|(name, f)| (name.as_str(), f.bitmap_bytes()))
+            .collect()
     }
 }
 

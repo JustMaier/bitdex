@@ -394,6 +394,37 @@ impl ConcurrentEngine {
         self.inner.read().slots.alive_count()
     }
 
+    /// Get the high-water mark slot counter (requires read lock).
+    pub fn slot_counter(&self) -> u32 {
+        self.inner.read().slots.slot_counter()
+    }
+
+    /// Report bitmap memory usage broken down by component (requires read lock).
+    ///
+    /// Returns (slot_bytes, filter_bytes, sort_bytes, filter_details, sort_details)
+    /// where all sizes are serialized bitmap bytes — no allocator or redb overhead.
+    pub fn bitmap_memory_report(
+        &self,
+    ) -> (usize, usize, usize, Vec<(String, usize, usize)>, Vec<(String, usize)>) {
+        let guard = self.inner.read();
+        let slot_bytes = guard.slots.bitmap_bytes();
+        let filter_bytes = guard.filters.bitmap_bytes();
+        let sort_bytes = guard.sorts.bitmap_bytes();
+        let filter_details: Vec<(String, usize, usize)> = guard
+            .filters
+            .per_field_bytes()
+            .into_iter()
+            .map(|(name, count, bytes)| (name.to_string(), count, bytes))
+            .collect();
+        let sort_details: Vec<(String, usize)> = guard
+            .sorts
+            .per_field_bytes()
+            .into_iter()
+            .map(|(name, bytes)| (name.to_string(), bytes))
+            .collect();
+        (slot_bytes, filter_bytes, sort_bytes, filter_details, sort_details)
+    }
+
     /// Get a reference to the config.
     pub fn config(&self) -> &Config {
         &self.config

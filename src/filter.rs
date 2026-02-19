@@ -142,6 +142,11 @@ impl FilterField {
     pub fn bitmap_count(&self) -> usize {
         self.bitmaps.len()
     }
+
+    /// Return the serialized byte size of all bitmaps in this field.
+    pub fn bitmap_bytes(&self) -> usize {
+        self.bitmaps.values().map(|bm| bm.serialized_size()).sum()
+    }
 }
 
 /// The type of a filter field, determining how values map to bitmaps.
@@ -198,6 +203,19 @@ impl FilterIndex {
     /// Get the total number of bitmaps across all fields.
     pub fn total_bitmap_count(&self) -> usize {
         self.fields.values().map(|f| f.bitmap_count()).sum()
+    }
+
+    /// Return the serialized byte size of all bitmaps across all fields.
+    pub fn bitmap_bytes(&self) -> usize {
+        self.fields.values().map(|f| f.bitmap_bytes()).sum()
+    }
+
+    /// Return per-field bitmap byte sizes (field_name, bitmap_count, bytes).
+    pub fn per_field_bytes(&self) -> Vec<(&str, usize, usize)> {
+        self.fields
+            .iter()
+            .map(|(name, f)| (name.as_str(), f.bitmap_count(), f.bitmap_bytes()))
+            .collect()
     }
 }
 

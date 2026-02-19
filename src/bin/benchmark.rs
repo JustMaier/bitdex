@@ -12,11 +12,12 @@
 //!   --json            Output machine-readable JSON report
 //!   --stages <LIST>   Comma-separated stages to run: insert,update,query,concurrent,mixed,all (default: all)
 //!   --threads <N>     Number of threads for concurrent benchmarks (default: 1, >1 uses ConcurrentEngine)
+//!   --in-memory-docstore  Use in-memory docstore instead of on-disk (default: on-disk)
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -24,7 +25,6 @@ use std::time::{Duration, Instant};
 
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
-use bitdex_v2::engine::Engine;
 use bitdex_v2::filter::FilterFieldType;
 use bitdex_v2::mutation::{Document, FieldValue};
 use bitdex_v2::query::{FilterClause, SortClause, SortDirection, Value};
@@ -195,6 +195,8 @@ struct Args {
     threads: usize,
     channel_capacity: usize,
     flush_interval_us: u64,
+    remap_ids: bool,
+    in_memory_docstore: bool,
 }
 
 fn parse_args() -> Args {
@@ -206,6 +208,8 @@ fn parse_args() -> Args {
     let mut threads: usize = 1;
     let mut channel_capacity: usize = 0; // 0 = auto
     let mut flush_interval_us: u64 = 100;
+    let mut remap_ids = false;
+    let mut in_memory_docstore = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -238,6 +242,12 @@ fn parse_args() -> Args {
                 i += 1;
                 flush_interval_us = args[i].parse().expect("--flush-interval-us must be a number");
             }
+            "--remap-ids" => {
+                remap_ids = true;
+            }
+            "--in-memory-docstore" => {
+                in_memory_docstore = true;
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -262,7 +272,7 @@ fn parse_args() -> Args {
         std::process::exit(1);
     });
 
-    Args { data_path, limit, json_output, stages, threads, channel_capacity, flush_interval_us }
+    Args { data_path, limit, json_output, stages, threads, channel_capacity, flush_interval_us, remap_ids, in_memory_docstore }
 }
 
 fn should_run(stages: &[String], name: &str) -> bool {
@@ -543,12 +553,49 @@ where
 
 /// Load records into a Vec for concurrent benchmarks (needs pre-parsed data
 /// so chunks can be distributed to threads).
-fn load_records(path: &PathBuf, limit: usize) -> Vec<(u32, Document)> {
+fn load_records(path: &PathBuf, limit: usize, remap_ids: bool) -> Vec<(u32, Document)> {
     let mut records = Vec::new();
+    let mut counter = 0u32;
     stream_records(path, limit, |rec| {
-        records.push((rec.id as u32, rec.to_document()));
+        let id = if remap_ids { counter } else { rec.id as u32 };
+        counter += 1;
+        records.push((id, rec.to_document()));
     });
     records
+}
+
+/// Print a detailed bitmap memory breakdown from the ConcurrentEngine.
+fn print_bitmap_memory(engine: &ConcurrentEngine) {
+    let (slot_bytes, filter_bytes, sort_bytes, filter_details, sort_details) =
+        engine.bitmap_memory_report();
+    let total = slot_bytes + filter_bytes + sort_bytes;
+
+    println!("--- Bitmap Memory (pure Bitdex, excludes docstore/allocator) ---");
+    println!("  Slots (alive+clean):  {:>10}", format_bytes(slot_bytes as u64));
+    println!("  Filter bitmaps:       {:>10}", format_bytes(filter_bytes as u64));
+    for (name, count, bytes) in &filter_details {
+        println!("    {:<22} {:>6} bitmaps  {:>10}", name, count, format_bytes(*bytes as u64));
+    }
+    println!("  Sort layer bitmaps:   {:>10}", format_bytes(sort_bytes as u64));
+    for (name, bytes) in &sort_details {
+        println!("    {:<22}              {:>10}", name, format_bytes(*bytes as u64));
+    }
+    println!("  ----------------------------------------");
+    println!("  Total bitmap memory:  {:>10}", format_bytes(total as u64));
+    println!();
+}
+
+/// Create a ConcurrentEngine with on-disk or in-memory docstore based on the flag.
+fn create_concurrent_engine(config: Config, bench_dir: &Path, label: &str, in_memory: bool) -> ConcurrentEngine {
+    if in_memory {
+        ConcurrentEngine::new(config).unwrap()
+    } else {
+        let db_path = bench_dir.join(format!("{}.redb", label));
+        if db_path.exists() {
+            std::fs::remove_file(&db_path).ok();
+        }
+        ConcurrentEngine::new_with_path(config, &db_path).unwrap()
+    }
 }
 
 /// Wait for the ConcurrentEngine flush thread to catch up.
@@ -579,8 +626,25 @@ fn main() {
     println!("Threads:    {}", args.threads);
     println!("Channel:    {}", if args.channel_capacity > 0 { args.channel_capacity.to_string() } else { "auto".to_string() });
     println!("Flush us:   {}", args.flush_interval_us);
+    println!("Remap IDs:  {}", args.remap_ids);
+    println!("Docstore:   {}", if args.in_memory_docstore { "in-memory" } else { "on-disk" });
     println!("Stages:     {:?}", args.stages);
     println!();
+
+    // Set up on-disk docstore directory next to the executable (cleaned up at end)
+    let bench_dir = std::env::current_exe()
+        .expect("failed to get exe path")
+        .parent()
+        .expect("exe has no parent dir")
+        .join("bitdex-bench-data");
+    if !args.in_memory_docstore {
+        if bench_dir.exists() {
+            std::fs::remove_dir_all(&bench_dir).ok();
+        }
+        std::fs::create_dir_all(&bench_dir).unwrap();
+        println!("Docstore dir: {}", bench_dir.display());
+        println!();
+    }
 
     let limit = args.limit.unwrap_or(usize::MAX);
 
@@ -616,10 +680,11 @@ fn main() {
     };
 
     // -----------------------------------------------------------------------
-    // Phase 2: Single-threaded insert benchmarks at varying batch sizes
+    // Phase 2: Insert benchmarks at varying batch sizes (ConcurrentEngine
+    //          for batched docstore writes even in single-threaded mode)
     // -----------------------------------------------------------------------
     if should_run(&args.stages, "insert") {
-        println!("--- Phase 2: Insert Benchmarks (single-threaded, Engine) ---");
+        println!("--- Phase 2: Insert Benchmarks (ConcurrentEngine, single caller) ---");
 
         let batch_sizes: Vec<usize> = vec![1_000, 10_000, 100_000, 500_000, 1_000_000, total_records]
             .into_iter()
@@ -640,24 +705,27 @@ fn main() {
             };
 
             let rss_before = rss_bytes();
-            let mut engine = Engine::new(civitai_config()).unwrap();
+            let engine = create_concurrent_engine(civitai_config(), &bench_dir, &format!("insert_{}", batch_size), args.in_memory_docstore);
             let mut insert_time = Duration::ZERO;
+            let mut id_counter = 0u32;
 
             let wall_start = Instant::now();
             stream_records(&args.data_path, batch_size, |rec| {
-                let id = rec.id as u32;
+                let id = if args.remap_ids { let v = id_counter; id_counter += 1; v } else { rec.id as u32 };
                 let doc = rec.to_document();
                 let put_start = Instant::now();
                 engine.put(id, &doc).unwrap();
                 insert_time += put_start.elapsed();
             });
+            // Wait for flush thread to apply all batched mutations
+            wait_for_flush(&engine, batch_size as u64, 30_000);
             let wall_elapsed = wall_start.elapsed();
             let rss_after = rss_bytes();
             let rss_delta = rss_after.saturating_sub(rss_before);
 
             let insert_rate = batch_size as f64 / insert_time.as_secs_f64();
 
-            println!("  [{:>12}] insert: {:.2}s  wall: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
+            println!("  [{:>12}] put: {:.2}s  wall: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
                 label,
                 insert_time.as_secs_f64(),
                 wall_elapsed.as_secs_f64(),
@@ -696,7 +764,7 @@ fn main() {
         println!("  Loading records into memory for thread distribution...");
 
         let load_start = Instant::now();
-        let records = load_records(&args.data_path, total_records);
+        let records = load_records(&args.data_path, total_records, args.remap_ids);
         let load_elapsed = load_start.elapsed();
         println!("  Loaded {} records in {:.2}s (parse + to_document)", records.len(), load_elapsed.as_secs_f64());
 
@@ -711,7 +779,7 @@ fn main() {
         }
         config.flush_interval_us = args.flush_interval_us;
         println!("  Channel capacity: {}, flush interval: {}us", config.channel_capacity, config.flush_interval_us);
-        let engine = Arc::new(ConcurrentEngine::new(config).unwrap());
+        let engine = Arc::new(create_concurrent_engine(config, &bench_dir, "concurrent_insert", args.in_memory_docstore));
 
         // Split records into chunks for each thread
         let chunk_size = (records.len() + args.threads - 1) / args.threads;
@@ -792,16 +860,19 @@ fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 3: Build the full engine (streaming from file, single-threaded)
+    // Phase 3: Build the full engine (streaming from file)
+    // Uses ConcurrentEngine for batched docstore writes.
     // -----------------------------------------------------------------------
     println!("--- Building full engine for update/query benchmarks ---");
-    let mut engine = Engine::new(civitai_config()).unwrap();
+    let engine = create_concurrent_engine(civitai_config(), &bench_dir, "full_engine", args.in_memory_docstore);
     let build_start = Instant::now();
+    let mut build_counter = 0u32;
     stream_records(&args.data_path, limit, |rec| {
-        let id = rec.id as u32;
+        let id = if args.remap_ids { let v = build_counter; build_counter += 1; v } else { rec.id as u32 };
         let doc = rec.to_document();
         engine.put(id, &doc).unwrap();
     });
+    wait_for_flush(&engine, total_records as u64, 60_000);
     let build_elapsed = build_start.elapsed();
     let rss = rss_bytes();
     println!("  Loaded {} records in {:.2}s", total_records, build_elapsed.as_secs_f64());
@@ -816,6 +887,9 @@ fn main() {
         alive_count: engine.alive_count(),
     });
 
+    // Bitmap memory breakdown (excludes redb, allocator, channels — pure Bitdex)
+    print_bitmap_memory(&engine);
+
     // -----------------------------------------------------------------------
     // Phase 4: Update/re-insert benchmark (re-reads file from top)
     // -----------------------------------------------------------------------
@@ -824,9 +898,10 @@ fn main() {
 
         let update_count = total_records.min(100_000);
         let mut update_time = Duration::ZERO;
+        let mut update_counter = 0u32;
         let wall_start = Instant::now();
         stream_records(&args.data_path, update_count, |rec| {
-            let id = rec.id as u32;
+            let id = if args.remap_ids { let v = update_counter; update_counter += 1; v } else { rec.id as u32 };
             let mut doc = rec.to_document();
             // Increment reactionCount by 1 to exercise sort layer XOR diff
             if let Some(FieldValue::Single(Value::Integer(ref mut v))) = doc.fields.get_mut("reactionCount") {
@@ -836,6 +911,7 @@ fn main() {
             engine.put(id, &doc).unwrap();
             update_time += put_start.elapsed();
         });
+        wait_for_flush(&engine, total_records as u64, 30_000);
         let wall_elapsed = wall_start.elapsed();
         let update_rate = update_count as f64 / update_time.as_secs_f64();
 
@@ -1148,9 +1224,9 @@ fn main() {
         // Load a subset of records for writing (use 50K or total if less)
         let mixed_record_count = total_records.min(50_000);
         println!("  Loading {} records for mixed benchmark...", mixed_record_count);
-        let records = load_records(&args.data_path, mixed_record_count);
+        let records = load_records(&args.data_path, mixed_record_count, args.remap_ids);
 
-        let engine = Arc::new(ConcurrentEngine::new(civitai_config()).unwrap());
+        let engine = Arc::new(create_concurrent_engine(civitai_config(), &bench_dir, "mixed_rw", args.in_memory_docstore));
 
         // Pre-populate with half the records so readers have data to query
         let prepop_count = records.len() / 2;
@@ -1305,6 +1381,11 @@ fn main() {
         let out_path = PathBuf::from("benchmark_report.json");
         std::fs::write(&out_path, &json).expect("Failed to write JSON report");
         println!("JSON report written to: {}", out_path.display());
+    }
+
+    // Clean up on-disk docstore
+    if !args.in_memory_docstore && bench_dir.exists() {
+        std::fs::remove_dir_all(&bench_dir).ok();
     }
 
     println!("==========================================================");
