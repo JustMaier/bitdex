@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::docstore::{DocStore, StoredDoc};
 use crate::error::Result;
 use crate::executor::QueryExecutor;
-use crate::mutation::{diff_document, diff_patch, Document, PatchPayload};
+use crate::mutation::{diff_document, diff_patch, Document, FieldRegistry, PatchPayload};
 use crate::query::{BitdexQuery, FilterClause, SortClause};
 use crate::types::QueryResult;
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
@@ -42,6 +42,7 @@ pub struct ConcurrentEngine {
     doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<DocStore>,
     config: Arc<Config>,
+    field_registry: FieldRegistry,
     in_flight: InFlightTracker,
     shutdown: Arc<AtomicBool>,
     flush_handle: Option<JoinHandle<()>>,
@@ -73,6 +74,7 @@ impl ConcurrentEngine {
             sorts.add_field(sc.clone());
         }
 
+        let field_registry = FieldRegistry::from_config(&config);
         let cache = TrieCache::new(config.cache.clone());
 
         let inner = Arc::new(RwLock::new(InnerEngine {
@@ -191,6 +193,7 @@ impl ConcurrentEngine {
             doc_tx,
             docstore,
             config,
+            field_registry,
             in_flight: InFlightTracker::new(),
             shutdown,
             flush_handle: Some(flush_handle),
@@ -230,7 +233,7 @@ impl ConcurrentEngine {
             };
 
             // Compute diff purely -> Vec<MutationOp>
-            let ops = diff_document(id, old_doc.as_ref(), doc, &self.config, is_upsert);
+            let ops = diff_document(id, old_doc.as_ref(), doc, &self.config, is_upsert, &self.field_registry);
 
             // Send ops to coalescer channel
             self.sender.send_batch(ops).map_err(|_| {
@@ -269,7 +272,7 @@ impl ConcurrentEngine {
                 }
             }
 
-            let ops = diff_patch(id, patch, &self.config);
+            let ops = diff_patch(id, patch, &self.config, &self.field_registry);
 
             self.sender.send_batch(ops).map_err(|_| {
                 crate::error::BitdexError::CapacityExceeded(
@@ -287,7 +290,7 @@ impl ConcurrentEngine {
     /// DELETE(id) -- send alive remove op to coalescer.
     pub fn delete(&self, id: u32) -> Result<()> {
         self.sender
-            .send(MutationOp::AliveRemove { slot: id })
+            .send(MutationOp::AliveRemove { slots: vec![id] })
             .map_err(|_| {
                 crate::error::BitdexError::CapacityExceeded(
                     "coalescer channel disconnected".to_string(),

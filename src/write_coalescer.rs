@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -6,50 +7,52 @@ use crate::filter::FilterIndex;
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
 
-/// A single bitmap mutation request submitted by any thread.
+/// A bitmap mutation request submitted by any thread.
+/// Field names use Arc<str> to avoid heap allocation per op.
+/// All variants carry `slots: Vec<u32>` for bulk grouping.
 #[derive(Debug, Clone)]
 pub enum MutationOp {
-    /// Set bit in a filter bitmap: field[value] |= slot
+    /// Set bits in a filter bitmap: field[value] |= slots
     FilterInsert {
-        field: String,
+        field: Arc<str>,
         value: u64,
-        slot: u32,
+        slots: Vec<u32>,
     },
-    /// Clear bit in a filter bitmap: field[value] &= !slot
+    /// Clear bits in a filter bitmap: field[value] &= !slots
     FilterRemove {
-        field: String,
+        field: Arc<str>,
         value: u64,
-        slot: u32,
+        slots: Vec<u32>,
     },
-    /// Set bit in a sort layer: field.bit_layers[bit_layer] |= slot
+    /// Set bits in a sort layer: field.bit_layers[bit_layer] |= slots
     SortSet {
-        field: String,
+        field: Arc<str>,
         bit_layer: usize,
-        slot: u32,
+        slots: Vec<u32>,
     },
-    /// Clear bit in a sort layer: field.bit_layers[bit_layer] &= !slot
+    /// Clear bits in a sort layer: field.bit_layers[bit_layer] &= !slots
     SortClear {
-        field: String,
+        field: Arc<str>,
         bit_layer: usize,
-        slot: u32,
+        slots: Vec<u32>,
     },
-    /// Set alive bit for a slot
-    AliveInsert { slot: u32 },
-    /// Clear alive bit for a slot
-    AliveRemove { slot: u32 },
+    /// Set alive bits for slots
+    AliveInsert { slots: Vec<u32> },
+    /// Clear alive bits for slots
+    AliveRemove { slots: Vec<u32> },
 }
 
 /// Key for grouping filter operations by target bitmap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FilterGroupKey {
-    field: String,
+    field: Arc<str>,
     value: u64,
 }
 
 /// Key for grouping sort operations by target bit layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SortGroupKey {
-    field: String,
+    field: Arc<str>,
     bit_layer: usize,
 }
 
@@ -110,43 +113,43 @@ impl WriteBatch {
 
         for op in self.ops.drain(..) {
             match op {
-                MutationOp::FilterInsert { field, value, slot } => {
+                MutationOp::FilterInsert { field, value, slots } => {
                     self.filter_inserts
                         .entry(FilterGroupKey { field, value })
                         .or_default()
-                        .push(slot);
+                        .extend(slots);
                 }
-                MutationOp::FilterRemove { field, value, slot } => {
+                MutationOp::FilterRemove { field, value, slots } => {
                     self.filter_removes
                         .entry(FilterGroupKey { field, value })
                         .or_default()
-                        .push(slot);
+                        .extend(slots);
                 }
                 MutationOp::SortSet {
                     field,
                     bit_layer,
-                    slot,
+                    slots,
                 } => {
                     self.sort_sets
                         .entry(SortGroupKey { field, bit_layer })
                         .or_default()
-                        .push(slot);
+                        .extend(slots);
                 }
                 MutationOp::SortClear {
                     field,
                     bit_layer,
-                    slot,
+                    slots,
                 } => {
                     self.sort_clears
                         .entry(SortGroupKey { field, bit_layer })
                         .or_default()
-                        .push(slot);
+                        .extend(slots);
                 }
-                MutationOp::AliveInsert { slot } => {
-                    self.alive_inserts.push(slot);
+                MutationOp::AliveInsert { slots } => {
+                    self.alive_inserts.extend(slots);
                 }
-                MutationOp::AliveRemove { slot } => {
-                    self.alive_removes.push(slot);
+                MutationOp::AliveRemove { slots } => {
+                    self.alive_removes.extend(slots);
                 }
             }
         }
@@ -345,34 +348,34 @@ mod tests {
     fn test_batch_groups_filter_inserts_by_key() {
         let mut batch = WriteBatch::new();
         batch.ops.push(MutationOp::FilterInsert {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
-            slot: 30,
+            slots: vec![30],
         });
         batch.ops.push(MutationOp::FilterInsert {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
-            slot: 10,
+            slots: vec![10],
         });
         batch.ops.push(MutationOp::FilterInsert {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
-            slot: 20,
+            slots: vec![20],
         });
         batch.ops.push(MutationOp::FilterInsert {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 2,
-            slot: 5,
+            slots: vec![5],
         });
 
         batch.group_and_sort();
 
         let key1 = FilterGroupKey {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
         };
         let key2 = FilterGroupKey {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 2,
         };
 
@@ -385,20 +388,20 @@ mod tests {
     fn test_batch_groups_filter_removes() {
         let mut batch = WriteBatch::new();
         batch.ops.push(MutationOp::FilterRemove {
-            field: "tagIds".into(),
+            field: Arc::from("tagIds"),
             value: 100,
-            slot: 20,
+            slots: vec![20],
         });
         batch.ops.push(MutationOp::FilterRemove {
-            field: "tagIds".into(),
+            field: Arc::from("tagIds"),
             value: 100,
-            slot: 10,
+            slots: vec![10],
         });
 
         batch.group_and_sort();
 
         let key = FilterGroupKey {
-            field: "tagIds".into(),
+            field: Arc::from("tagIds"),
             value: 100,
         };
         assert_eq!(batch.filter_removes[&key], vec![10, 20]); // sorted
@@ -408,29 +411,29 @@ mod tests {
     fn test_batch_groups_sort_ops() {
         let mut batch = WriteBatch::new();
         batch.ops.push(MutationOp::SortSet {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 3,
-            slot: 50,
+            slots: vec![50],
         });
         batch.ops.push(MutationOp::SortSet {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 3,
-            slot: 10,
+            slots: vec![10],
         });
         batch.ops.push(MutationOp::SortClear {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 5,
-            slot: 7,
+            slots: vec![7],
         });
 
         batch.group_and_sort();
 
         let set_key = SortGroupKey {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 3,
         };
         let clear_key = SortGroupKey {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 5,
         };
         assert_eq!(batch.sort_sets[&set_key], vec![10, 50]); // sorted
@@ -440,10 +443,10 @@ mod tests {
     #[test]
     fn test_batch_groups_alive_ops() {
         let mut batch = WriteBatch::new();
-        batch.ops.push(MutationOp::AliveInsert { slot: 30 });
-        batch.ops.push(MutationOp::AliveInsert { slot: 10 });
-        batch.ops.push(MutationOp::AliveInsert { slot: 20 });
-        batch.ops.push(MutationOp::AliveRemove { slot: 5 });
+        batch.ops.push(MutationOp::AliveInsert { slots: vec![30] });
+        batch.ops.push(MutationOp::AliveInsert { slots: vec![10] });
+        batch.ops.push(MutationOp::AliveInsert { slots: vec![20] });
+        batch.ops.push(MutationOp::AliveRemove { slots: vec![5] });
 
         batch.group_and_sort();
 
@@ -457,16 +460,16 @@ mod tests {
         // Insert in reverse order
         for slot in (0..100).rev() {
             batch.ops.push(MutationOp::FilterInsert {
-                field: "status".into(),
+                field: Arc::from("status"),
                 value: 1,
-                slot,
+                slots: vec![slot],
             });
         }
 
         batch.group_and_sort();
 
         let key = FilterGroupKey {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
         };
         let slots = &batch.filter_inserts[&key];
@@ -502,19 +505,19 @@ mod tests {
 
         let mut batch = WriteBatch::new();
         batch.ops.push(MutationOp::FilterInsert {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
-            slot: 10,
+            slots: vec![10],
         });
         batch.ops.push(MutationOp::FilterInsert {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
-            slot: 20,
+            slots: vec![20],
         });
         batch.ops.push(MutationOp::FilterInsert {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 2,
-            slot: 30,
+            slots: vec![30],
         });
 
         batch.group_and_sort();
@@ -543,14 +546,14 @@ mod tests {
 
         let mut batch = WriteBatch::new();
         batch.ops.push(MutationOp::FilterRemove {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
-            slot: 10,
+            slots: vec![10],
         });
         batch.ops.push(MutationOp::FilterRemove {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
-            slot: 30,
+            slots: vec![30],
         });
 
         batch.group_and_sort();
@@ -571,14 +574,14 @@ mod tests {
         let mut batch = WriteBatch::new();
         // Set bits 0 and 2 for slot 10 (value = 5 in binary: 101)
         batch.ops.push(MutationOp::SortSet {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 0,
-            slot: 10,
+            slots: vec![10],
         });
         batch.ops.push(MutationOp::SortSet {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 2,
-            slot: 10,
+            slots: vec![10],
         });
 
         batch.group_and_sort();
@@ -593,9 +596,9 @@ mod tests {
         // Now clear bit 0, so value becomes 4 (binary: 100)
         let mut batch2 = WriteBatch::new();
         batch2.ops.push(MutationOp::SortClear {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 0,
-            slot: 10,
+            slots: vec![10],
         });
 
         batch2.group_and_sort();
@@ -614,9 +617,9 @@ mod tests {
         let mut sorts = setup_sort_index();
 
         let mut batch = WriteBatch::new();
-        batch.ops.push(MutationOp::AliveInsert { slot: 10 });
-        batch.ops.push(MutationOp::AliveInsert { slot: 20 });
-        batch.ops.push(MutationOp::AliveInsert { slot: 30 });
+        batch.ops.push(MutationOp::AliveInsert { slots: vec![10] });
+        batch.ops.push(MutationOp::AliveInsert { slots: vec![20] });
+        batch.ops.push(MutationOp::AliveInsert { slots: vec![30] });
 
         batch.group_and_sort();
         batch.apply(&mut slots, &mut filters, &mut sorts);
@@ -627,7 +630,7 @@ mod tests {
 
         // Now remove slot 20
         let mut batch2 = WriteBatch::new();
-        batch2.ops.push(MutationOp::AliveRemove { slot: 20 });
+        batch2.ops.push(MutationOp::AliveRemove { slots: vec![20] });
 
         batch2.group_and_sort();
         batch2.apply(&mut slots, &mut filters, &mut sorts);
@@ -645,21 +648,21 @@ mod tests {
 
         let mut batch = WriteBatch::new();
         // Mix of all operation types
-        batch.ops.push(MutationOp::AliveInsert { slot: 100 });
+        batch.ops.push(MutationOp::AliveInsert { slots: vec![100] });
         batch.ops.push(MutationOp::FilterInsert {
-            field: "status".into(),
+            field: Arc::from("status"),
             value: 1,
-            slot: 100,
+            slots: vec![100],
         });
         batch.ops.push(MutationOp::SortSet {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 0,
-            slot: 100,
+            slots: vec![100],
         });
         batch.ops.push(MutationOp::SortSet {
-            field: "reactionCount".into(),
+            field: Arc::from("reactionCount"),
             bit_layer: 5,
-            slot: 100,
+            slots: vec![100],
         });
 
         batch.group_and_sort();
@@ -689,14 +692,14 @@ mod tests {
 
         let mut batch = WriteBatch::new();
         batch.ops.push(MutationOp::FilterInsert {
-            field: "nonexistent".into(),
+            field: Arc::from("nonexistent"),
             value: 1,
-            slot: 10,
+            slots: vec![10],
         });
         batch.ops.push(MutationOp::SortSet {
-            field: "nonexistent".into(),
+            field: Arc::from("nonexistent"),
             bit_layer: 0,
-            slot: 10,
+            slots: vec![10],
         });
 
         batch.group_and_sort();
@@ -712,7 +715,7 @@ mod tests {
         assert_eq!(coalescer.pending_count(), 0);
 
         sender
-            .send(MutationOp::AliveInsert { slot: 1 })
+            .send(MutationOp::AliveInsert { slots: vec![1] })
             .unwrap();
         assert_eq!(coalescer.pending_count(), 1);
     }
@@ -725,16 +728,16 @@ mod tests {
         let mut sorts = setup_sort_index();
 
         sender
-            .send(MutationOp::AliveInsert { slot: 10 })
+            .send(MutationOp::AliveInsert { slots: vec![10] })
             .unwrap();
         sender
-            .send(MutationOp::AliveInsert { slot: 20 })
+            .send(MutationOp::AliveInsert { slots: vec![20] })
             .unwrap();
         sender
             .send(MutationOp::FilterInsert {
-                field: "status".into(),
+                field: Arc::from("status"),
                 value: 1,
-                slot: 10,
+                slots: vec![10],
             })
             .unwrap();
 
@@ -770,17 +773,17 @@ mod tests {
 
         // First batch
         sender
-            .send(MutationOp::AliveInsert { slot: 10 })
+            .send(MutationOp::AliveInsert { slots: vec![10] })
             .unwrap();
         let count1 = coalescer.flush(&mut slots, &mut filters, &mut sorts);
         assert_eq!(count1, 1);
 
         // Second batch
         sender
-            .send(MutationOp::AliveInsert { slot: 20 })
+            .send(MutationOp::AliveInsert { slots: vec![20] })
             .unwrap();
         sender
-            .send(MutationOp::AliveInsert { slot: 30 })
+            .send(MutationOp::AliveInsert { slots: vec![30] })
             .unwrap();
         let count2 = coalescer.flush(&mut slots, &mut filters, &mut sorts);
         assert_eq!(count2, 2);
@@ -804,7 +807,7 @@ mod tests {
                     for i in 0..25u32 {
                         let slot = thread_id * 25 + i;
                         sender
-                            .send(MutationOp::AliveInsert { slot })
+                            .send(MutationOp::AliveInsert { slots: vec![slot] })
                             .unwrap();
                     }
                 })
@@ -828,9 +831,9 @@ mod tests {
         let mut sorts = setup_sort_index();
 
         let ops = vec![
-            MutationOp::AliveInsert { slot: 1 },
-            MutationOp::AliveInsert { slot: 2 },
-            MutationOp::AliveInsert { slot: 3 },
+            MutationOp::AliveInsert { slots: vec![1] },
+            MutationOp::AliveInsert { slots: vec![2] },
+            MutationOp::AliveInsert { slots: vec![3] },
         ];
         sender.send_batch(ops).unwrap();
 
@@ -848,10 +851,10 @@ mod tests {
 
         // Fill the channel
         sender
-            .send(MutationOp::AliveInsert { slot: 1 })
+            .send(MutationOp::AliveInsert { slots: vec![1] })
             .unwrap();
         sender
-            .send(MutationOp::AliveInsert { slot: 2 })
+            .send(MutationOp::AliveInsert { slots: vec![2] })
             .unwrap();
 
         // Channel is now full. Verify with try_send that it would block.
@@ -864,7 +867,7 @@ mod tests {
         let handle = thread::spawn(move || {
             // This will block until the channel is drained
             sender_clone
-                .send(MutationOp::AliveInsert { slot: 3 })
+                .send(MutationOp::AliveInsert { slots: vec![3] })
                 .unwrap();
         });
 
@@ -888,13 +891,13 @@ mod tests {
         let (mut coalescer, sender) = WriteCoalescer::new(3);
 
         sender
-            .send(MutationOp::AliveInsert { slot: 1 })
+            .send(MutationOp::AliveInsert { slots: vec![1] })
             .unwrap();
         sender
-            .send(MutationOp::AliveInsert { slot: 2 })
+            .send(MutationOp::AliveInsert { slots: vec![2] })
             .unwrap();
         sender
-            .send(MutationOp::AliveInsert { slot: 3 })
+            .send(MutationOp::AliveInsert { slots: vec![3] })
             .unwrap();
         assert_eq!(coalescer.pending_count(), 3);
 
@@ -908,10 +911,10 @@ mod tests {
 
         // Now we can send more
         sender
-            .send(MutationOp::AliveInsert { slot: 4 })
+            .send(MutationOp::AliveInsert { slots: vec![4] })
             .unwrap();
         sender
-            .send(MutationOp::AliveInsert { slot: 5 })
+            .send(MutationOp::AliveInsert { slots: vec![5] })
             .unwrap();
         assert_eq!(coalescer.pending_count(), 2);
     }
@@ -922,7 +925,7 @@ mod tests {
         let sender2 = coalescer.sender();
 
         sender2
-            .send(MutationOp::AliveInsert { slot: 42 })
+            .send(MutationOp::AliveInsert { slots: vec![42] })
             .unwrap();
         assert_eq!(coalescer.pending_count(), 1);
     }
@@ -937,31 +940,31 @@ mod tests {
 
         // "Insert" document at slot 42 with status=1, reactionCount=100 (bits: 0,2,5,6)
         let insert_ops = vec![
-            MutationOp::AliveInsert { slot: 42 },
+            MutationOp::AliveInsert { slots: vec![42] },
             MutationOp::FilterInsert {
-                field: "status".into(),
+                field: Arc::from("status"),
                 value: 1,
-                slot: 42,
+                slots: vec![42],
             },
             MutationOp::SortSet {
-                field: "reactionCount".into(),
+                field: Arc::from("reactionCount"),
                 bit_layer: 0,
-                slot: 42,
+                slots: vec![42],
             },
             MutationOp::SortSet {
-                field: "reactionCount".into(),
+                field: Arc::from("reactionCount"),
                 bit_layer: 2,
-                slot: 42,
+                slots: vec![42],
             },
             MutationOp::SortSet {
-                field: "reactionCount".into(),
+                field: Arc::from("reactionCount"),
                 bit_layer: 5,
-                slot: 42,
+                slots: vec![42],
             },
             MutationOp::SortSet {
-                field: "reactionCount".into(),
+                field: Arc::from("reactionCount"),
                 bit_layer: 6,
-                slot: 42,
+                slots: vec![42],
             },
         ];
         sender.send_batch(insert_ops).unwrap();
@@ -986,9 +989,9 @@ mod tests {
         // "Update" reactionCount from 101 to 100 (clear bit 0)
         sender
             .send(MutationOp::SortClear {
-                field: "reactionCount".into(),
+                field: Arc::from("reactionCount"),
                 bit_layer: 0,
-                slot: 42,
+                slots: vec![42],
             })
             .unwrap();
         coalescer.flush(&mut slots, &mut filters, &mut sorts);
@@ -1003,7 +1006,7 @@ mod tests {
 
         // "Delete" document (only clears alive bit per Bitdex design)
         sender
-            .send(MutationOp::AliveRemove { slot: 42 })
+            .send(MutationOp::AliveRemove { slots: vec![42] })
             .unwrap();
         coalescer.flush(&mut slots, &mut filters, &mut sorts);
 
