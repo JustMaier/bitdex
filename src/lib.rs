@@ -1,3 +1,5 @@
+pub mod cache;
+pub mod concurrency;
 pub mod config;
 pub mod engine;
 pub mod error;
@@ -5,6 +7,7 @@ pub mod executor;
 pub mod filter;
 pub mod mutation;
 pub mod parser;
+pub mod planner;
 pub mod query;
 pub mod slot;
 pub mod sort;

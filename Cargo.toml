@@ -19,6 +19,9 @@ toml = "0.8"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Concurrency
+dashmap = "6"
+
 # Error handling
 thiserror = "2"
 
@@ -37,6 +40,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 tempfile = "3"
 
+
 [[bench]]
 name = "engine_bench"
 harness = false
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"

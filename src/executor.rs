@@ -1,7 +1,9 @@
 use roaring::RoaringBitmap;
 
+use crate::cache::{self, CacheLookup, TrieCache};
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
+use crate::planner;
 use crate::query::{FilterClause, SortClause, SortDirection, Value};
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
@@ -17,6 +19,7 @@ fn value_to_bitmap_key(val: &Value) -> Option<u64> {
 }
 
 /// Query executor: computes filter intersections and sort traversals.
+/// Uses the query planner for cardinality-based clause ordering.
 pub struct QueryExecutor<'a> {
     slots: &'a SlotAllocator,
     filters: &'a FilterIndex,
@@ -39,7 +42,7 @@ impl<'a> QueryExecutor<'a> {
         }
     }
 
-    /// Execute a full query: filter -> sort -> paginate -> return IDs.
+    /// Execute a full query: plan -> filter -> sort -> paginate -> return IDs.
     pub fn execute(
         &self,
         filters: &[FilterClause],
@@ -49,18 +52,25 @@ impl<'a> QueryExecutor<'a> {
     ) -> Result<QueryResult> {
         let limit = limit.min(self.max_page_size);
 
-        // Step 1: Compute filter bitmap
-        let filter_bitmap = self.compute_filters(filters)?;
+        // Step 1: Plan the query (reorder clauses by cardinality)
+        let plan = planner::plan_query(filters, self.filters, self.slots);
 
-        // Step 2: AND with alive bitmap (implicit in every query)
+        // Step 2: Compute filter bitmap using planned clause order
+        let filter_bitmap = self.compute_filters(&plan.ordered_clauses)?;
+
+        // Step 3: AND with alive bitmap (implicit in every query)
         let alive = self.slots.alive_bitmap();
         let candidates = &filter_bitmap & alive;
 
         let total_matched = candidates.len();
 
-        // Step 3: Sort and paginate
+        // Step 4: Sort and paginate
         let (ids, next_cursor) = if let Some(sort_clause) = sort {
-            self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+            if plan.use_simple_sort {
+                self.simple_sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+            } else {
+                self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+            }
         } else {
             // No sort: return first N slot IDs as-is
             let ids: Vec<i64> = candidates.iter().take(limit).map(|s| s as i64).collect();
@@ -78,8 +88,86 @@ impl<'a> QueryExecutor<'a> {
         })
     }
 
+    /// Execute a query with trie cache integration.
+    /// Checks cache first, falls back to computation, stores results.
+    pub fn execute_with_cache(
+        &self,
+        filters: &[FilterClause],
+        sort: Option<&SortClause>,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+        cache: &mut TrieCache,
+    ) -> Result<QueryResult> {
+        let limit = limit.min(self.max_page_size);
+
+        // Step 1: Plan the query (reorder clauses by cardinality)
+        let plan = planner::plan_query(filters, self.filters, self.slots);
+
+        // Step 2: Try cache lookup using canonical key
+        let cache_key = cache::canonicalize(&plan.ordered_clauses);
+
+        let filter_bitmap = if let Some(ref key) = cache_key {
+            match cache.lookup(key) {
+                CacheLookup::ExactHit(cached_bitmap) => {
+                    // Cache hit -- use cached bitmap directly
+                    cached_bitmap
+                }
+                CacheLookup::PrefixHit { bitmap: prefix_bitmap, matched_prefix_len } => {
+                    // Partial cache hit -- compute remaining clauses against cached prefix
+                    let remaining = &plan.ordered_clauses[matched_prefix_len..];
+                    let mut result = prefix_bitmap;
+                    for clause in remaining {
+                        let clause_bitmap = self.evaluate_clause(clause)?;
+                        result &= &clause_bitmap;
+                    }
+                    // Store the full result in cache
+                    cache.store(key, result.clone());
+                    result
+                }
+                CacheLookup::Miss => {
+                    // Full miss -- compute from scratch
+                    let result = self.compute_filters(&plan.ordered_clauses)?;
+                    cache.store(key, result.clone());
+                    result
+                }
+            }
+        } else {
+            // Uncacheable query (contains compound clauses) -- compute without cache
+            self.compute_filters(&plan.ordered_clauses)?
+        };
+
+        // Step 3: AND with alive bitmap (implicit in every query)
+        let alive = self.slots.alive_bitmap();
+        let candidates = &filter_bitmap & alive;
+
+        let total_matched = candidates.len();
+
+        // Step 4: Sort and paginate
+        let (ids, next_cursor) = if let Some(sort_clause) = sort {
+            if plan.use_simple_sort {
+                self.simple_sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+            } else {
+                self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+            }
+        } else {
+            let ids: Vec<i64> = candidates.iter().take(limit).map(|s| s as i64).collect();
+            let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
+                sort_value: 0,
+                slot_id: last_id as u32,
+            });
+            (ids, next_cursor)
+        };
+
+        Ok(QueryResult {
+            ids,
+            cursor: next_cursor,
+            total_matched,
+        })
+    }
+
     /// Compute the combined filter bitmap from a list of filter clauses.
     /// Top-level clauses are implicitly ANDed together.
+    /// Clauses are expected to be pre-ordered by the planner for optimal evaluation.
     fn compute_filters(&self, clauses: &[FilterClause]) -> Result<RoaringBitmap> {
         if clauses.is_empty() {
             return Ok(self.slots.alive_bitmap().clone());
@@ -115,7 +203,8 @@ impl<'a> QueryExecutor<'a> {
             }
 
             FilterClause::NotEq(field, value) => {
-                // NOT(field == value) = alive AND NOT(field == value bitmap)
+                // Use andnot optimization: compute the small negated bitmap
+                // and subtract from alive, instead of computing the large complement
                 let eq_bitmap = self.evaluate_clause(&FilterClause::Eq(field.clone(), value.clone()))?;
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
@@ -136,6 +225,7 @@ impl<'a> QueryExecutor<'a> {
             }
 
             FilterClause::Not(inner) => {
+                // NOT uses andnot: compute inner bitmap and subtract from alive
                 let inner_bitmap = self.evaluate_clause(inner)?;
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
@@ -144,8 +234,14 @@ impl<'a> QueryExecutor<'a> {
             }
 
             FilterClause::And(clauses) => {
+                // Optimize And sub-clauses by reordering by cardinality
+                let optimized = planner::optimize_and_clause(
+                    clauses,
+                    self.filters,
+                    self.slots.alive_count(),
+                );
                 let mut result: Option<RoaringBitmap> = None;
-                for clause in clauses {
+                for clause in &optimized {
                     let bitmap = self.evaluate_clause(clause)?;
                     result = Some(match result {
                         Some(existing) => existing & &bitmap,
@@ -200,7 +296,7 @@ impl<'a> QueryExecutor<'a> {
         Ok(result)
     }
 
-    /// Sort candidates and apply cursor pagination.
+    /// Sort candidates using bitmap sort layer traversal.
     fn sort_and_paginate(
         &self,
         candidates: &RoaringBitmap,
@@ -221,6 +317,64 @@ impl<'a> QueryExecutor<'a> {
         let ids: Vec<i64> = sorted_slots.iter().map(|&s| s as i64).collect();
 
         let next_cursor = sorted_slots.last().map(|&last_slot| {
+            let sort_value = sort_field.reconstruct_value(last_slot) as u64;
+            crate::query::CursorPosition {
+                sort_value,
+                slot_id: last_slot,
+            }
+        });
+
+        Ok((ids, next_cursor))
+    }
+
+    /// Simple in-memory sort for small result sets.
+    /// When the planner estimates the result set is small, this avoids walking 32 bit layers.
+    fn simple_sort_and_paginate(
+        &self,
+        candidates: &RoaringBitmap,
+        sort: &SortClause,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+    ) -> Result<(Vec<i64>, Option<crate::query::CursorPosition>)> {
+        let sort_field = self
+            .sorts
+            .get_field(&sort.field)
+            .ok_or_else(|| BitdexError::FieldNotFound(sort.field.clone()))?;
+
+        let descending = sort.direction == SortDirection::Desc;
+
+        // Reconstruct values and collect into Vec
+        let mut entries: Vec<(u32, u32)> = candidates
+            .iter()
+            .map(|slot| (slot, sort_field.reconstruct_value(slot)))
+            .collect();
+
+        // Sort by value, tiebreak by slot ID
+        if descending {
+            entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+        } else {
+            entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        }
+
+        // Apply cursor filtering
+        if let Some(cursor) = cursor {
+            let cursor_value = cursor.sort_value as u32;
+            let cursor_slot = cursor.slot_id;
+            entries.retain(|&(slot, value)| {
+                if descending {
+                    value < cursor_value || (value == cursor_value && slot < cursor_slot)
+                } else {
+                    value > cursor_value || (value == cursor_value && slot > cursor_slot)
+                }
+            });
+        }
+
+        // Take limit
+        let result_slots: Vec<u32> = entries.iter().take(limit).map(|&(slot, _)| slot).collect();
+
+        let ids: Vec<i64> = result_slots.iter().map(|&s| s as i64).collect();
+
+        let next_cursor = result_slots.last().map(|&last_slot| {
             let sort_value = sort_field.reconstruct_value(last_slot) as u64;
             crate::query::CursorPosition {
                 sort_value,
