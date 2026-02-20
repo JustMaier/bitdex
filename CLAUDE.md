@@ -61,13 +61,13 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 2. **Filter Bitmaps** — One roaring bitmap per distinct value per filterable field. Boolean fields: one bitmap per boolean. Multi-value fields: one bitmap per distinct value.
 3. **Sort Layer Bitmaps** — Each sortable numeric field decomposed into N bitmaps (one per bit position). A u32 field = 32 bitmaps. Top-N retrieval via MSB-to-LSB traversal using AND operations.
 
-### Concurrency Model — No Locks
+### Concurrency Model — ArcSwap Lock-Free Reads
 
-- Writers atomically mark their target slot ID in an in-flight set BEFORE mutating bitmaps
-- Writers clear the in-flight mark AFTER mutation is complete
-- Readers execute their full query without coordination
-- After computing results, readers check if any result IDs overlap with the in-flight set
-- If overlap: revalidate only the overlapping IDs (re-check their filter/sort bits)
+- **Snapshot architecture**: Flush thread owns a private staging `InnerEngine`, publishes immutable snapshots via `ArcSwap::store()`. Readers load snapshots with `ArcSwap::load()` (zero-cost Guard, no refcount ops).
+- **Arc-per-bitmap CoW**: Each `RoaringBitmap` wrapped in `Arc`. `Arc::make_mut()` only clones bitmaps with refcount > 1. Filter/sort fields also Arc-wrapped for O(num_fields) snapshot clone.
+- **Write path**: Writers compute diffs and send `MutationOp`s to a crossbeam channel. Flush thread drains, batches, applies to staging, publishes new snapshot atomically.
+- **In-flight tracking**: Writers mark slot IDs in an atomic in-flight set before mutation, clear after. Readers post-validate overlapping IDs.
+- **Cache**: Separate `Arc<Mutex<TrieCache>>` with brief locks (lookup ~μs, store ~μs). Targeted invalidation: only filter fields that actually changed are invalidated; sort-only flushes skip cache invalidation entirely.
 
 ### Trie Cache
 
@@ -95,13 +95,14 @@ Slot allocation, alive bitmap, filter bitmaps, sort layer bitmaps, mutation API 
 ### Phase 2: Persistence — PARTIAL
 On-disk document store via redb (commit 8e3c54a). Stores documents keyed by slot ID for upsert diffing. WAL, snapshot serialization, and sidecar snapshot builder are NOT yet implemented.
 
-### Phase 3: Performance — COMPLETE (commits 95df2a5 through 1acfad7)
+### Phase 3: Performance — COMPLETE (commits 95df2a5 through 763a008)
 - Cardinality-based query planning (planner.rs)
 - Trie cache with prefix matching and generation-counter invalidation (cache.rs)
-- Concurrent engine with RwLock-based read/write separation (concurrent_engine.rs)
+- ArcSwap lock-free snapshot reads with Arc-per-bitmap CoW (concurrent_engine.rs)
 - Write coalescing via crossbeam channels with batched flush loop (write_coalescer.rs)
+- Targeted cache invalidation — sort-only flushes skip invalidation
 - Arc<str> field name interning for zero-copy mutation ops
-- Benchmark harness with 20 query types, memory reporting, multi-stage benchmarking
+- Benchmark harness with 20 query types + contention benchmark, memory reporting
 
 ### Phase 4: Operations
 Prometheus metrics, autovac, admin API, graceful shutdown, health check. NOT yet started.
