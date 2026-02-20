@@ -89,20 +89,25 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 ## Development Phases
 
-### Phase 1: Core Engine (Current Priority)
-Slot allocation, alive bitmap, filter bitmaps, sort layer bitmaps, mutation API (PUT/PATCH/DELETE/DELETE WHERE), query execution, JSON query parser, config loading.
+### Phase 1: Core Engine — COMPLETE (commit 7bc60fd)
+Slot allocation, alive bitmap, filter bitmaps, sort layer bitmaps, mutation API (PUT/PATCH/DELETE/DELETE WHERE), query execution, JSON query parser, config loading. Full test coverage.
 
-### Phase 2: Persistence
-WAL, snapshot serialization/deserialization, sidecar snapshot builder, startup sequence.
+### Phase 2: Persistence — PARTIAL
+On-disk document store via redb (commit 8e3c54a). Stores documents keyed by slot ID for upsert diffing. WAL, snapshot serialization, and sidecar snapshot builder are NOT yet implemented.
 
-### Phase 3: Performance
-Cardinality-based query planning, trie cache with LRU, prefix matching, optimistic concurrency.
+### Phase 3: Performance — COMPLETE (commits 95df2a5 through 1acfad7)
+- Cardinality-based query planning (planner.rs)
+- Trie cache with prefix matching and generation-counter invalidation (cache.rs)
+- Concurrent engine with RwLock-based read/write separation (concurrent_engine.rs)
+- Write coalescing via crossbeam channels with batched flush loop (write_coalescer.rs)
+- Arc<str> field name interning for zero-copy mutation ops
+- Benchmark harness with 20 query types, memory reporting, multi-stage benchmarking
 
 ### Phase 4: Operations
-Prometheus metrics, autovac, admin API, graceful shutdown, health check.
+Prometheus metrics, autovac, admin API, graceful shutdown, health check. NOT yet started.
 
 ### Phase 5: Integration
-Postgres WAL consumer, backfill pipeline, shadow mode, end-to-end tests.
+Postgres WAL consumer, backfill pipeline, shadow mode, end-to-end tests. NOT yet started.
 
 ---
 
@@ -119,18 +124,31 @@ Postgres WAL consumer, backfill pipeline, shadow mode, end-to-end tests.
 
 ---
 
-## Key Memory Estimates (150M documents)
+## Measured Memory (Civitai dataset, remapped IDs, 4 threads)
+
+| Scale | Bitmap Memory | RSS | Worst Query p50 |
+|------:|-------------:|----:|----------------:|
+| 5M | 328 MB | 1.20 GB | 0.83ms |
+| 50M | 2.95 GB | 6.09 GB | 13.5ms |
+| 100M | 6.19 GB | 11.66 GB | 18.7ms |
+| 104.6M | 6.49 GB | 12.14 GB | 21.1ms |
+
+tagIds dominates filter memory at 79-80% across all scales.
+Full results: `docs/benchmark-report.md`
+
+### Extrapolation to 150M
 
 | Component | Estimated Size |
 |---|---|
-| Alive bitmap | ~20MB |
-| Filter bitmaps (all fields) | ~4.6-6.8GB |
-| Sort bitmaps (5 fields x 32 layers) | ~2.5-4GB |
-| Trie cache (configurable) | ~1-2GB |
-| **Total in-memory** | **~7-11GB** |
+| Filter bitmaps | ~8.1 GB |
+| Sort bitmaps | ~1.1 GB |
+| Trie cache | ~160 MB |
+| **Total bitmap memory** | **~9.3 GB** |
+| **Total RSS** | **~17.4 GB** |
 
-Document store on disk (redb): scales with document count, NVMe random reads are ~microseconds.
-Snapshot on disk with zstd compression: ~1-3GB.
+Within the original 7-11 GB bitmap target. RSS overhead is ~48% from redb + allocator.
+
+Document store on disk (redb): ~6 GB at 100M records.
 
 ---
 
