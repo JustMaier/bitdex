@@ -57,6 +57,14 @@ impl CanonicalClause {
                 op: "lte".to_string(),
                 value_repr: value_to_string(value),
             }),
+            // BucketBitmap uses a stable key: op="bucket", value_repr=bucket_name.
+            // This ensures queries snapped to "sortAt:7d" always produce the same cache key
+            // regardless of the raw timestamp value supplied by the caller (C5).
+            FilterClause::BucketBitmap { field, bucket_name, .. } => Some(CanonicalClause {
+                field: field.clone(),
+                op: "bucket".to_string(),
+                value_repr: bucket_name.clone(),
+            }),
             // Compound clauses (And/Or/Not) are not directly cacheable as trie keys
             FilterClause::Not(_) | FilterClause::And(_) | FilterClause::Or(_) => None,
         }
@@ -756,5 +764,93 @@ mod tests {
         ];
         let key = canonicalize(&clauses).unwrap();
         assert_eq!(key.len(), 2);
+    }
+
+    fn make_bucket_bitmap(field: &str, bucket_name: &str) -> FilterClause {
+        FilterClause::BucketBitmap {
+            field: field.to_string(),
+            bucket_name: bucket_name.to_string(),
+            bitmap: std::sync::Arc::new(RoaringBitmap::new()),
+        }
+    }
+
+    #[test]
+    fn test_bucket_bitmap_produces_stable_key() {
+        // Two BucketBitmap clauses with the same field+bucket_name but different internal bitmaps
+        // must produce the same cache key (C5).
+        let clause_a = make_bucket_bitmap("sortAt", "7d");
+        let clause_b = FilterClause::BucketBitmap {
+            field: "sortAt".to_string(),
+            bucket_name: "7d".to_string(),
+            bitmap: std::sync::Arc::new({
+                let mut bm = RoaringBitmap::new();
+                bm.insert(42);
+                bm
+            }),
+        };
+
+        let key_a = canonicalize(&[clause_a]).unwrap();
+        let key_b = canonicalize(&[clause_b]).unwrap();
+
+        assert_eq!(key_a, key_b);
+        assert_eq!(key_a[0].op, "bucket");
+        assert_eq!(key_a[0].value_repr, "7d");
+    }
+
+    #[test]
+    fn test_bucket_bitmap_key_field_name() {
+        let clause = make_bucket_bitmap("sortAt", "24h");
+        let key = canonicalize(&[clause]).unwrap();
+        assert_eq!(key[0].field, "sortAt");
+        assert_eq!(key[0].op, "bucket");
+        assert_eq!(key[0].value_repr, "24h");
+    }
+
+    #[test]
+    fn test_bucket_bitmap_different_bucket_names_different_keys() {
+        let key_24h = canonicalize(&[make_bucket_bitmap("sortAt", "24h")]).unwrap();
+        let key_7d = canonicalize(&[make_bucket_bitmap("sortAt", "7d")]).unwrap();
+        assert_ne!(key_24h, key_7d);
+    }
+
+    #[test]
+    fn test_bucket_bitmap_stable_key_cache_hit() {
+        // Store under 7d bucket, look up with a new BucketBitmap (different bitmap content)
+        // — should get an exact hit because cache key is based on bucket name, not bitmap content.
+        let mut cache = TrieCache::new(make_config(100));
+
+        let clause_store = make_bucket_bitmap("sortAt", "7d");
+        let key = canonicalize(&[clause_store]).unwrap();
+        cache.store(&key, make_bitmap(&[1, 2, 3]));
+
+        // Look up with a different bitmap content but same field/bucket_name
+        let clause_lookup = FilterClause::BucketBitmap {
+            field: "sortAt".to_string(),
+            bucket_name: "7d".to_string(),
+            bitmap: std::sync::Arc::new({
+                let mut bm = RoaringBitmap::new();
+                bm.insert(99);
+                bm
+            }),
+        };
+        let lookup_key = canonicalize(&[clause_lookup]).unwrap();
+
+        match cache.lookup(&lookup_key) {
+            CacheLookup::ExactHit(bm) => assert_eq!(bm, make_bitmap(&[1, 2, 3])),
+            _ => panic!("expected exact hit for stable bucket key"),
+        }
+    }
+
+    #[test]
+    fn test_bucket_bitmap_combined_with_eq_in_key() {
+        // BucketBitmap + Eq should produce a 2-element canonical key, sorted by field.
+        let bucket = make_bucket_bitmap("sortAt", "7d");
+        let eq = eq_clause("nsfwLevel", 1);
+        let key = canonicalize(&[bucket, eq]).unwrap();
+        assert_eq!(key.len(), 2);
+        // Sorted by field: "nsfwLevel" < "sortAt"
+        assert_eq!(key[0].field, "nsfwLevel");
+        assert_eq!(key[1].field, "sortAt");
+        assert_eq!(key[1].op, "bucket");
     }
 }

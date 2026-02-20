@@ -354,6 +354,9 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::Gte(field, value) => self.range_scan(field, value, |k, t| k >= t),
             FilterClause::Lt(field, value) => self.range_scan(field, value, |k, t| k < t),
             FilterClause::Lte(field, value) => self.range_scan(field, value, |k, t| k <= t),
+
+            // Pre-computed bucket bitmap from range snapping (C3): use the bitmap directly.
+            FilterClause::BucketBitmap { bitmap, .. } => Ok(bitmap.as_ref().clone()),
         }
     }
 

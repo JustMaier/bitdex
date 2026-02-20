@@ -1,5 +1,8 @@
-use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
+
+use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 
 /// A parsed query ready for execution by the bitmap engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +18,8 @@ pub struct BitdexQuery {
 /// The engine evaluates these against roaring bitmaps:
 /// - `Eq`/`NotEq`/`In`/`Gt`/`Lt`/`Gte`/`Lte` operate on individual field bitmaps
 /// - `And`/`Or`/`Not` compose sub-clauses via bitmap intersection/union/complement
+/// - `BucketBitmap` is an internal variant used by bucket snapping (C3/C5): a pre-computed
+///   bitmap for a named time bucket, never constructed by the user or serialized from input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FilterClause {
     Eq(String, Value),
@@ -27,6 +32,19 @@ pub enum FilterClause {
     Not(Box<FilterClause>),
     And(Vec<FilterClause>),
     Or(Vec<FilterClause>),
+    /// Pre-computed bucket bitmap produced by range-to-bucket snapping.
+    /// - `field` — the filter field name (e.g. "sortAt")
+    /// - `bucket_name` — the human-readable bucket name (e.g. "7d"), used as the stable cache key
+    /// - `bitmap` — the pre-computed roaring bitmap for the bucket
+    ///
+    /// This variant is produced internally by `snap_range_clauses` and is never serialized
+    /// to or from user-facing query input.
+    #[serde(skip)]
+    BucketBitmap {
+        field: String,
+        bucket_name: String,
+        bitmap: Arc<RoaringBitmap>,
+    },
 }
 
 /// A dynamically-typed value used in filter predicates and cursors.
@@ -96,9 +114,248 @@ pub trait QueryParser: Send + Sync {
     fn content_type(&self) -> &str;
 }
 
+/// Context for bucket snapping: maps field names to their `TimeBucketManager`.
+///
+/// Passed to `snap_range_clauses` so the executor can resolve range filters against
+/// pre-computed time buckets (C3).
+pub struct BucketSnapContext<'a> {
+    /// Map from field name → TimeBucketManager for that field.
+    pub managers: &'a std::collections::HashMap<String, crate::time_buckets::TimeBucketManager>,
+    /// Current unix timestamp in seconds (used to compute `now - duration` for Gt/Gte).
+    pub now_secs: u64,
+    /// Snap tolerance as a fraction (e.g. 0.10 for 10%).
+    pub tolerance_pct: f64,
+}
+
+/// Pre-process filter clauses: replace range filters on bucketed timestamp fields with
+/// pre-computed `BucketBitmap` clauses (C3).
+///
+/// For each `Gt(field, Integer(ts))` or `Gte(field, Integer(ts))` where `field` has a
+/// `TimeBucketManager` registered in `ctx`, compute `duration = now - ts` and try to snap
+/// to the nearest bucket within tolerance. If snapping succeeds, replace the clause with
+/// `BucketBitmap { field, bucket_name, bitmap }`.
+///
+/// `Lt` / `Lte` are not snapped — time buckets are "newer than X" windows.
+///
+/// Returns the transformed clause list. Clauses that don't snap are returned unchanged.
+pub fn snap_range_clauses(
+    clauses: &[FilterClause],
+    ctx: &BucketSnapContext<'_>,
+) -> Vec<FilterClause> {
+    clauses
+        .iter()
+        .map(|clause| snap_clause(clause, ctx))
+        .collect()
+}
+
+fn snap_clause(clause: &FilterClause, ctx: &BucketSnapContext<'_>) -> FilterClause {
+    match clause {
+        FilterClause::Gt(field, Value::Integer(ts)) | FilterClause::Gte(field, Value::Integer(ts)) => {
+            try_snap_to_bucket(field, *ts, ctx)
+                .unwrap_or_else(|| clause.clone())
+        }
+
+        // Recurse into And/Or — but not Not (semantics differ)
+        FilterClause::And(inner) => {
+            FilterClause::And(inner.iter().map(|c| snap_clause(c, ctx)).collect())
+        }
+        FilterClause::Or(inner) => {
+            FilterClause::Or(inner.iter().map(|c| snap_clause(c, ctx)).collect())
+        }
+
+        // All other variants pass through unchanged.
+        other => other.clone(),
+    }
+}
+
+/// Try to snap a `Gt/Gte(field, ts)` to a bucket bitmap.
+/// Returns `Some(BucketBitmap { ... })` if snapping succeeds, `None` otherwise.
+fn try_snap_to_bucket(
+    field: &str,
+    ts: i64,
+    ctx: &BucketSnapContext<'_>,
+) -> Option<FilterClause> {
+    let manager = ctx.managers.get(field)?;
+    // duration = now - ts (the window the filter requests)
+    let duration_secs = ctx.now_secs.saturating_sub(ts as u64);
+    let bucket_name = manager.snap_duration(duration_secs, ctx.tolerance_pct)?;
+    let bucket = manager.get_bucket(bucket_name)?;
+    Some(FilterClause::BucketBitmap {
+        field: field.to_string(),
+        bucket_name: bucket_name.to_string(),
+        bitmap: Arc::new(bucket.bitmap().clone()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BucketConfig;
+    use crate::time_buckets::TimeBucketManager;
+    use std::collections::HashMap;
+
+    /// Build a BucketSnapContext with a single field and two buckets (24h, 7d).
+    fn make_ctx(
+        managers: &HashMap<String, TimeBucketManager>,
+        now_secs: u64,
+    ) -> BucketSnapContext<'_> {
+        BucketSnapContext {
+            managers,
+            now_secs,
+            tolerance_pct: 0.10,
+        }
+    }
+
+    fn make_manager_with_data(now: u64) -> TimeBucketManager {
+        let configs = vec![
+            BucketConfig { name: "24h".to_string(), duration_secs: 86400, refresh_interval_secs: 300 },
+            BucketConfig { name: "7d".to_string(), duration_secs: 604800, refresh_interval_secs: 3600 },
+        ];
+        let mut mgr = TimeBucketManager::new("sortAt".to_string(), configs);
+        // Slots 1-3 within 24h, slots 4-6 within 7d but outside 24h, slot 7 outside 7d.
+        let data: Vec<(u32, u64)> = vec![
+            (1, now - 3600),
+            (2, now - 7200),
+            (3, now - 43200),
+            (4, now - 90000),
+            (5, now - 200000),
+            (6, now - 500000),
+            (7, now - 700000), // outside 7d
+        ];
+        mgr.rebuild_bucket("24h", data.iter().copied(), now);
+        mgr.rebuild_bucket("7d", data.iter().copied(), now);
+        mgr
+    }
+
+    #[test]
+    fn test_snap_gt_exact_24h() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), mgr);
+        let ctx = make_ctx(&managers, now);
+
+        // Gt("sortAt", now - 86400) → exactly 24h duration → snap to "24h"
+        let ts = (now - 86400) as i64;
+        let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Integer(ts))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+
+        assert_eq!(snapped.len(), 1);
+        match &snapped[0] {
+            FilterClause::BucketBitmap { field, bucket_name, bitmap } => {
+                assert_eq!(field, "sortAt");
+                assert_eq!(bucket_name, "24h");
+                assert_eq!(bitmap.len(), 3); // slots 1, 2, 3
+            }
+            other => panic!("expected BucketBitmap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_snap_gte_7d_within_tolerance() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), mgr);
+        let ctx = make_ctx(&managers, now);
+
+        // Gte("sortAt", now - 590000) → duration=590000, 7d=604800, delta=14800, threshold=60480 → snap
+        let ts = (now - 590000) as i64;
+        let clauses = vec![FilterClause::Gte("sortAt".to_string(), Value::Integer(ts))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+
+        match &snapped[0] {
+            FilterClause::BucketBitmap { bucket_name, .. } => {
+                assert_eq!(bucket_name, "7d");
+            }
+            other => panic!("expected BucketBitmap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_snap_outside_tolerance() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), mgr);
+        let ctx = make_ctx(&managers, now);
+
+        // Duration = 200000s. Neither 24h (86400) nor 7d (604800) is within 10% tolerance.
+        let ts = (now - 200000) as i64;
+        let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Integer(ts))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+
+        // Should remain unchanged — no snap
+        assert!(matches!(&snapped[0], FilterClause::Gt(_, _)));
+    }
+
+    #[test]
+    fn test_no_snap_unknown_field() {
+        let now: u64 = 1_700_000_000;
+        let managers: HashMap<String, TimeBucketManager> = HashMap::new();
+        let ctx = make_ctx(&managers, now);
+
+        let ts = (now - 86400) as i64;
+        let clauses = vec![FilterClause::Gt("nsfwLevel".to_string(), Value::Integer(ts))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+
+        assert!(matches!(&snapped[0], FilterClause::Gt(_, _)));
+    }
+
+    #[test]
+    fn test_lt_lte_not_snapped() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), mgr);
+        let ctx = make_ctx(&managers, now);
+
+        let ts = (now - 86400) as i64;
+        let lt = FilterClause::Lt("sortAt".to_string(), Value::Integer(ts));
+        let lte = FilterClause::Lte("sortAt".to_string(), Value::Integer(ts));
+        let snapped = snap_range_clauses(&[lt, lte], &ctx);
+
+        assert!(matches!(&snapped[0], FilterClause::Lt(_, _)));
+        assert!(matches!(&snapped[1], FilterClause::Lte(_, _)));
+    }
+
+    #[test]
+    fn test_snap_inside_and_clause() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), mgr);
+        let ctx = make_ctx(&managers, now);
+
+        let ts = (now - 86400) as i64;
+        let clauses = vec![FilterClause::And(vec![
+            FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1)),
+            FilterClause::Gt("sortAt".to_string(), Value::Integer(ts)),
+        ])];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+
+        match &snapped[0] {
+            FilterClause::And(inner) => {
+                assert!(matches!(&inner[0], FilterClause::Eq(_, _)));
+                assert!(matches!(&inner[1], FilterClause::BucketBitmap { .. }));
+            }
+            other => panic!("expected And, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_non_integer_value_not_snapped() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), mgr);
+        let ctx = make_ctx(&managers, now);
+
+        // Float value — should not snap
+        let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Float(1.0))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+        assert!(matches!(&snapped[0], FilterClause::Gt(_, _)));
+    }
 
     #[test]
     fn test_filter_clause_construction() {

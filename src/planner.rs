@@ -71,6 +71,9 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
         | FilterClause::Lt(_, _)
         | FilterClause::Gte(_, _)
         | FilterClause::Lte(_, _) => alive_count / 2,
+
+        // Pre-computed bucket bitmap: use the actual bitmap length as cardinality.
+        FilterClause::BucketBitmap { bitmap, .. } => bitmap.len(),
     }
 }
 
