@@ -10,6 +10,7 @@ pub mod executor;
 pub mod filter;
 pub mod mutation;
 pub mod parser;
+pub mod pending_buffer;
 pub mod planner;
 pub mod query;
 pub mod slot;
