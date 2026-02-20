@@ -1,3 +1,4 @@
+pub mod bitmap_store;
 pub mod cache;
 pub mod concurrency;
 pub mod concurrent_engine;
@@ -13,6 +14,7 @@ pub mod planner;
 pub mod query;
 pub mod slot;
 pub mod sort;
+pub mod tier2_cache;
 pub mod types;
 pub mod versioned_bitmap;
 pub mod write_coalescer;

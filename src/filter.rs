@@ -4,10 +4,11 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::config::FilterFieldConfig;
+use crate::versioned_bitmap::VersionedBitmap;
 
 /// Filter bitmap storage for a single field.
 ///
-/// Each distinct value gets its own RoaringBitmap containing all slot positions
+/// Each distinct value gets its own VersionedBitmap containing all slot positions
 /// that have that value. This is the core of Bitdex's filtering.
 ///
 /// Field types:
@@ -15,11 +16,11 @@ use crate::config::FilterFieldConfig;
 /// - multi_value: each slot can appear in multiple bitmaps (e.g., tags)
 /// - boolean: two bitmaps (true/false), stored as values 0 and 1
 ///
-/// Bitmaps are Arc-wrapped for clone-on-write snapshot sharing.
+/// Bitmaps use VersionedBitmap for deferred diff compaction and cheap snapshot cloning.
 #[derive(Clone)]
 pub struct FilterField {
     /// One bitmap per distinct value. Key is the u64 bitmap key.
-    bitmaps: HashMap<u64, Arc<RoaringBitmap>>,
+    bitmaps: HashMap<u64, VersionedBitmap>,
     /// Field configuration.
     config: FilterFieldConfig,
 }
@@ -44,44 +45,34 @@ impl FilterField {
 
     /// Set a slot's bit in the bitmap for the given value.
     pub fn insert(&mut self, value: u64, slot: u32) {
-        Arc::make_mut(
-            self.bitmaps
-                .entry(value)
-                .or_insert_with(|| Arc::new(RoaringBitmap::new())),
-        )
-        .insert(slot);
+        self.bitmaps
+            .entry(value)
+            .or_insert_with(VersionedBitmap::new_empty)
+            .insert(slot);
     }
 
     /// Clear a slot's bit from the bitmap for the given value.
     pub fn remove(&mut self, value: u64, slot: u32) {
-        if let Some(bm) = self.bitmaps.get_mut(&value) {
-            Arc::make_mut(bm).remove(slot);
-            if bm.is_empty() {
-                self.bitmaps.remove(&value);
-            }
+        if let Some(vb) = self.bitmaps.get_mut(&value) {
+            vb.remove(slot);
+            // Defer cleanup to merge_dirty/autovac since checking emptiness requires merge
         }
     }
 
     /// Bulk-insert multiple slots into the bitmap for the given value.
     /// Slots should be sorted for maximum roaring-rs `extend()` performance.
     pub fn insert_bulk(&mut self, value: u64, slots: impl IntoIterator<Item = u32>) {
-        Arc::make_mut(
-            self.bitmaps
-                .entry(value)
-                .or_insert_with(|| Arc::new(RoaringBitmap::new())),
-        )
-        .extend(slots);
+        self.bitmaps
+            .entry(value)
+            .or_insert_with(VersionedBitmap::new_empty)
+            .insert_bulk(slots);
     }
 
     /// Bulk-remove multiple slots from the bitmap for the given value.
     pub fn remove_bulk(&mut self, value: u64, slots: &[u32]) {
-        if let Some(bm) = self.bitmaps.get_mut(&value) {
-            let inner = Arc::make_mut(bm);
+        if let Some(vb) = self.bitmaps.get_mut(&value) {
             for &slot in slots {
-                inner.remove(slot);
-            }
-            if bm.is_empty() {
-                self.bitmaps.remove(&value);
+                vb.remove(slot);
             }
         }
     }
@@ -89,26 +80,23 @@ impl FilterField {
     /// Clear a slot's bit from ALL bitmaps in this field.
     /// Used by autovac to clean dead slots from filter bitmaps.
     pub fn remove_from_all(&mut self, slot: u32) {
-        let mut empty_keys = Vec::new();
-        for (&key, bm) in self.bitmaps.iter_mut() {
-            Arc::make_mut(bm).remove(slot);
-            if bm.is_empty() {
-                empty_keys.push(key);
-            }
-        }
-        for key in empty_keys {
-            self.bitmaps.remove(&key);
+        for vb in self.bitmaps.values_mut() {
+            vb.remove(slot);
         }
     }
 
     /// Get the bitmap for a specific value.
+    /// The VersionedBitmap must be merged before calling this.
     pub fn get(&self, value: u64) -> Option<&RoaringBitmap> {
-        self.bitmaps.get(&value).map(|a| a.as_ref())
+        self.bitmaps.get(&value).map(|vb| {
+            debug_assert!(!vb.is_dirty(), "filter bitmap must be merged before read");
+            vb.base().as_ref()
+        })
     }
 
     /// Get the cardinality (number of set bits) for a specific value.
     pub fn cardinality(&self, value: u64) -> u64 {
-        self.bitmaps.get(&value).map_or(0, |bm| bm.len())
+        self.bitmaps.get(&value).map_or(0, |vb| vb.base_len())
     }
 
     /// Get the number of distinct values tracked.
@@ -120,8 +108,8 @@ impl FilterField {
     pub fn union(&self, values: &[u64]) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
         for value in values {
-            if let Some(bm) = self.bitmaps.get(value) {
-                result |= bm.as_ref();
+            if let Some(vb) = self.bitmaps.get(value) {
+                result |= vb.base().as_ref();
             }
         }
         result
@@ -132,10 +120,10 @@ impl FilterField {
     pub fn intersection(&self, values: &[u64]) -> Option<RoaringBitmap> {
         let mut iter = values.iter();
         let first = iter.next()?;
-        let mut result: RoaringBitmap = self.bitmaps.get(first)?.as_ref().clone();
+        let mut result: RoaringBitmap = self.bitmaps.get(first)?.base().as_ref().clone();
         for value in iter {
             match self.bitmaps.get(value) {
-                Some(bm) => result &= bm.as_ref(),
+                Some(vb) => result &= vb.base().as_ref(),
                 None => return Some(RoaringBitmap::new()), // Empty intersection
             }
         }
@@ -144,7 +132,7 @@ impl FilterField {
 
     /// Iterate over all (value, bitmap) pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &RoaringBitmap)> {
-        self.bitmaps.iter().map(|(k, v)| (k, v.as_ref()))
+        self.bitmaps.iter().map(|(k, vb)| (k, vb.base().as_ref()))
     }
 
     /// Get the total number of bitmaps.
@@ -154,7 +142,23 @@ impl FilterField {
 
     /// Return the serialized byte size of all bitmaps in this field.
     pub fn bitmap_bytes(&self) -> usize {
-        self.bitmaps.values().map(|bm| bm.serialized_size()).sum()
+        self.bitmaps.values().map(|vb| vb.bitmap_bytes()).sum()
+    }
+
+    /// Merge all dirty VersionedBitmaps in this field.
+    pub fn merge_all(&mut self) {
+        for vb in self.bitmaps.values_mut() {
+            vb.merge();
+        }
+    }
+
+    /// Merge only dirty VersionedBitmaps.
+    pub fn merge_dirty(&mut self) {
+        for vb in self.bitmaps.values_mut() {
+            if vb.is_dirty() {
+                vb.merge();
+            }
+        }
     }
 }
 
@@ -251,6 +255,7 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::SingleValue,
+            storage: crate::config::StorageMode::default(),
         }
     }
 
@@ -258,6 +263,7 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::MultiValue,
+            storage: crate::config::StorageMode::default(),
         }
     }
 
@@ -265,6 +271,7 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::Boolean,
+            storage: crate::config::StorageMode::default(),
         }
     }
 
@@ -274,6 +281,7 @@ mod tests {
         field.insert(1, 100);
         field.insert(1, 200);
         field.insert(2, 300);
+        field.merge_all();
 
         let bm = field.get(1).unwrap();
         assert_eq!(bm.len(), 2);
@@ -291,8 +299,10 @@ mod tests {
         field.insert(42, 10);
         field.insert(42, 20);
         field.insert(42, 30);
+        field.merge_all();
 
         field.remove(42, 20);
+        field.merge_dirty();
         assert_eq!(field.cardinality(42), 2);
         assert!(!field.get(42).unwrap().contains(20));
     }
@@ -301,9 +311,11 @@ mod tests {
     fn test_remove_last_cleans_up() {
         let mut field = FilterField::new(make_single_value_config("status"));
         field.insert(1, 10);
+        field.merge_all();
         field.remove(1, 10);
-        assert!(field.get(1).is_none());
-        assert_eq!(field.distinct_count(), 0);
+        field.merge_dirty();
+        // After merge, the bitmap exists but is empty (cleanup deferred to autovac)
+        assert_eq!(field.cardinality(1), 0);
     }
 
     #[test]
@@ -313,13 +325,15 @@ mod tests {
         field.insert(200, 5);
         field.insert(300, 5);
         field.insert(100, 10);
+        field.merge_all();
 
         field.remove_from_all(5);
+        field.merge_dirty();
 
         assert!(!field.get(100).unwrap().contains(5));
         assert!(field.get(100).unwrap().contains(10));
-        assert!(field.get(200).is_none()); // Was only slot 5
-        assert!(field.get(300).is_none()); // Was only slot 5
+        assert_eq!(field.cardinality(200), 0); // Was only slot 5
+        assert_eq!(field.cardinality(300), 0); // Was only slot 5
     }
 
     #[test]
@@ -332,6 +346,7 @@ mod tests {
         // Document at slot 10 has tags 200, 400
         field.insert(200, 10);
         field.insert(400, 10);
+        field.merge_all();
 
         assert!(field.get(100).unwrap().contains(5));
         assert!(field.get(200).unwrap().contains(5));
@@ -345,6 +360,7 @@ mod tests {
         field.insert(1, 10); // true
         field.insert(1, 20); // true
         field.insert(0, 30); // false
+        field.merge_all();
 
         assert_eq!(field.cardinality(1), 2);
         assert_eq!(field.cardinality(0), 1);
@@ -358,6 +374,7 @@ mod tests {
         field.insert(2, 30);
         field.insert(2, 40);
         field.insert(3, 50);
+        field.merge_all();
 
         let result = field.union(&[1, 2]);
         assert_eq!(result.len(), 4);
@@ -378,6 +395,7 @@ mod tests {
         field.insert(300, 10);
         // Slot 15 has tag 100
         field.insert(100, 15);
+        field.merge_all();
 
         let result = field.intersection(&[100, 200]).unwrap();
         assert_eq!(result.len(), 1);
@@ -388,6 +406,7 @@ mod tests {
     fn test_intersection_missing_value() {
         let mut field = FilterField::new(make_single_value_config("status"));
         field.insert(1, 10);
+        field.merge_all();
 
         let result = field.intersection(&[1, 999]).unwrap();
         assert!(result.is_empty()); // 999 doesn't exist, so intersection is empty
@@ -406,6 +425,11 @@ mod tests {
         index.get_field_mut("tagIds").unwrap().insert(789, 100);
         index.get_field_mut("onSite").unwrap().insert(1, 100);
 
+        // Merge before reading
+        for (_name, field) in index.fields_mut() {
+            field.merge_all();
+        }
+
         // Verify
         assert_eq!(index.get_field("nsfwLevel").unwrap().cardinality(1), 1);
         assert_eq!(index.get_field("tagIds").unwrap().cardinality(456), 1);
@@ -419,6 +443,7 @@ mod tests {
         field.insert(1, 10);
         field.insert(1, 20);
         field.insert(1, 30);
+        field.merge_all();
 
         let mut alive = RoaringBitmap::new();
         alive.insert(10);

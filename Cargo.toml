@@ -29,6 +29,9 @@ arc-swap = "1"
 redb = "2"
 bincode = "1"
 
+# Tier 2 bitmap cache
+moka = { version = "0.12", features = ["sync"] }
+
 # RNG (used by benchmark binary)
 rand = "0.8"
 

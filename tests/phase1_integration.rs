@@ -30,30 +30,37 @@ fn civitai_config() -> Config {
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
+                storage: Default::default(),
             },
             FilterFieldConfig {
                 name: "tagIds".to_string(),
                 field_type: FilterFieldType::MultiValue,
+                storage: Default::default(),
             },
             FilterFieldConfig {
                 name: "userId".to_string(),
                 field_type: FilterFieldType::SingleValue,
+                storage: Default::default(),
             },
             FilterFieldConfig {
                 name: "modelVersionIds".to_string(),
                 field_type: FilterFieldType::MultiValue,
+                storage: Default::default(),
             },
             FilterFieldConfig {
                 name: "onSite".to_string(),
                 field_type: FilterFieldType::Boolean,
+                storage: Default::default(),
             },
             FilterFieldConfig {
                 name: "hasMeta".to_string(),
                 field_type: FilterFieldType::Boolean,
+                storage: Default::default(),
             },
             FilterFieldConfig {
                 name: "type".to_string(),
                 field_type: FilterFieldType::SingleValue,
+                storage: Default::default(),
             },
         ],
         sort_fields: vec![
@@ -100,14 +107,17 @@ fn minimal_config() -> Config {
             FilterFieldConfig {
                 name: "status".to_string(),
                 field_type: FilterFieldType::SingleValue,
+                storage: Default::default(),
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
                 field_type: FilterFieldType::MultiValue,
+                storage: Default::default(),
             },
             FilterFieldConfig {
                 name: "active".to_string(),
                 field_type: FilterFieldType::Boolean,
+                storage: Default::default(),
             },
         ],
         sort_fields: vec![SortFieldConfig {

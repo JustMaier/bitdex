@@ -114,6 +114,10 @@ impl Engine {
         for (_name, field) in self.sorts.fields_mut() {
             field.merge_dirty();
         }
+        // Eager merge: filter diffs must be compacted before readers see them
+        for (_name, field) in self.filters.fields_mut() {
+            field.merge_dirty();
+        }
         self.slots.merge_alive();
 
         // Clear in-flight after mutation
@@ -147,6 +151,10 @@ impl Engine {
 
         // Eager merge: sort diffs and alive must be compacted before readers see them
         for (_name, field) in self.sorts.fields_mut() {
+            field.merge_dirty();
+        }
+        // Eager merge: filter diffs must be compacted before readers see them
+        for (_name, field) in self.filters.fields_mut() {
             field.merge_dirty();
         }
         self.slots.merge_alive();
@@ -385,14 +393,17 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
+                    storage: crate::config::StorageMode::default(),
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
+                    storage: crate::config::StorageMode::default(),
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
+                    storage: crate::config::StorageMode::default(),
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -604,6 +615,7 @@ mod tests {
         let filter_field = engine.filters.get_field_mut("nsfwLevel").unwrap();
         filter_field.remove(1, 2);  // remove from old value
         filter_field.insert(2, 2);  // add to new value
+        filter_field.merge_dirty();
 
         // Now query for nsfwLevel=1. Without post-validation, slot 2 might
         // still appear in results due to bitmap state during write.

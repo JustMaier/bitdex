@@ -484,18 +484,22 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
+                    storage: crate::config::StorageMode::default(),
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
+                    storage: crate::config::StorageMode::default(),
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
+                    storage: crate::config::StorageMode::default(),
                 },
                 FilterFieldConfig {
                     name: "userId".to_string(),
                     field_type: FilterFieldType::SingleValue,
+                    storage: crate::config::StorageMode::default(),
                 },
             ],
             sort_fields: vec![
@@ -546,6 +550,14 @@ mod tests {
                 &self.docstore,
             );
             engine.put(id, doc).unwrap();
+            // Eager merge: mirror Engine::put() behavior
+            for (_name, field) in self.sorts.fields_mut() {
+                field.merge_dirty();
+            }
+            for (_name, field) in self.filters.fields_mut() {
+                field.merge_dirty();
+            }
+            self.slots.merge_alive();
         }
 
         fn query(

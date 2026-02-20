@@ -253,6 +253,15 @@ impl WriteBatch {
             }
         }
 
+        // Eager merge: filter diffs must be compacted before readers see them.
+        // Merge only filter fields that were mutated in this batch.
+        let mutated_filter_fields = self.mutated_filter_fields();
+        for field_name in &mutated_filter_fields {
+            if let Some(field) = filters.get_field_mut(field_name) {
+                field.merge_dirty();
+            }
+        }
+
         // Merge alive bitmap
         slots.merge_alive();
     }
@@ -397,10 +406,12 @@ mod tests {
         filters.add_field(FilterFieldConfig {
             name: "status".to_string(),
             field_type: FilterFieldType::SingleValue,
+            storage: crate::config::StorageMode::default(),
         });
         filters.add_field(FilterFieldConfig {
             name: "tagIds".to_string(),
             field_type: FilterFieldType::MultiValue,
+            storage: crate::config::StorageMode::default(),
         });
         filters
     }

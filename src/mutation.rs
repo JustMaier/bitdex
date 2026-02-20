@@ -774,14 +774,17 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
+                    storage: crate::config::StorageMode::default(),
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
+                    storage: crate::config::StorageMode::default(),
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
+                    storage: crate::config::StorageMode::default(),
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -841,6 +844,11 @@ mod tests {
         assert!(slots.is_alive(100));
         assert_eq!(slots.alive_count(), 1);
 
+        // Merge filter diffs before reading (Engine::put does this; MutationEngine does not)
+        for (_name, field) in filters.fields_mut() {
+            field.merge_dirty();
+        }
+
         assert!(filters
             .get_field("nsfwLevel")
             .unwrap()
@@ -893,6 +901,11 @@ mod tests {
         ]);
         engine.put(100, &doc2).unwrap();
 
+        // Merge filter diffs before reading
+        for (_name, field) in filters.fields_mut() {
+            field.merge_dirty();
+        }
+
         // Old filter value gone
         assert!(filters.get_field("nsfwLevel").unwrap().get(1).is_none()
             || !filters
@@ -943,6 +956,11 @@ mod tests {
             .collect(),
         };
         engine.patch(100, &patch).unwrap();
+
+        // Merge filter diffs before reading
+        for (_name, field) in filters.fields_mut() {
+            field.merge_dirty();
+        }
 
         assert!(filters.get_field("nsfwLevel").unwrap().get(1).is_none()
             || !filters
@@ -1018,6 +1036,11 @@ mod tests {
         };
         engine.patch(10, &patch).unwrap();
 
+        // Merge filter diffs before reading
+        for (_name, field) in filters.fields_mut() {
+            field.merge_dirty();
+        }
+
         assert!(filters.get_field("tagIds").unwrap().get(100).is_none()
             || !filters
                 .get_field("tagIds")
@@ -1055,6 +1078,11 @@ mod tests {
         engine.delete(100).unwrap();
 
         assert!(!slots.is_alive(100));
+
+        // Merge filter diffs before reading
+        for (_name, field) in filters.fields_mut() {
+            field.merge_dirty();
+        }
 
         // Filter bitmap still has stale bit (by design!)
         assert!(filters
@@ -1108,6 +1136,11 @@ mod tests {
                 )]);
                 engine.put(i, &doc).unwrap();
             }
+        }
+
+        // Merge filter diffs before reading
+        for (_name, field) in filters.fields_mut() {
+            field.merge_dirty();
         }
 
         // Get matching bitmap, then delete

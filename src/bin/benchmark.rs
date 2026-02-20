@@ -161,17 +161,17 @@ fn type_to_int(t: &str) -> i64 {
 fn civitai_config() -> Config {
     Config {
         filter_fields: vec![
-            FilterFieldConfig { name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue },
-            FilterFieldConfig { name: "userId".into(), field_type: FilterFieldType::SingleValue },
-            FilterFieldConfig { name: "type".into(), field_type: FilterFieldType::SingleValue },
-            FilterFieldConfig { name: "hasMeta".into(), field_type: FilterFieldType::Boolean },
-            FilterFieldConfig { name: "onSite".into(), field_type: FilterFieldType::Boolean },
-            FilterFieldConfig { name: "poi".into(), field_type: FilterFieldType::Boolean },
-            FilterFieldConfig { name: "minor".into(), field_type: FilterFieldType::Boolean },
-            FilterFieldConfig { name: "tagIds".into(), field_type: FilterFieldType::MultiValue },
-            FilterFieldConfig { name: "modelVersionIds".into(), field_type: FilterFieldType::MultiValue },
-            FilterFieldConfig { name: "toolIds".into(), field_type: FilterFieldType::MultiValue },
-            FilterFieldConfig { name: "techniqueIds".into(), field_type: FilterFieldType::MultiValue },
+            FilterFieldConfig { name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue, storage: Default::default() },
+            FilterFieldConfig { name: "userId".into(), field_type: FilterFieldType::SingleValue, storage: Default::default() },
+            FilterFieldConfig { name: "type".into(), field_type: FilterFieldType::SingleValue, storage: Default::default() },
+            FilterFieldConfig { name: "hasMeta".into(), field_type: FilterFieldType::Boolean, storage: Default::default() },
+            FilterFieldConfig { name: "onSite".into(), field_type: FilterFieldType::Boolean, storage: Default::default() },
+            FilterFieldConfig { name: "poi".into(), field_type: FilterFieldType::Boolean, storage: Default::default() },
+            FilterFieldConfig { name: "minor".into(), field_type: FilterFieldType::Boolean, storage: Default::default() },
+            FilterFieldConfig { name: "tagIds".into(), field_type: FilterFieldType::MultiValue, storage: Default::default() },
+            FilterFieldConfig { name: "modelVersionIds".into(), field_type: FilterFieldType::MultiValue, storage: Default::default() },
+            FilterFieldConfig { name: "toolIds".into(), field_type: FilterFieldType::MultiValue, storage: Default::default() },
+            FilterFieldConfig { name: "techniqueIds".into(), field_type: FilterFieldType::MultiValue, storage: Default::default() },
         ],
         sort_fields: vec![
             SortFieldConfig { name: "reactionCount".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32 },
