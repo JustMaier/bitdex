@@ -182,6 +182,7 @@ impl ConcurrentEngine {
             let tier2_fields = tier2_field_names.clone();
             let flush_pending = Arc::clone(&pending);
             let flush_tier2_cache = tier2_cache.clone();
+            let flush_bound_cache = Arc::clone(&bound_cache);
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
@@ -211,6 +212,53 @@ impl ConcurrentEngine {
                             &mut staging.filters,
                             &mut staging.sorts,
                         );
+
+                        // D3: Live maintenance of bound caches on sort field mutations.
+                        // For each mutated slot, check if its new sort value qualifies for
+                        // any existing bound (exceeds min_tracked_value). Bits are only added,
+                        // never removed — bloat control (D4) handles cleanup.
+                        {
+                            let sort_mutations = coalescer.mutated_sort_slots();
+                            if !sort_mutations.is_empty() {
+                                let mut bc = flush_bound_cache.lock();
+                                if !bc.is_empty() {
+                                    for (sort_field, slots) in &sort_mutations {
+                                        // Collect matching bounds for this sort field
+                                        let matching_keys: Vec<BoundKey> = bc
+                                            .iter_mut()
+                                            .filter(|(k, _)| k.sort_field == *sort_field)
+                                            .map(|(k, _)| k.clone())
+                                            .collect();
+
+                                        if matching_keys.is_empty() {
+                                            continue;
+                                        }
+
+                                        for &slot in slots {
+                                            let value = staging.sorts
+                                                .get_field(sort_field)
+                                                .map(|f| f.reconstruct_value(slot))
+                                                .unwrap_or(0);
+
+                                            for bound_key in &matching_keys {
+                                                if let Some(entry) = bc.get_mut(bound_key) {
+                                                    if entry.needs_rebuild() {
+                                                        continue;
+                                                    }
+                                                    let qualifies = match bound_key.direction {
+                                                        SortDirection::Desc => value > entry.min_tracked_value(),
+                                                        SortDirection::Asc => value < entry.min_tracked_value(),
+                                                    };
+                                                    if qualifies {
+                                                        entry.add_slot(slot);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // Route Tier 2 mutations to PendingBuffer and invalidate moka cache
                         if !tier2_mutations.is_empty() {
@@ -255,6 +303,28 @@ impl ConcurrentEngine {
                                 let mut c = cache.lock();
                                 for name in &changed {
                                     c.invalidate_field(name);
+                                }
+                            }
+                        }
+
+                        // D3: Invalidate bounds whose filter fields changed.
+                        // Alive mutations affect all bounds (alive is implicit in filter results).
+                        {
+                            let changed_filters = coalescer.mutated_filter_fields();
+                            let has_alive = coalescer.has_alive_mutations();
+                            if has_alive || !changed_filters.is_empty() {
+                                let mut bc = flush_bound_cache.lock();
+                                if !bc.is_empty() {
+                                    if has_alive {
+                                        // Alive changed — mark ALL bounds for rebuild
+                                        for (_, entry) in bc.iter_mut() {
+                                            entry.mark_for_rebuild();
+                                        }
+                                    } else {
+                                        for field_name in &changed_filters {
+                                            bc.invalidate_filter_field(field_name);
+                                        }
+                                    }
                                 }
                             }
                         }

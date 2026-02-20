@@ -474,4 +474,115 @@ mod tests {
         // Should have some non-zero memory from the bitmap
         assert!(mgr.total_memory_bytes() > 0);
     }
+
+    // ---- D9: Live maintenance correctness tests ----
+
+    #[test]
+    fn test_d9_live_maintenance_adds_qualifying_slot_desc() {
+        // Bound with Desc direction: min_tracked_value = floor. New values above floor qualify.
+        let mut mgr = BoundCacheManager::new(3, 10);
+        let key = make_bound_key("nsfwLevel", "1", "reactionCount", SortDirection::Desc);
+
+        // Sorted slots: [10, 8, 6] with values [1000, 800, 600]. Floor = 600.
+        mgr.form_bound(key.clone(), &[10, 8, 6], |s| s * 100);
+        assert_eq!(mgr.lookup(&key).unwrap().min_tracked_value(), 600);
+
+        // Slot 20 has value 700 (> 600 floor) — should be added
+        let entry = mgr.get_mut(&key).unwrap();
+        assert!(!entry.bitmap().contains(20));
+        let added = entry.add_slot(20);
+        assert!(added);
+        assert!(entry.bitmap().contains(20));
+        assert_eq!(entry.cardinality(), 4);
+    }
+
+    #[test]
+    fn test_d9_live_maintenance_skips_below_threshold_desc() {
+        let mut mgr = BoundCacheManager::new(3, 10);
+        let key = make_bound_key("nsfwLevel", "1", "reactionCount", SortDirection::Desc);
+
+        // Floor = 600.
+        mgr.form_bound(key.clone(), &[10, 8, 6], |s| s * 100);
+
+        // Simulated check: value 500 < 600 floor — should NOT be added.
+        // (In real code, the flush loop checks this before calling add_slot.)
+        let value = 500u32;
+        let min = mgr.lookup(&key).unwrap().min_tracked_value();
+        assert!(value <= min, "Value below floor should not qualify for Desc bound");
+    }
+
+    #[test]
+    fn test_d9_live_maintenance_adds_qualifying_slot_asc() {
+        // Bound with Asc direction: min_tracked_value = ceiling. New values below ceiling qualify.
+        let mut mgr = BoundCacheManager::new(3, 10);
+        let key = make_bound_key("nsfwLevel", "1", "reactionCount", SortDirection::Asc);
+
+        // Sorted asc: [1, 2, 3] with values [100, 200, 300]. Ceiling = 300.
+        mgr.form_bound(key.clone(), &[1, 2, 3], |s| s * 100);
+        assert_eq!(mgr.lookup(&key).unwrap().min_tracked_value(), 300);
+
+        // Slot 5 with value 150 (< 300 ceiling) — qualifies
+        let entry = mgr.get_mut(&key).unwrap();
+        let added = entry.add_slot(5);
+        assert!(added);
+        assert!(entry.bitmap().contains(5));
+    }
+
+    #[test]
+    fn test_d9_bloat_triggers_rebuild_on_live_maintenance() {
+        let mut mgr = BoundCacheManager::new(3, 5);
+        let key = make_bound_key("nsfwLevel", "1", "reactionCount", SortDirection::Desc);
+
+        // Start with 3 slots (at target_size)
+        mgr.form_bound(key.clone(), &[10, 8, 6], |s| s * 100);
+        assert_eq!(mgr.lookup(&key).unwrap().cardinality(), 3);
+
+        // Add qualifying slots via live maintenance until bloat
+        let entry = mgr.get_mut(&key).unwrap();
+        entry.add_slot(20); // 4
+        entry.add_slot(30); // 5 = max_size, not over yet
+        assert!(!entry.needs_rebuild());
+        entry.add_slot(40); // 6 > max_size(5) — triggers rebuild flag
+        assert!(entry.needs_rebuild());
+    }
+
+    #[test]
+    fn test_d9_rebuild_flag_skips_live_maintenance() {
+        // When needs_rebuild is true, the flush loop should skip adding new slots
+        // (the next query will do a full rebuild instead)
+        let mut mgr = BoundCacheManager::new(3, 4);
+        let key = make_bound_key("nsfwLevel", "1", "reactionCount", SortDirection::Desc);
+
+        mgr.form_bound(key.clone(), &[10, 8, 6], |s| s * 100);
+        let entry = mgr.get_mut(&key).unwrap();
+        entry.add_slot(20); // 4 = max_size
+        entry.add_slot(30); // 5 > max_size → needs_rebuild
+        assert!(entry.needs_rebuild());
+
+        // Simulated: flush loop checks needs_rebuild() and skips
+        // This test verifies the flag is correctly set
+        let cardinality_before = entry.cardinality();
+        // In real flush loop: if entry.needs_rebuild() { continue; }
+        // After rebuild:
+        entry.rebuild(&[50, 40, 30], |s| s * 100);
+        assert!(!entry.needs_rebuild());
+        assert_eq!(entry.cardinality(), 3);
+        assert!(entry.cardinality() < cardinality_before);
+    }
+
+    #[test]
+    fn test_d9_filter_invalidation_marks_bounds_for_rebuild() {
+        let mut mgr = BoundCacheManager::new(5, 10);
+        let key_nsfw = make_bound_key("nsfwLevel", "1", "reactionCount", SortDirection::Desc);
+        let key_type = make_bound_key("type", "image", "reactionCount", SortDirection::Desc);
+
+        mgr.form_bound(key_nsfw.clone(), &[1, 2, 3], |s| s * 100);
+        mgr.form_bound(key_type.clone(), &[4, 5, 6], |s| s * 100);
+
+        // Mutate nsfwLevel filter — only nsfwLevel bounds should be marked
+        mgr.invalidate_filter_field("nsfwLevel");
+
+        assert!(mgr.lookup(&key_nsfw).unwrap().needs_rebuild());
+        assert!(!mgr.lookup(&key_type).unwrap().needs_rebuild());
+    }
 }

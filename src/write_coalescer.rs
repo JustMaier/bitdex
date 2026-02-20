@@ -215,6 +215,20 @@ impl WriteBatch {
         result
     }
 
+    /// Returns the set of slots mutated per sort field in this batch.
+    /// Valid after `group_and_sort()` has been called.
+    /// Used by D3 live bound maintenance to check if mutated slots qualify for bounds.
+    pub fn mutated_sort_slots(&self) -> HashMap<&str, HashSet<u32>> {
+        let mut result: HashMap<&str, HashSet<u32>> = HashMap::new();
+        for (key, slots) in &self.sort_sets {
+            result.entry(&key.field).or_default().extend(slots);
+        }
+        for (key, slots) in &self.sort_clears {
+            result.entry(&key.field).or_default().extend(slots);
+        }
+        result
+    }
+
     /// Returns the set of filter field names that were mutated in this batch.
     /// Valid after `group_and_sort()` has been called.
     pub fn mutated_filter_fields(&self) -> HashSet<&str> {
@@ -438,6 +452,13 @@ impl WriteCoalescer {
     /// Valid after `prepare()` returned > 0, before the next `prepare()` call.
     pub fn mutated_filter_fields(&self) -> HashSet<&str> {
         self.batch.mutated_filter_fields()
+    }
+
+    /// Returns slots mutated per sort field in the prepared batch.
+    /// Valid after `prepare()` returned > 0, before the next `prepare()` call.
+    /// Used by D3 live bound maintenance.
+    pub fn mutated_sort_slots(&self) -> HashMap<&str, HashSet<u32>> {
+        self.batch.mutated_sort_slots()
     }
 }
 
