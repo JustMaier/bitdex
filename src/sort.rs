@@ -3,6 +3,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::config::SortFieldConfig;
+use crate::versioned_bitmap::VersionedBitmap;
 
 /// Sort layer bitmaps for a single sortable field.
 ///
@@ -16,11 +17,13 @@ use crate::config::SortFieldConfig;
 /// If < N, keep both groups and continue. This is binary search across all documents
 /// simultaneously. All sort operations are bitmap AND operations.
 ///
-/// Bit layers are Arc-wrapped for clone-on-write snapshot sharing.
+/// Bit layers use VersionedBitmap for diff-based mutation with eager merge.
+/// Mutations write to the diff layer; eager merge compacts diffs before
+/// readers see them, so sort traversal always reads clean bases.
 #[derive(Clone)]
 pub struct SortField {
     /// One bitmap per bit position. Index 0 = LSB, index 31 = MSB (for 32-bit).
-    bit_layers: Vec<Arc<RoaringBitmap>>,
+    bit_layers: Vec<VersionedBitmap>,
     /// Number of bit layers (typically 32 for u32).
     num_bits: usize,
     /// Field configuration.
@@ -31,7 +34,7 @@ impl SortField {
     pub fn new(config: SortFieldConfig) -> Self {
         let num_bits = config.bits as usize;
         let bit_layers = (0..num_bits)
-            .map(|_| Arc::new(RoaringBitmap::new()))
+            .map(|_| VersionedBitmap::new_empty())
             .collect();
         Self {
             bit_layers,
@@ -50,11 +53,11 @@ impl SortField {
         self.num_bits
     }
 
-    /// Insert a value for a slot. Sets the appropriate bits in each layer.
+    /// Insert a value for a slot. Sets the appropriate bits in each layer's diff.
     pub fn insert(&mut self, slot: u32, value: u32) {
         for bit in 0..self.num_bits {
             if (value >> bit) & 1 == 1 {
-                Arc::make_mut(&mut self.bit_layers[bit]).insert(slot);
+                self.bit_layers[bit].insert(slot);
             }
         }
     }
@@ -62,7 +65,7 @@ impl SortField {
     /// Remove a slot from all bit layers. Used by autovac.
     pub fn remove(&mut self, slot: u32) {
         for layer in &mut self.bit_layers {
-            Arc::make_mut(layer).remove(slot);
+            layer.remove(slot);
         }
     }
 
@@ -72,12 +75,11 @@ impl SortField {
         let diff = old_value ^ new_value;
         for bit in 0..self.num_bits {
             if (diff >> bit) & 1 == 1 {
-                let layer = Arc::make_mut(&mut self.bit_layers[bit]);
-                // This bit changed, flip it in the layer
-                if layer.contains(slot) {
-                    layer.remove(slot);
+                // This bit changed — check base+diff to determine current state
+                if self.bit_layers[bit].contains(slot) {
+                    self.bit_layers[bit].remove(slot);
                 } else {
-                    layer.insert(slot);
+                    self.bit_layers[bit].insert(slot);
                 }
             }
         }
@@ -86,23 +88,26 @@ impl SortField {
     /// Bulk-set a bit layer for multiple slots. Slots should be sorted for performance.
     pub fn set_layer_bulk(&mut self, bit: usize, slots: impl IntoIterator<Item = u32>) {
         if let Some(layer) = self.bit_layers.get_mut(bit) {
-            Arc::make_mut(layer).extend(slots);
+            layer.insert_bulk(slots);
         }
     }
 
     /// Bulk-clear a bit layer for multiple slots.
     pub fn clear_layer_bulk(&mut self, bit: usize, slots: &[u32]) {
         if let Some(layer) = self.bit_layers.get_mut(bit) {
-            let inner = Arc::make_mut(layer);
             for &slot in slots {
-                inner.remove(slot);
+                layer.remove(slot);
             }
         }
     }
 
-    /// Get a reference to a specific bit layer.
+    /// Get a reference to a specific bit layer's base bitmap.
+    /// Requires that the layer has been merged (no pending diff).
     pub fn layer(&self, bit: usize) -> Option<&RoaringBitmap> {
-        self.bit_layers.get(bit).map(|a| a.as_ref())
+        self.bit_layers.get(bit).map(|vb| {
+            debug_assert!(!vb.is_dirty(), "sort layer {bit} has unmerged diff");
+            vb.base().as_ref()
+        })
     }
 
     /// Perform top-N sort traversal on a candidate set using MSB-to-LSB bifurcation.
@@ -175,7 +180,8 @@ impl SortField {
                 break;
             }
 
-            let layer: &RoaringBitmap = &self.bit_layers[bit];
+            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in bifurcate");
+            let layer: &RoaringBitmap = self.bit_layers[bit].base();
 
             // preferred = slots that have the "better" bit value at this position
             let preferred = if descending {
@@ -268,7 +274,8 @@ impl SortField {
             }
 
             let cursor_bit_set = (cursor_value >> bit) & 1 == 1;
-            let layer: &RoaringBitmap = &self.bit_layers[bit];
+            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in apply_cursor_filter");
+            let layer: &RoaringBitmap = self.bit_layers[bit].base();
 
             let equal_with_bit_set = &equal & layer;
             let equal_with_bit_clear = &equal - layer;
@@ -316,20 +323,38 @@ impl SortField {
         confirmed
     }
 
-    /// Reconstruct the sort value for a given slot by reading its bits.
+    /// Reconstruct the sort value for a given slot by reading from the base bitmap.
+    /// Requires that all layers have been merged.
     pub fn reconstruct_value(&self, slot: u32) -> u32 {
         let mut value = 0u32;
         for bit in 0..self.num_bits {
-            if self.bit_layers[bit].contains(slot) {
+            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in reconstruct_value");
+            if self.bit_layers[bit].base().contains(slot) {
                 value |= 1 << bit;
             }
         }
         value
     }
 
+    /// Merge all bit layers, compacting diffs into bases.
+    pub fn merge_all(&mut self) {
+        for layer in &mut self.bit_layers {
+            layer.merge();
+        }
+    }
+
+    /// Merge only dirty bit layers (those with pending diffs).
+    pub fn merge_dirty(&mut self) {
+        for layer in &mut self.bit_layers {
+            if layer.is_dirty() {
+                layer.merge();
+            }
+        }
+    }
+
     /// Return the serialized byte size of all bit layer bitmaps.
     pub fn bitmap_bytes(&self) -> usize {
-        self.bit_layers.iter().map(|bm| bm.serialized_size()).sum()
+        self.bit_layers.iter().map(|bm| bm.bitmap_bytes()).sum()
     }
 }
 
@@ -417,6 +442,7 @@ mod tests {
     fn test_insert_and_reconstruct() {
         let mut sf = SortField::new(make_config("reactionCount"));
         sf.insert(10, 42);
+        sf.merge_all();
         assert_eq!(sf.reconstruct_value(10), 42);
     }
 
@@ -424,6 +450,7 @@ mod tests {
     fn test_insert_zero() {
         let mut sf = SortField::new(make_config("count"));
         sf.insert(5, 0);
+        sf.merge_all();
         assert_eq!(sf.reconstruct_value(5), 0);
     }
 
@@ -431,6 +458,7 @@ mod tests {
     fn test_insert_max_u32() {
         let mut sf = SortField::new(make_config("count"));
         sf.insert(5, u32::MAX);
+        sf.merge_all();
         assert_eq!(sf.reconstruct_value(5), u32::MAX);
     }
 
@@ -439,6 +467,7 @@ mod tests {
         let mut sf = SortField::new(make_config("count"));
         // Value 5 = binary 101 -> bits 0 and 2 are set
         sf.insert(10, 5);
+        sf.merge_all();
 
         assert!(sf.layer(0).unwrap().contains(10)); // bit 0
         assert!(!sf.layer(1).unwrap().contains(10)); // bit 1
@@ -452,9 +481,11 @@ mod tests {
     fn test_update_xor_diff() {
         let mut sf = SortField::new(make_config("reactionCount"));
         sf.insert(10, 100);
+        sf.merge_all();
         assert_eq!(sf.reconstruct_value(10), 100);
 
         sf.update(10, 100, 200);
+        sf.merge_all();
         assert_eq!(sf.reconstruct_value(10), 200);
     }
 
@@ -463,6 +494,7 @@ mod tests {
         let mut sf = SortField::new(make_config("count"));
         // Value 5 = 101, Value 6 = 110 -> diff = 011 (bits 0 and 1 flip)
         sf.insert(10, 5);
+        sf.merge_all();
 
         // Before update: bit 0 = 1, bit 1 = 0, bit 2 = 1
         assert!(sf.layer(0).unwrap().contains(10));
@@ -470,6 +502,7 @@ mod tests {
         assert!(sf.layer(2).unwrap().contains(10));
 
         sf.update(10, 5, 6);
+        sf.merge_all();
 
         // After update: bit 0 = 0, bit 1 = 1, bit 2 = 1
         assert!(!sf.layer(0).unwrap().contains(10));
@@ -482,7 +515,9 @@ mod tests {
     fn test_update_same_value_noop() {
         let mut sf = SortField::new(make_config("count"));
         sf.insert(10, 42);
+        sf.merge_all();
         sf.update(10, 42, 42); // No change
+        sf.merge_all();
         assert_eq!(sf.reconstruct_value(10), 42);
     }
 
@@ -490,7 +525,9 @@ mod tests {
     fn test_remove() {
         let mut sf = SortField::new(make_config("count"));
         sf.insert(10, 255);
+        sf.merge_all();
         sf.remove(10);
+        sf.merge_all();
         assert_eq!(sf.reconstruct_value(10), 0);
     }
 
@@ -502,6 +539,7 @@ mod tests {
         sf.insert(3, 200);
         sf.insert(4, 50);
         sf.insert(5, 300);
+        sf.merge_all();
 
         let mut candidates = RoaringBitmap::new();
         for i in 1..=5 {
@@ -520,6 +558,7 @@ mod tests {
         sf.insert(3, 200);
         sf.insert(4, 50);
         sf.insert(5, 300);
+        sf.merge_all();
 
         let mut candidates = RoaringBitmap::new();
         for i in 1..=5 {
@@ -535,6 +574,7 @@ mod tests {
         let mut sf = SortField::new(make_config("count"));
         sf.insert(1, 10);
         sf.insert(2, 20);
+        sf.merge_all();
 
         let mut candidates = RoaringBitmap::new();
         candidates.insert(1);
@@ -552,6 +592,7 @@ mod tests {
         sf.insert(10, 42);
         sf.insert(20, 42);
         sf.insert(30, 42);
+        sf.merge_all();
 
         let mut candidates = RoaringBitmap::new();
         candidates.insert(10);
@@ -581,6 +622,7 @@ mod tests {
         for i in 1..=10u32 {
             sf.insert(i, i * 10);
         }
+        sf.merge_all();
 
         let mut candidates = RoaringBitmap::new();
         for i in 1..=10 {
@@ -602,6 +644,7 @@ mod tests {
         for i in 1..=10u32 {
             sf.insert(i, i * 10);
         }
+        sf.merge_all();
 
         let mut candidates = RoaringBitmap::new();
         for i in 1..=10 {
@@ -624,7 +667,9 @@ mod tests {
         index.add_field(make_config("commentCount"));
 
         index.get_field_mut("reactionCount").unwrap().insert(1, 100);
+        index.get_field_mut("reactionCount").unwrap().merge_all();
         index.get_field_mut("commentCount").unwrap().insert(1, 5);
+        index.get_field_mut("commentCount").unwrap().merge_all();
 
         assert_eq!(
             index
@@ -648,6 +693,7 @@ mod tests {
         sf.insert(1, 100);
         sf.insert(2, 200);
         sf.insert(3, 300);
+        sf.merge_all();
 
         assert_eq!(sf.reconstruct_value(1), 100);
         assert_eq!(sf.reconstruct_value(2), 200);
@@ -655,6 +701,7 @@ mod tests {
 
         // Update one doesn't affect others
         sf.update(2, 200, 999);
+        sf.merge_all();
         assert_eq!(sf.reconstruct_value(1), 100);
         assert_eq!(sf.reconstruct_value(2), 999);
         assert_eq!(sf.reconstruct_value(3), 300);

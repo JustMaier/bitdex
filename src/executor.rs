@@ -63,7 +63,7 @@ impl<'a> QueryExecutor<'a> {
         let limit = limit.min(self.max_page_size);
 
         // Step 1: Plan the query (reorder clauses by cardinality)
-        let plan = planner::plan_query(filters, self.filters, self.slots);
+        let plan = planner::plan_query(filters, self.filters, self.slots, sort.is_some());
 
         // Step 2: Compute filter bitmap using planned clause order
         let filter_bitmap = self.compute_filters(&plan.ordered_clauses)?;
@@ -82,13 +82,8 @@ impl<'a> QueryExecutor<'a> {
                 self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
             }
         } else {
-            // No sort: return first N slot IDs as-is
-            let ids: Vec<i64> = candidates.iter().take(limit).map(|s| s as i64).collect();
-            let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
-                sort_value: 0,
-                slot_id: last_id as u32,
-            });
-            (ids, next_cursor)
+            // No sort: return in descending slot order (newest first)
+            self.slot_order_paginate(&candidates, limit, cursor)
         };
 
         Ok(QueryResult {
@@ -111,7 +106,7 @@ impl<'a> QueryExecutor<'a> {
         let limit = limit.min(self.max_page_size);
 
         // Step 1: Plan the query (reorder clauses by cardinality)
-        let plan = planner::plan_query(filters, self.filters, self.slots);
+        let plan = planner::plan_query(filters, self.filters, self.slots, sort.is_some());
 
         // Step 2: Try cache lookup using canonical key
         let cache_key = cache::canonicalize(&plan.ordered_clauses);
@@ -160,12 +155,8 @@ impl<'a> QueryExecutor<'a> {
                 self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
             }
         } else {
-            let ids: Vec<i64> = candidates.iter().take(limit).map(|s| s as i64).collect();
-            let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
-                sort_value: 0,
-                slot_id: last_id as u32,
-            });
-            (ids, next_cursor)
+            // No sort: return in descending slot order (newest first)
+            self.slot_order_paginate(&candidates, limit, cursor)
         };
 
         Ok(QueryResult {
@@ -212,12 +203,8 @@ impl<'a> QueryExecutor<'a> {
                 self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
             }
         } else {
-            let ids: Vec<i64> = candidates.iter().take(limit).map(|s| s as i64).collect();
-            let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
-                sort_value: 0,
-                slot_id: last_id as u32,
-            });
-            (ids, next_cursor)
+            // No sort: return in descending slot order (newest first)
+            self.slot_order_paginate(&candidates, limit, cursor)
         };
 
         Ok(QueryResult {
@@ -356,6 +343,42 @@ impl<'a> QueryExecutor<'a> {
             }
         }
         Ok(result)
+    }
+
+    /// Paginate by descending slot order (newest-first) for no-sort queries.
+    /// Highest slot IDs come first since slots are monotonically assigned.
+    fn slot_order_paginate(
+        &self,
+        candidates: &RoaringBitmap,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+    ) -> (Vec<i64>, Option<crate::query::CursorPosition>) {
+        // For cursor-based pagination, narrow candidates to slots below cursor
+        let effective = if let Some(cursor) = cursor {
+            let mut narrowed = candidates.clone();
+            // Remove slots >= cursor_slot_id (we want strictly less than cursor for desc order)
+            narrowed.remove_range(cursor.slot_id..=u32::MAX);
+            narrowed
+        } else {
+            candidates.clone()
+        };
+
+        if effective.is_empty() {
+            return (Vec::new(), None);
+        }
+
+        // Take the last `limit` slots (highest slot IDs = newest)
+        let total = effective.len() as usize;
+        let skip = total.saturating_sub(limit);
+        let slots: Vec<u32> = effective.iter().skip(skip).collect();
+        // Reverse to get descending order
+        let ids: Vec<i64> = slots.iter().rev().map(|&s| s as i64).collect();
+
+        let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
+            sort_value: 0,
+            slot_id: last_id as u32,
+        });
+        (ids, next_cursor)
     }
 
     /// Sort candidates using bitmap sort layer traversal.
@@ -798,5 +821,60 @@ mod tests {
         let result = executor.execute(&[], None, 1000, None).unwrap();
         assert_eq!(result.ids.len(), 5);
         assert_eq!(result.total_matched, 20);
+    }
+
+    #[test]
+    fn test_no_sort_returns_descending_slot_order() {
+        let mut h = TestHarness::new();
+
+        for i in 1..=5u32 {
+            h.put(i, &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+            ]));
+        }
+
+        let result = h.query(&[], None, 100, None);
+        assert_eq!(result.ids, vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_no_sort_cursor_pagination() {
+        let mut h = TestHarness::new();
+
+        for i in 1..=10u32 {
+            h.put(i, &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+            ]));
+        }
+
+        // First page: top 5 descending
+        let page1 = h.query(&[], None, 5, None);
+        assert_eq!(page1.ids, vec![10, 9, 8, 7, 6]);
+        assert!(page1.cursor.is_some());
+
+        // Second page: next 5 descending using cursor
+        let page2 = h.query(&[], None, 5, page1.cursor.as_ref());
+        assert_eq!(page2.ids, vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_no_sort_with_filter() {
+        let mut h = TestHarness::new();
+
+        for i in 1..=10u32 {
+            let level = if i % 2 == 0 { 1 } else { 2 };
+            h.put(i, &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(level))),
+            ]));
+        }
+
+        // Filter for nsfwLevel=1 (even IDs: 2,4,6,8,10), no sort
+        let result = h.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            100,
+            None,
+        );
+        assert_eq!(result.ids, vec![10, 8, 6, 4, 2]);
     }
 }

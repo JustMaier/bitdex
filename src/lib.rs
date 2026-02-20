@@ -14,4 +14,5 @@ pub mod query;
 pub mod slot;
 pub mod sort;
 pub mod types;
+pub mod versioned_bitmap;
 pub mod write_coalescer;

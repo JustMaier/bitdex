@@ -110,6 +110,12 @@ impl Engine {
             engine.put(id, doc)
         };
 
+        // Eager merge: sort diffs and alive must be compacted before readers see them
+        for (_name, field) in self.sorts.fields_mut() {
+            field.merge_dirty();
+        }
+        self.slots.merge_alive();
+
         // Clear in-flight after mutation
         self.in_flight.clear_in_flight(id);
         result
@@ -139,6 +145,12 @@ impl Engine {
             engine.patch(id, patch)
         };
 
+        // Eager merge: sort diffs and alive must be compacted before readers see them
+        for (_name, field) in self.sorts.fields_mut() {
+            field.merge_dirty();
+        }
+        self.slots.merge_alive();
+
         // Clear in-flight after mutation
         self.in_flight.clear_in_flight(id);
         result
@@ -160,6 +172,8 @@ impl Engine {
             );
             engine.delete(id)
         };
+        // Merge alive after delete so alive_bitmap() returns correct state
+        self.slots.merge_alive();
         self.in_flight.clear_in_flight(id);
         result
     }
@@ -188,14 +202,19 @@ impl Engine {
         }
 
         // Now delete them
-        let mut engine = MutationEngine::new(
-            &mut self.slots,
-            &mut self.filters,
-            &mut self.sorts,
-            &self.config,
-            &self.docstore,
-        );
-        engine.delete_where(&matching)
+        let result = {
+            let mut engine = MutationEngine::new(
+                &mut self.slots,
+                &mut self.filters,
+                &mut self.sorts,
+                &self.config,
+                &self.docstore,
+            );
+            engine.delete_where(&matching)
+        };
+        // Merge alive after bulk delete
+        self.slots.merge_alive();
+        result
     }
 
     /// Execute a parsed query.
@@ -655,6 +674,7 @@ mod tests {
         // Mark in-flight, then clear the alive bit directly
         engine.in_flight.mark_in_flight(2);
         engine.slots_mut().delete(2).unwrap();
+        engine.slots_mut().merge_alive();
 
         let result = engine.query(
             &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],

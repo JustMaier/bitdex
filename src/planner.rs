@@ -91,13 +91,21 @@ pub struct QueryPlan {
     pub use_simple_sort: bool,
     /// Estimated result size after all filters.
     pub estimated_result_size: u64,
+    /// Whether to skip sort entirely (no sort field specified).
+    /// When true, results are returned in descending slot order (newest first).
+    pub skip_sort: bool,
 }
 
 /// Plans query execution by reordering filter clauses by cardinality.
+///
+/// `has_sort` indicates whether the query specifies a sort field.
+/// When false, `skip_sort` is set in the plan so the executor returns
+/// results in descending slot order (newest first) instead of sorting.
 pub fn plan_query(
     clauses: &[FilterClause],
     filters: &FilterIndex,
     slots: &SlotAllocator,
+    has_sort: bool,
 ) -> QueryPlan {
     let alive_count = slots.alive_count();
 
@@ -106,6 +114,7 @@ pub fn plan_query(
             ordered_clauses: Vec::new(),
             use_simple_sort: alive_count < SORT_FIRST_THRESHOLD,
             estimated_result_size: alive_count,
+            skip_sort: !has_sort,
         };
     }
 
@@ -135,6 +144,7 @@ pub fn plan_query(
         ordered_clauses,
         use_simple_sort: estimated_result_size < SORT_FIRST_THRESHOLD,
         estimated_result_size,
+        skip_sort: !has_sort,
     }
 }
 
@@ -267,7 +277,7 @@ mod tests {
     #[test]
     fn test_plan_empty_clauses() {
         let h = TestHarness::new();
-        let plan = plan_query(&[], &h.filters, &h.slots);
+        let plan = plan_query(&[], &h.filters, &h.slots, true);
         assert!(plan.ordered_clauses.is_empty());
         assert!(plan.use_simple_sort); // 0 docs < threshold
     }
@@ -290,7 +300,7 @@ mod tests {
             FilterClause::Eq("userId".to_string(), Value::Integer(42)),     // 5 matches
         ];
 
-        let plan = plan_query(&clauses, &h.filters, &h.slots);
+        let plan = plan_query(&clauses, &h.filters, &h.slots, true);
 
         // userId should come first (lower cardinality)
         assert_eq!(plan.ordered_clauses.len(), 2);
@@ -319,7 +329,7 @@ mod tests {
             FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1)),
         ];
 
-        let plan = plan_query(&clauses, &h.filters, &h.slots);
+        let plan = plan_query(&clauses, &h.filters, &h.slots, true);
         assert!(plan.use_simple_sort);
         assert_eq!(plan.estimated_result_size, 50);
     }
@@ -339,7 +349,7 @@ mod tests {
             FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1)),
         ];
 
-        let plan = plan_query(&clauses, &h.filters, &h.slots);
+        let plan = plan_query(&clauses, &h.filters, &h.slots, true);
         assert!(!plan.use_simple_sort);
         assert_eq!(plan.estimated_result_size, 2000);
     }
@@ -514,7 +524,7 @@ mod tests {
             FilterClause::Eq("userId".to_string(), Value::Integer(42)),
         ];
 
-        let plan = plan_query(&clauses, &h.filters, &h.slots);
+        let plan = plan_query(&clauses, &h.filters, &h.slots, true);
 
         // userId=42 has cardinality 3, should be first
         match &plan.ordered_clauses[0] {
@@ -522,5 +532,18 @@ mod tests {
             _ => panic!("expected userId first"),
         }
         assert!(plan.use_simple_sort); // estimated 3 < 1000
+    }
+
+    #[test]
+    fn test_skip_sort_flag() {
+        let h = TestHarness::new();
+
+        // has_sort=false -> skip_sort=true
+        let plan = plan_query(&[], &h.filters, &h.slots, false);
+        assert!(plan.skip_sort);
+
+        // has_sort=true -> skip_sort=false
+        let plan = plan_query(&[], &h.filters, &h.slots, true);
+        assert!(!plan.skip_sort);
     }
 }

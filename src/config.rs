@@ -31,13 +31,9 @@ pub struct Config {
     #[serde(default = "default_autovac_interval")]
     pub autovac_interval_secs: u64,
 
-    /// Snapshot interval in seconds.
-    #[serde(default = "default_snapshot_interval")]
-    pub snapshot_interval_secs: u64,
-
-    /// WAL flush strategy: "fsync" or "async".
-    #[serde(default = "default_wal_flush_strategy")]
-    pub wal_flush_strategy: String,
+    /// Merge interval for versioned bitmaps, in milliseconds.
+    #[serde(default = "default_merge_interval_ms")]
+    pub merge_interval_ms: u64,
 
     /// Prometheus metrics port.
     #[serde(default = "default_prometheus_port")]
@@ -58,11 +54,8 @@ fn default_max_page_size() -> usize {
 fn default_autovac_interval() -> u64 {
     3600
 }
-fn default_snapshot_interval() -> u64 {
-    300
-}
-fn default_wal_flush_strategy() -> String {
-    "fsync".to_string()
+fn default_merge_interval_ms() -> u64 {
+    5000
 }
 fn default_prometheus_port() -> u16 {
     9090
@@ -82,8 +75,7 @@ impl Default for Config {
             max_page_size: default_max_page_size(),
             cache: CacheConfig::default(),
             autovac_interval_secs: default_autovac_interval(),
-            snapshot_interval_secs: default_snapshot_interval(),
-            wal_flush_strategy: default_wal_flush_strategy(),
+            merge_interval_ms: default_merge_interval_ms(),
             prometheus_port: default_prometheus_port(),
             flush_interval_us: default_flush_interval_us(),
             channel_capacity: default_channel_capacity(),
@@ -150,16 +142,6 @@ impl Config {
             return Err(BitdexError::Config(
                 "cache.decay_rate must be in (0.0, 1.0]".to_string(),
             ));
-        }
-
-        // Validate WAL flush strategy
-        match self.wal_flush_strategy.as_str() {
-            "fsync" | "async" => {}
-            other => {
-                return Err(BitdexError::Config(format!(
-                    "wal_flush_strategy must be 'fsync' or 'async', got '{other}'"
-                )));
-            }
         }
 
         // Check for duplicate filter field names
@@ -275,8 +257,7 @@ mod tests {
         assert_eq!(config.cache.max_entries, 10_000);
         assert_eq!(config.cache.decay_rate, 0.95);
         assert_eq!(config.autovac_interval_secs, 3600);
-        assert_eq!(config.snapshot_interval_secs, 300);
-        assert_eq!(config.wal_flush_strategy, "fsync");
+        assert_eq!(config.merge_interval_ms, 5000);
         assert_eq!(config.prometheus_port, 9090);
         assert!(config.validate().is_ok());
     }
@@ -286,8 +267,7 @@ mod tests {
         let toml_str = r#"
 max_page_size = 50
 autovac_interval_secs = 7200
-snapshot_interval_secs = 600
-wal_flush_strategy = "async"
+merge_interval_ms = 3000
 prometheus_port = 9191
 
 [cache]
@@ -322,8 +302,7 @@ bits = 32
         assert_eq!(config.cache.max_entries, 5000);
         assert_eq!(config.cache.decay_rate, 0.9);
         assert_eq!(config.autovac_interval_secs, 7200);
-        assert_eq!(config.snapshot_interval_secs, 600);
-        assert_eq!(config.wal_flush_strategy, "async");
+        assert_eq!(config.merge_interval_ms, 3000);
         assert_eq!(config.prometheus_port, 9191);
         assert_eq!(config.filter_fields.len(), 3);
         assert_eq!(config.sort_fields.len(), 2);
@@ -460,26 +439,6 @@ cache:
     }
 
     #[test]
-    fn test_validation_rejects_invalid_wal_strategy() {
-        let config = Config {
-            wal_flush_strategy: "never".to_string(),
-            ..Default::default()
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_validation_accepts_valid_wal_strategies() {
-        for strategy in &["fsync", "async"] {
-            let config = Config {
-                wal_flush_strategy: strategy.to_string(),
-                ..Default::default()
-            };
-            assert!(config.validate().is_ok());
-        }
-    }
-
-    #[test]
     fn test_validation_rejects_duplicate_filter_fields() {
         let config = Config {
             filter_fields: vec![
@@ -572,8 +531,7 @@ cache:
         let toml_str = r#"
 max_page_size = 100
 autovac_interval_secs = 3600
-snapshot_interval_secs = 300
-wal_flush_strategy = "fsync"
+merge_interval_ms = 5000
 prometheus_port = 9090
 
 [cache]
@@ -645,7 +603,7 @@ bits = 32
         let yaml = r#"
 max_page_size: 100
 autovac_interval_secs: 3600
-snapshot_interval_secs: 300
+merge_interval_ms: 5000
 prometheus_port: 9090
 
 filter_fields:

@@ -228,15 +228,33 @@ impl WriteBatch {
             }
         }
 
-        // Apply alive inserts in bulk
+        // Apply alive inserts in bulk (writes to diff layer)
         if !self.alive_inserts.is_empty() {
-            slots.alive_bitmap_mut().extend(self.alive_inserts.iter().copied());
+            slots.alive_insert_bulk(self.alive_inserts.iter().copied());
         }
 
-        // Apply alive removes
+        // Apply alive removes (writes to diff layer)
         for &slot in &self.alive_removes {
-            slots.alive_bitmap_mut().remove(slot);
+            slots.alive_remove_one(slot);
         }
+
+        // Eager merge: sort diffs MUST be empty before readers see them.
+        // Merge only sort fields that were mutated in this batch.
+        let mut mutated_sort_fields: HashSet<&str> = HashSet::new();
+        for key in self.sort_sets.keys() {
+            mutated_sort_fields.insert(&key.field);
+        }
+        for key in self.sort_clears.keys() {
+            mutated_sort_fields.insert(&key.field);
+        }
+        for field_name in &mutated_sort_fields {
+            if let Some(field) = sorts.get_field_mut(field_name) {
+                field.merge_dirty();
+            }
+        }
+
+        // Merge alive bitmap
+        slots.merge_alive();
     }
 }
 

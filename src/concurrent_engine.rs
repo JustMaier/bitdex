@@ -51,6 +51,7 @@ pub struct ConcurrentEngine {
     in_flight: InFlightTracker,
     shutdown: Arc<AtomicBool>,
     flush_handle: Option<JoinHandle<()>>,
+    merge_handle: Option<JoinHandle<()>>,
 }
 
 impl ConcurrentEngine {
@@ -208,6 +209,21 @@ impl ConcurrentEngine {
             })
         };
 
+        let merge_handle = {
+            let shutdown = Arc::clone(&shutdown);
+            let merge_interval_ms = config.merge_interval_ms;
+
+            thread::spawn(move || {
+                let sleep_duration = Duration::from_millis(merge_interval_ms);
+                while !shutdown.load(Ordering::Relaxed) {
+                    thread::sleep(sleep_duration);
+                    // Merge thread is lightweight for now:
+                    // Filter bitmaps don't use VersionedBitmap yet (Phase A).
+                    // When they do, this thread will compact filter diffs and write to redb.
+                }
+            })
+        };
+
         Ok(Self {
             inner,
             cache,
@@ -219,6 +235,7 @@ impl ConcurrentEngine {
             in_flight: InFlightTracker::new(),
             shutdown,
             flush_handle: Some(flush_handle),
+            merge_handle: Some(merge_handle),
         })
     }
 
@@ -346,7 +363,7 @@ impl ConcurrentEngine {
         );
 
         let (filter_bitmap, use_simple_sort) =
-            self.resolve_filters(&executor, filters)?;
+            self.resolve_filters(&executor, filters, sort.is_some())?;
 
         let mut result =
             executor.execute_from_bitmap(filter_bitmap, sort, limit, None, use_simple_sort)?;
@@ -368,7 +385,7 @@ impl ConcurrentEngine {
         );
 
         let (filter_bitmap, use_simple_sort) =
-            self.resolve_filters(&executor, &query.filters)?;
+            self.resolve_filters(&executor, &query.filters, query.sort.is_some())?;
 
         let mut result = executor.execute_from_bitmap(
             filter_bitmap,
@@ -391,8 +408,9 @@ impl ConcurrentEngine {
         &self,
         executor: &QueryExecutor,
         filters: &[FilterClause],
+        has_sort: bool,
     ) -> Result<(roaring::RoaringBitmap, bool)> {
-        let plan = planner::plan_query(filters, executor.filter_index(), executor.slot_allocator());
+        let plan = planner::plan_query(filters, executor.filter_index(), executor.slot_allocator(), has_sort);
         let cache_key = cache::canonicalize(&plan.ordered_clauses);
 
         let filter_bitmap = if let Some(ref key) = cache_key {
@@ -605,10 +623,13 @@ impl ConcurrentEngine {
         result
     }
 
-    /// Shutdown the flush thread gracefully.
+    /// Shutdown the flush and merge threads gracefully.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_handle.take() {
+            handle.join().ok();
+        }
+        if let Some(handle) = self.merge_handle.take() {
             handle.join().ok();
         }
     }
@@ -1165,5 +1186,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.ids, vec![1]);
+    }
+
+    #[test]
+    fn test_merge_thread_starts_and_stops() {
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+        // Just verify it starts and shuts down cleanly
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_two_threads_independent() {
+        let engine = Arc::new(ConcurrentEngine::new(test_config()).unwrap());
+
+        // Insert a doc to exercise the flush thread
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(42))),
+                ]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Query to verify flush worked while merge thread is also running
+        let result = engine
+            .query(
+                &[FilterClause::Eq(
+                    "nsfwLevel".to_string(),
+                    Value::Integer(1),
+                )],
+                None,
+                100,
+            )
+            .unwrap();
+        assert!(result.ids.contains(&1));
     }
 }

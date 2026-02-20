@@ -4,6 +4,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::error::{BitdexError, Result};
+use crate::versioned_bitmap::VersionedBitmap;
 
 /// Manages slot allocation, the alive bitmap, and the clean bitmap for slot recycling.
 ///
@@ -14,14 +15,15 @@ use crate::error::{BitdexError, Result};
 /// - An autovac process periodically produces a clean bitmap of recycled slots.
 /// - New inserts check the clean bitmap first (grab first set bit), append only if none available.
 ///
-/// Bitmaps are Arc-wrapped for clone-on-write: cloning the allocator only bumps
-/// refcounts. `Arc::make_mut` on mutation ensures copy-on-write semantics.
+/// The alive bitmap uses VersionedBitmap for diff-based mutation with eager merge.
+/// Mutations write to the diff layer; merge compacts diffs before readers see them.
+/// The clean bitmap remains Arc-wrapped since it is only touched by autovac.
 pub struct SlotAllocator {
     /// Next slot to assign if no recycled slots are available.
     next_slot: AtomicU32,
 
     /// Bitmap of all alive (active) documents. ANDed into every query.
-    alive: Arc<RoaringBitmap>,
+    alive: VersionedBitmap,
 
     /// Bitmap of slots that have been cleaned by autovac and are available for reuse.
     clean: Arc<RoaringBitmap>,
@@ -31,7 +33,7 @@ impl Clone for SlotAllocator {
     fn clone(&self) -> Self {
         Self {
             next_slot: AtomicU32::new(self.next_slot.load(Ordering::Relaxed)),
-            alive: Arc::clone(&self.alive),
+            alive: self.alive.clone(),
             clean: Arc::clone(&self.clean),
         }
     }
@@ -41,7 +43,7 @@ impl SlotAllocator {
     pub fn new() -> Self {
         Self {
             next_slot: AtomicU32::new(0),
-            alive: Arc::new(RoaringBitmap::new()),
+            alive: VersionedBitmap::new_empty(),
             clean: Arc::new(RoaringBitmap::new()),
         }
     }
@@ -50,7 +52,7 @@ impl SlotAllocator {
     pub fn from_state(next_slot: u32, alive: RoaringBitmap, clean: RoaringBitmap) -> Self {
         Self {
             next_slot: AtomicU32::new(next_slot),
-            alive: Arc::new(alive),
+            alive: VersionedBitmap::new(alive),
             clean: Arc::new(clean),
         }
     }
@@ -71,8 +73,8 @@ impl SlotAllocator {
         // Remove from clean bitmap if it was a recycled slot
         Arc::make_mut(&mut self.clean).remove(slot);
 
-        // Mark as alive
-        Arc::make_mut(&mut self.alive).insert(slot);
+        // Mark as alive (writes to diff layer)
+        self.alive.insert(slot);
 
         Ok(slot)
     }
@@ -83,13 +85,13 @@ impl SlotAllocator {
         // Try to reuse a cleaned slot first
         if let Some(recycled) = self.clean.min() {
             Arc::make_mut(&mut self.clean).remove(recycled);
-            Arc::make_mut(&mut self.alive).insert(recycled);
+            self.alive.insert(recycled);
             return recycled;
         }
 
         // No recycled slots, use next sequential
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
-        Arc::make_mut(&mut self.alive).insert(slot);
+        self.alive.insert(slot);
         slot
     }
 
@@ -99,11 +101,11 @@ impl SlotAllocator {
         if !self.alive.contains(slot) {
             return Err(BitdexError::SlotNotFound(slot));
         }
-        Arc::make_mut(&mut self.alive).remove(slot);
+        self.alive.remove(slot);
         Ok(())
     }
 
-    /// Check if a slot is alive.
+    /// Check if a slot is alive (checks base + diff).
     pub fn is_alive(&self, slot: u32) -> bool {
         self.alive.contains(slot)
     }
@@ -115,14 +117,25 @@ impl SlotAllocator {
         slot < self.next_slot.load(Ordering::Relaxed)
     }
 
-    /// Get a reference to the alive bitmap. This is ANDed into every query.
+    /// Get a reference to the alive bitmap's base. This is ANDed into every query.
+    /// Requires that the alive bitmap has been merged (no pending diff).
     pub fn alive_bitmap(&self) -> &RoaringBitmap {
-        &self.alive
+        self.alive.base().as_ref()
     }
 
-    /// Get a mutable reference to the alive bitmap (CoW via Arc::make_mut).
-    pub fn alive_bitmap_mut(&mut self) -> &mut RoaringBitmap {
-        Arc::make_mut(&mut self.alive)
+    /// Bulk-insert slots into the alive bitmap's diff layer.
+    pub fn alive_insert_bulk(&mut self, slots: impl IntoIterator<Item = u32>) {
+        self.alive.insert_bulk(slots);
+    }
+
+    /// Remove a single slot from the alive bitmap's diff layer.
+    pub fn alive_remove_one(&mut self, slot: u32) {
+        self.alive.remove(slot);
+    }
+
+    /// Merge the alive bitmap's diff into its base.
+    pub fn merge_alive(&mut self) {
+        self.alive.merge();
     }
 
     /// Get the clean bitmap (recycled slots available for reuse).
@@ -144,9 +157,9 @@ impl SlotAllocator {
         Arc::make_mut(&mut self.clean).insert(slot);
     }
 
-    /// Get the number of alive documents.
+    /// Get the number of alive documents (from merged base).
     pub fn alive_count(&self) -> u64 {
-        self.alive.len()
+        self.alive.base_len()
     }
 
     /// Get the number of dead (deleted but not yet cleaned) slots.
@@ -156,7 +169,7 @@ impl SlotAllocator {
     /// autovac should scan `NOT alive AND NOT clean AND slot < counter`.
     pub fn dead_count(&self) -> u64 {
         let counter = self.next_slot.load(Ordering::Relaxed) as u64;
-        counter.saturating_sub(self.alive.len()).saturating_sub(self.clean.len())
+        counter.saturating_sub(self.alive.base_len()).saturating_sub(self.clean.len())
     }
 
     /// Get the number of clean (recycled) slots available for reuse.
@@ -171,7 +184,7 @@ impl SlotAllocator {
 
     /// Return the serialized byte size of all bitmaps owned by the slot allocator.
     pub fn bitmap_bytes(&self) -> usize {
-        self.alive.serialized_size() + self.clean.serialized_size()
+        self.alive.bitmap_bytes() + self.clean.serialized_size()
     }
 }
 
@@ -191,6 +204,7 @@ mod tests {
         let slot = alloc.allocate(42).unwrap();
         assert_eq!(slot, 42);
         assert!(alloc.is_alive(42));
+        alloc.merge_alive();
         assert_eq!(alloc.alive_count(), 1);
         assert_eq!(alloc.slot_counter(), 43);
     }
@@ -204,6 +218,7 @@ mod tests {
         assert_eq!(s0, 0);
         assert_eq!(s1, 1);
         assert_eq!(s2, 2);
+        alloc.merge_alive();
         assert_eq!(alloc.alive_count(), 3);
         assert_eq!(alloc.slot_counter(), 3);
     }
@@ -216,6 +231,7 @@ mod tests {
 
         alloc.delete(10).unwrap();
         assert!(!alloc.is_alive(10));
+        alloc.merge_alive();
         assert_eq!(alloc.alive_count(), 0);
     }
 
@@ -238,6 +254,7 @@ mod tests {
         // Slot is dead but NOT clean (autovac hasn't run)
         assert!(!alloc.is_alive(5));
         assert!(!alloc.clean_bitmap().contains(5));
+        alloc.merge_alive();
         assert_eq!(alloc.dead_count(), 1);
     }
 
@@ -247,7 +264,9 @@ mod tests {
 
         // Allocate and delete slot 0
         alloc.allocate(0).unwrap();
+        alloc.merge_alive();
         alloc.delete(0).unwrap();
+        alloc.merge_alive();
 
         // Simulate autovac marking slot 0 as clean
         alloc.mark_clean(0);
@@ -283,6 +302,7 @@ mod tests {
         for i in (0..10).step_by(2) {
             alloc.delete(i).unwrap();
         }
+        alloc.merge_alive();
 
         let alive = alloc.alive_bitmap();
         assert_eq!(alive.len(), 5);
@@ -303,6 +323,7 @@ mod tests {
         }
         alloc.delete(3).unwrap();
         alloc.delete(7).unwrap();
+        alloc.merge_alive();
         assert_eq!(alloc.dead_count(), 2);
 
         // Clean one of them

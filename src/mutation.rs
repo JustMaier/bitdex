@@ -469,6 +469,12 @@ impl<'a> MutationEngine<'a> {
         };
         self.docstore.put(id, &stored)?;
 
+        // Eager merge: sort diffs and alive must be compacted before readers see them
+        for (_name, field) in self.sorts.fields_mut() {
+            field.merge_dirty();
+        }
+        self.slots.merge_alive();
+
         Ok(())
     }
 
@@ -722,6 +728,11 @@ impl<'a> MutationEngine<'a> {
             }
         }
 
+        // Eager merge: sort diffs must be compacted before readers see them
+        for (_name, field) in self.sorts.fields_mut() {
+            field.merge_dirty();
+        }
+
         Ok(())
     }
 
@@ -729,7 +740,9 @@ impl<'a> MutationEngine<'a> {
     ///
     /// All other bitmaps retain stale bits -- they're invisible behind the alive gate.
     pub fn delete(&mut self, id: u32) -> Result<()> {
-        self.slots.delete(id)
+        self.slots.delete(id)?;
+        self.slots.merge_alive();
+        Ok(())
     }
 
     /// DELETE WHERE(predicate) -- resolve predicate, clear alive bits.
@@ -744,6 +757,7 @@ impl<'a> MutationEngine<'a> {
                 count += 1;
             }
         }
+        self.slots.merge_alive();
         Ok(count)
     }
 }
