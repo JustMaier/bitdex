@@ -4,40 +4,45 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use arc_swap::{ArcSwap, Guard};
 use crossbeam_channel::{Receiver, Sender};
-use parking_lot::RwLock;
 
-use crate::cache::TrieCache;
+use crate::cache::{self, CacheLookup, TrieCache};
 use crate::concurrency::InFlightTracker;
 use crate::config::Config;
 use crate::docstore::{DocStore, StoredDoc};
 use crate::error::Result;
 use crate::executor::QueryExecutor;
 use crate::mutation::{diff_document, diff_patch, Document, FieldRegistry, PatchPayload};
+use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause};
 use crate::types::QueryResult;
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 
-/// Inner bitmap state protected by the RwLock.
-/// Separated from ConcurrentEngine so the flush thread can take
-/// a write lock on just the bitmap state.
+/// Inner bitmap state published as immutable snapshots via ArcSwap.
+///
+/// All fields are Clone via Arc-per-bitmap CoW. Cloning bumps refcounts
+/// on the Arc-wrapped bitmaps — zero data copy. Actual bitmap data is
+/// only cloned on mutation via `Arc::make_mut()`.
+#[derive(Clone)]
 pub struct InnerEngine {
     pub slots: crate::slot::SlotAllocator,
     pub filters: crate::filter::FilterIndex,
     pub sorts: crate::sort::SortIndex,
-    pub cache: parking_lot::Mutex<TrieCache>,
 }
 
-/// Thread-safe engine wrapper that uses RwLock + WriteCoalescer
-/// for concurrent reads and writes.
+/// Thread-safe engine using ArcSwap for lock-free snapshot reads.
 ///
 /// Writers call `put`/`patch`/`delete` which compute diffs and send
-/// MutationOps to a channel. A background flush thread periodically
-/// takes a write lock and applies batched mutations.
+/// MutationOps to a channel. A background flush thread applies batched
+/// mutations to a private staging copy, then atomically publishes a
+/// new snapshot via ArcSwap::store().
 ///
-/// Readers take a shared read lock to execute queries.
+/// Readers load the current snapshot via `load_full()` — fully lock-free,
+/// no contention with writers or the flush thread.
 pub struct ConcurrentEngine {
-    inner: Arc<RwLock<InnerEngine>>,
+    inner: Arc<ArcSwap<InnerEngine>>,
+    cache: Arc<parking_lot::Mutex<TrieCache>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<DocStore>,
@@ -75,26 +80,29 @@ impl ConcurrentEngine {
         }
 
         let field_registry = FieldRegistry::from_config(&config);
-        let cache = TrieCache::new(config.cache.clone());
+        let cache = Arc::new(parking_lot::Mutex::new(TrieCache::new(config.cache.clone())));
 
-        let inner = Arc::new(RwLock::new(InnerEngine {
+        let inner_engine = InnerEngine {
             slots: crate::slot::SlotAllocator::new(),
             filters,
             sorts,
-            cache: parking_lot::Mutex::new(cache),
-        }));
+        };
+
+        // Flush thread owns a staging clone; readers see published snapshots
+        let mut staging = inner_engine.clone();
+        let inner = Arc::new(ArcSwap::new(Arc::new(inner_engine)));
 
         let (mut coalescer, sender) = WriteCoalescer::new(config.channel_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Arc::new(config);
 
-        // Docstore write channel — bounded for backpressure, same capacity as mutation channel
+        // Docstore write channel — bounded for backpressure
         let (doc_tx, doc_rx): (Sender<(u32, StoredDoc)>, Receiver<(u32, StoredDoc)>) =
             crossbeam_channel::bounded(config.channel_capacity);
 
         let docstore = Arc::new(docstore);
 
-        // Collect filter field names for cache invalidation in the flush thread
+        // Collect filter field names for cache invalidation
         let filter_field_names: Vec<String> = config
             .filter_fields
             .iter()
@@ -103,6 +111,7 @@ impl ConcurrentEngine {
 
         let flush_handle = {
             let inner = Arc::clone(&inner);
+            let cache = Arc::clone(&cache);
             let shutdown = Arc::clone(&shutdown);
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
@@ -110,35 +119,48 @@ impl ConcurrentEngine {
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
-                let max_sleep = Duration::from_micros(flush_interval_us * 10); // 10x base = ~1ms at default
+                let max_sleep = Duration::from_micros(flush_interval_us * 10);
                 let mut current_sleep = min_sleep;
                 let mut doc_batch: Vec<(u32, StoredDoc)> = Vec::new();
 
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
 
-                    // Phase 1: Take write lock, flush bitmap mutations
-                    let bitmap_count = {
-                        let mut guard = inner.write();
-                        let ie = &mut *guard;
-                        let count = coalescer.flush(
-                            &mut ie.slots,
-                            &mut ie.filters,
-                            &mut ie.sorts,
+                    // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
+                    let bitmap_count = coalescer.prepare();
+
+                    // Phase 2: Apply mutations to staging (private, no lock needed)
+                    if bitmap_count > 0 {
+                        coalescer.apply_prepared(
+                            &mut staging.slots,
+                            &mut staging.filters,
+                            &mut staging.sorts,
                         );
 
-                        if count > 0 {
-                            let mut cache = ie.cache.lock();
+                        // Targeted cache invalidation: only invalidate fields that actually changed.
+                        // Sort-only flushes (e.g., reactionCount updates) skip invalidation entirely.
+                        if coalescer.has_alive_mutations() {
+                            // Alive changed — invalidate all filter fields because NotEq/Not
+                            // bake alive into cached results.
+                            let mut c = cache.lock();
                             for name in &field_names {
-                                cache.invalidate_field(name);
+                                c.invalidate_field(name);
+                            }
+                        } else {
+                            let changed = coalescer.mutated_filter_fields();
+                            if !changed.is_empty() {
+                                let mut c = cache.lock();
+                                for name in &changed {
+                                    c.invalidate_field(name);
+                                }
                             }
                         }
-                        count
-                    };
-                    // Write lock released here
 
-                    // Phase 2: Drain docstore channel and batch write OUTSIDE the RwLock
-                    // (redb has its own internal locking — no need to hold bitmap lock)
+                        // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
+                        inner.store(Arc::new(staging.clone()));
+                    }
+
+                    // Phase 3: Drain docstore channel and batch write
                     doc_batch.clear();
                     while let Ok(item) = doc_rx.try_recv() {
                         doc_batch.push(item);
@@ -158,20 +180,19 @@ impl ConcurrentEngine {
                 }
 
                 // Final flush on shutdown
-                {
-                    let mut guard = inner.write();
-                    let ie = &mut *guard;
-                    let count = coalescer.flush(
-                        &mut ie.slots,
-                        &mut ie.filters,
-                        &mut ie.sorts,
+                let count = coalescer.prepare();
+                if count > 0 {
+                    coalescer.apply_prepared(
+                        &mut staging.slots,
+                        &mut staging.filters,
+                        &mut staging.sorts,
                     );
-                    if count > 0 {
-                        let mut cache = ie.cache.lock();
-                        for name in &field_names {
-                            cache.invalidate_field(name);
-                        }
+                    // Shutdown: invalidate all fields for safety
+                    let mut c = cache.lock();
+                    for name in &field_names {
+                        c.invalidate_field(name);
                     }
+                    inner.store(Arc::new(staging.clone()));
                 }
 
                 // Final docstore drain
@@ -189,6 +210,7 @@ impl ConcurrentEngine {
 
         Ok(Self {
             inner,
+            cache,
             sender,
             doc_tx,
             docstore,
@@ -200,10 +222,19 @@ impl ConcurrentEngine {
         })
     }
 
+    /// Load the current snapshot (lock-free, zero refcount ops).
+    ///
+    /// Returns a Guard that derefs to Arc<InnerEngine>. Unlike `load_full()`,
+    /// this avoids atomic refcount increment/decrement and moves deallocation
+    /// of old snapshots off the reader path onto the flush thread's `store()`.
+    fn snapshot(&self) -> Guard<Arc<InnerEngine>> {
+        self.inner.load()
+    }
+
     /// PUT(id, document) -- full replace with upsert semantics.
     ///
     /// 1. Mark in-flight
-    /// 2. Check alive status (read lock)
+    /// 2. Check alive status (lock-free snapshot)
     /// 3. Read old doc from docstore if upsert
     /// 4. Diff old vs new -> MutationOps
     /// 5. Send ops to coalescer channel
@@ -213,12 +244,12 @@ impl ConcurrentEngine {
         self.in_flight.mark_in_flight(id);
 
         let result = (|| -> Result<()> {
-            // Check alive status and allocation in a single read lock
+            // Check alive status via lock-free snapshot
             let (is_upsert, was_allocated) = {
-                let guard = self.inner.read();
-                let alive = guard.slots.is_alive(id);
+                let snap = self.snapshot();
+                let alive = snap.slots.is_alive(id);
                 let alloc = if !alive {
-                    guard.slots.was_ever_allocated(id)
+                    snap.slots.was_ever_allocated(id)
                 } else {
                     false
                 };
@@ -242,7 +273,7 @@ impl ConcurrentEngine {
                 )
             })?;
 
-            // Enqueue doc write — flush thread will batch these into a single redb transaction
+            // Enqueue doc write — flush thread will batch these
             let stored = StoredDoc {
                 fields: doc.fields.clone(),
             };
@@ -264,10 +295,10 @@ impl ConcurrentEngine {
         self.in_flight.mark_in_flight(id);
 
         let result = (|| -> Result<()> {
-            // Verify the slot is alive
+            // Verify the slot is alive via lock-free snapshot
             {
-                let guard = self.inner.read();
-                if !guard.slots.is_alive(id) {
+                let snap = self.snapshot();
+                if !snap.slots.is_alive(id) {
                     return Err(crate::error::BitdexError::SlotNotFound(id));
                 }
             }
@@ -306,20 +337,19 @@ impl ConcurrentEngine {
         sort: Option<&SortClause>,
         limit: usize,
     ) -> Result<QueryResult> {
-        let guard = self.inner.read();
+        let snap = self.snapshot(); // lock-free
         let executor = QueryExecutor::new(
-            &guard.slots,
-            &guard.filters,
-            &guard.sorts,
+            &snap.slots,
+            &snap.filters,
+            &snap.sorts,
             self.config.max_page_size,
         );
-        let mut result = executor.execute_with_cache(
-            filters,
-            sort,
-            limit,
-            None,
-            &mut guard.cache.lock(),
-        )?;
+
+        let (filter_bitmap, use_simple_sort) =
+            self.resolve_filters(&executor, filters)?;
+
+        let mut result =
+            executor.execute_from_bitmap(filter_bitmap, sort, limit, None, use_simple_sort)?;
 
         // Post-validation against in-flight writes
         self.post_validate(&mut result, filters, &executor)?;
@@ -329,24 +359,73 @@ impl ConcurrentEngine {
 
     /// Execute a parsed BitdexQuery.
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
-        let guard = self.inner.read();
+        let snap = self.snapshot(); // lock-free
         let executor = QueryExecutor::new(
-            &guard.slots,
-            &guard.filters,
-            &guard.sorts,
+            &snap.slots,
+            &snap.filters,
+            &snap.sorts,
             self.config.max_page_size,
         );
-        let mut result = executor.execute_with_cache(
-            &query.filters,
+
+        let (filter_bitmap, use_simple_sort) =
+            self.resolve_filters(&executor, &query.filters)?;
+
+        let mut result = executor.execute_from_bitmap(
+            filter_bitmap,
             query.sort.as_ref(),
             query.limit,
             query.cursor.as_ref(),
-            &mut guard.cache.lock(),
+            use_simple_sort,
         )?;
 
         self.post_validate(&mut result, &query.filters, &executor)?;
 
         Ok(result)
+    }
+
+    /// Resolve filter clauses to a bitmap, using the trie cache with brief locks.
+    ///
+    /// Cache Mutex is held ONLY during lookup (~μs) and store (~μs),
+    /// never during filter computation or sort traversal.
+    fn resolve_filters(
+        &self,
+        executor: &QueryExecutor,
+        filters: &[FilterClause],
+    ) -> Result<(roaring::RoaringBitmap, bool)> {
+        let plan = planner::plan_query(filters, executor.filter_index(), executor.slot_allocator());
+        let cache_key = cache::canonicalize(&plan.ordered_clauses);
+
+        let filter_bitmap = if let Some(ref key) = cache_key {
+            // Brief lock: cache lookup only
+            let lookup = { self.cache.lock().lookup(key) };
+            // Lock released — CacheLookup owns its bitmaps
+
+            match lookup {
+                CacheLookup::ExactHit(bitmap) => bitmap,
+                CacheLookup::PrefixHit { mut bitmap, matched_prefix_len } => {
+                    // Compute remaining clauses (no lock held)
+                    for clause in &plan.ordered_clauses[matched_prefix_len..] {
+                        let clause_bm = executor.evaluate_clause(clause)?;
+                        bitmap &= &clause_bm;
+                    }
+                    // Brief lock: store result
+                    self.cache.lock().store(key, bitmap.clone());
+                    bitmap
+                }
+                CacheLookup::Miss => {
+                    // Full computation (no lock held)
+                    let bitmap = executor.compute_filters(&plan.ordered_clauses)?;
+                    // Brief lock: store result
+                    self.cache.lock().store(key, bitmap.clone());
+                    bitmap
+                }
+            }
+        } else {
+            // Uncacheable query — compute without cache
+            executor.compute_filters(&plan.ordered_clauses)?
+        };
+
+        Ok((filter_bitmap, plan.use_simple_sort))
     }
 
     /// Post-validate query results against in-flight writes.
@@ -365,7 +444,7 @@ impl ConcurrentEngine {
             return Ok(());
         }
 
-        // The executor holds references to the bitmap state (still under read lock)
+        // The executor holds references to the snapshot's bitmap state
         // so we can revalidate in-flight slots.
         let mut invalid_slots: Vec<u32> = Vec::new();
 
@@ -384,22 +463,22 @@ impl ConcurrentEngine {
         Ok(())
     }
 
-    /// Get a reference to the inner engine (for advanced use cases).
-    pub fn inner(&self) -> &Arc<RwLock<InnerEngine>> {
-        &self.inner
+    /// Load the current snapshot (lock-free). Public API for advanced use.
+    pub fn snapshot_public(&self) -> Arc<InnerEngine> {
+        self.inner.load_full()
     }
 
-    /// Get the number of alive documents (requires read lock).
+    /// Get the number of alive documents (lock-free snapshot).
     pub fn alive_count(&self) -> u64 {
-        self.inner.read().slots.alive_count()
+        self.snapshot().slots.alive_count()
     }
 
-    /// Get the high-water mark slot counter (requires read lock).
+    /// Get the high-water mark slot counter (lock-free snapshot).
     pub fn slot_counter(&self) -> u32 {
-        self.inner.read().slots.slot_counter()
+        self.snapshot().slots.slot_counter()
     }
 
-    /// Report bitmap memory usage broken down by component (requires read lock).
+    /// Report bitmap memory usage broken down by component (lock-free snapshot).
     ///
     /// Returns (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes,
     ///          filter_details, sort_details)
@@ -408,21 +487,21 @@ impl ConcurrentEngine {
     pub fn bitmap_memory_report(
         &self,
     ) -> (usize, usize, usize, usize, usize, Vec<(String, usize, usize)>, Vec<(String, usize)>) {
-        let guard = self.inner.read();
-        let slot_bytes = guard.slots.bitmap_bytes();
-        let filter_bytes = guard.filters.bitmap_bytes();
-        let sort_bytes = guard.sorts.bitmap_bytes();
-        let cache = guard.cache.lock();
+        let snap = self.snapshot();
+        let slot_bytes = snap.slots.bitmap_bytes();
+        let filter_bytes = snap.filters.bitmap_bytes();
+        let sort_bytes = snap.sorts.bitmap_bytes();
+        let cache = self.cache.lock();
         let cache_entries = cache.len();
         let cache_bytes = cache.bitmap_bytes();
         drop(cache);
-        let filter_details: Vec<(String, usize, usize)> = guard
+        let filter_details: Vec<(String, usize, usize)> = snap
             .filters
             .per_field_bytes()
             .into_iter()
             .map(|(name, count, bytes)| (name.to_string(), count, bytes))
             .collect();
-        let sort_details: Vec<(String, usize)> = guard
+        let sort_details: Vec<(String, usize)> = snap
             .sorts
             .per_field_bytes()
             .into_iter()
@@ -439,6 +518,91 @@ impl ConcurrentEngine {
     /// Get a reference to the in-flight tracker.
     pub fn in_flight(&self) -> &InFlightTracker {
         &self.in_flight
+    }
+
+    /// PUT_MANY -- batch version of put() for throughput experiments.
+    ///
+    /// Batches the work: one snapshot load for all alive/allocation checks,
+    /// computes all diffs, sends all ops, enqueues all docstore writes, then clears
+    /// in-flight tracking.
+    ///
+    /// EXPERIMENTAL: This is a temporary method for benchmarking put_many vs put-in-loop.
+    pub fn put_many(&self, docs: &[(u32, Document)]) -> Result<()> {
+        // Phase 1: Mark all in-flight
+        for &(id, _) in docs {
+            self.in_flight.mark_in_flight(id);
+        }
+
+        let result = (|| -> Result<()> {
+            // Phase 2: Single snapshot load for all alive/allocation checks
+            let statuses: Vec<(u32, bool, bool)> = {
+                let snap = self.snapshot();
+                docs.iter()
+                    .map(|&(id, _)| {
+                        let alive = snap.slots.is_alive(id);
+                        let alloc = if !alive {
+                            snap.slots.was_ever_allocated(id)
+                        } else {
+                            false
+                        };
+                        (id, alive, alloc)
+                    })
+                    .collect()
+            };
+
+            // Phase 3: Batch docstore reads for upserts (outside any lock)
+            let old_docs: Vec<Option<crate::docstore::StoredDoc>> = statuses
+                .iter()
+                .map(|&(id, is_upsert, was_allocated)| {
+                    if is_upsert || was_allocated {
+                        self.docstore.get(id).ok().flatten()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Phase 4: Compute all diffs and collect all ops
+            let mut all_ops: Vec<MutationOp> = Vec::new();
+            let mut doc_writes: Vec<(u32, crate::docstore::StoredDoc)> = Vec::new();
+
+            for (i, &(id, ref doc)) in docs.iter().enumerate() {
+                let (_, is_upsert, _) = statuses[i];
+                let ops = diff_document(id, old_docs[i].as_ref(), doc, &self.config, is_upsert, &self.field_registry);
+                all_ops.extend(ops);
+                doc_writes.push((
+                    id,
+                    crate::docstore::StoredDoc {
+                        fields: doc.fields.clone(),
+                    },
+                ));
+            }
+
+            // Phase 5: Send all ops in one burst
+            self.sender.send_batch(all_ops).map_err(|_| {
+                crate::error::BitdexError::CapacityExceeded(
+                    "coalescer channel disconnected".to_string(),
+                )
+            })?;
+
+            // Phase 6: Enqueue all doc writes
+            for item in doc_writes {
+                self.doc_tx.send(item).map_err(|_| {
+                    crate::error::BitdexError::CapacityExceeded(
+                        "docstore channel disconnected".to_string(),
+                    )
+                })?;
+            }
+
+            Ok(())
+        })();
+
+        // Phase 7: Clear all in-flight
+        for &(id, _) in docs {
+            self.in_flight.clear_in_flight(id);
+        }
+
+        result
     }
 
     /// Shutdown the flush thread gracefully.

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
@@ -13,9 +14,12 @@ use crate::config::FilterFieldConfig;
 /// - single_value: each slot appears in exactly one bitmap per field
 /// - multi_value: each slot can appear in multiple bitmaps (e.g., tags)
 /// - boolean: two bitmaps (true/false), stored as values 0 and 1
+///
+/// Bitmaps are Arc-wrapped for clone-on-write snapshot sharing.
+#[derive(Clone)]
 pub struct FilterField {
     /// One bitmap per distinct value. Key is the u64 bitmap key.
-    bitmaps: HashMap<u64, RoaringBitmap>,
+    bitmaps: HashMap<u64, Arc<RoaringBitmap>>,
     /// Field configuration.
     config: FilterFieldConfig,
 }
@@ -40,16 +44,18 @@ impl FilterField {
 
     /// Set a slot's bit in the bitmap for the given value.
     pub fn insert(&mut self, value: u64, slot: u32) {
-        self.bitmaps
-            .entry(value)
-            .or_insert_with(RoaringBitmap::new)
-            .insert(slot);
+        Arc::make_mut(
+            self.bitmaps
+                .entry(value)
+                .or_insert_with(|| Arc::new(RoaringBitmap::new())),
+        )
+        .insert(slot);
     }
 
     /// Clear a slot's bit from the bitmap for the given value.
     pub fn remove(&mut self, value: u64, slot: u32) {
         if let Some(bm) = self.bitmaps.get_mut(&value) {
-            bm.remove(slot);
+            Arc::make_mut(bm).remove(slot);
             if bm.is_empty() {
                 self.bitmaps.remove(&value);
             }
@@ -59,17 +65,20 @@ impl FilterField {
     /// Bulk-insert multiple slots into the bitmap for the given value.
     /// Slots should be sorted for maximum roaring-rs `extend()` performance.
     pub fn insert_bulk(&mut self, value: u64, slots: impl IntoIterator<Item = u32>) {
-        self.bitmaps
-            .entry(value)
-            .or_insert_with(RoaringBitmap::new)
-            .extend(slots);
+        Arc::make_mut(
+            self.bitmaps
+                .entry(value)
+                .or_insert_with(|| Arc::new(RoaringBitmap::new())),
+        )
+        .extend(slots);
     }
 
     /// Bulk-remove multiple slots from the bitmap for the given value.
     pub fn remove_bulk(&mut self, value: u64, slots: &[u32]) {
         if let Some(bm) = self.bitmaps.get_mut(&value) {
+            let inner = Arc::make_mut(bm);
             for &slot in slots {
-                bm.remove(slot);
+                inner.remove(slot);
             }
             if bm.is_empty() {
                 self.bitmaps.remove(&value);
@@ -82,7 +91,7 @@ impl FilterField {
     pub fn remove_from_all(&mut self, slot: u32) {
         let mut empty_keys = Vec::new();
         for (&key, bm) in self.bitmaps.iter_mut() {
-            bm.remove(slot);
+            Arc::make_mut(bm).remove(slot);
             if bm.is_empty() {
                 empty_keys.push(key);
             }
@@ -94,7 +103,7 @@ impl FilterField {
 
     /// Get the bitmap for a specific value.
     pub fn get(&self, value: u64) -> Option<&RoaringBitmap> {
-        self.bitmaps.get(&value)
+        self.bitmaps.get(&value).map(|a| a.as_ref())
     }
 
     /// Get the cardinality (number of set bits) for a specific value.
@@ -112,7 +121,7 @@ impl FilterField {
         let mut result = RoaringBitmap::new();
         for value in values {
             if let Some(bm) = self.bitmaps.get(value) {
-                result |= bm;
+                result |= bm.as_ref();
             }
         }
         result
@@ -123,10 +132,10 @@ impl FilterField {
     pub fn intersection(&self, values: &[u64]) -> Option<RoaringBitmap> {
         let mut iter = values.iter();
         let first = iter.next()?;
-        let mut result = self.bitmaps.get(first)?.clone();
+        let mut result: RoaringBitmap = self.bitmaps.get(first)?.as_ref().clone();
         for value in iter {
             match self.bitmaps.get(value) {
-                Some(bm) => result &= bm,
+                Some(bm) => result &= bm.as_ref(),
                 None => return Some(RoaringBitmap::new()), // Empty intersection
             }
         }
@@ -135,7 +144,7 @@ impl FilterField {
 
     /// Iterate over all (value, bitmap) pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &RoaringBitmap)> {
-        self.bitmaps.iter()
+        self.bitmaps.iter().map(|(k, v)| (k, v.as_ref()))
     }
 
     /// Get the total number of bitmaps.
@@ -162,9 +171,16 @@ pub enum FilterFieldType {
 }
 
 /// Manages all filter fields.
+///
+/// Each FilterField is Arc-wrapped for clone-on-write at the field level.
+/// Cloning FilterIndex copies only the outer HashMap (~5-10 entries, one per field)
+/// and bumps Arc refcounts — O(num_fields), not O(total_distinct_values).
+/// Mutation via `get_field_mut()` uses `Arc::make_mut()` to clone only the
+/// specific field being modified when shared with a published snapshot.
+#[derive(Clone)]
 pub struct FilterIndex {
-    /// Map from field name to FilterField.
-    fields: HashMap<String, FilterField>,
+    /// Map from field name to Arc-wrapped FilterField.
+    fields: HashMap<String, Arc<FilterField>>,
 }
 
 impl FilterIndex {
@@ -177,27 +193,29 @@ impl FilterIndex {
     /// Add a filter field from configuration.
     pub fn add_field(&mut self, config: FilterFieldConfig) {
         let name = config.name.clone();
-        self.fields.insert(name, FilterField::new(config));
+        self.fields.insert(name, Arc::new(FilterField::new(config)));
     }
 
     /// Get a reference to a filter field by name.
     pub fn get_field(&self, name: &str) -> Option<&FilterField> {
-        self.fields.get(name)
+        self.fields.get(name).map(|f| f.as_ref())
     }
 
     /// Get a mutable reference to a filter field by name.
+    /// Uses Arc::make_mut for clone-on-write: only clones the field's data
+    /// when shared with a published snapshot (refcount > 1).
     pub fn get_field_mut(&mut self, name: &str) -> Option<&mut FilterField> {
-        self.fields.get_mut(name)
+        self.fields.get_mut(name).map(|f| Arc::make_mut(f))
     }
 
     /// Iterate over all fields.
     pub fn fields(&self) -> impl Iterator<Item = (&String, &FilterField)> {
-        self.fields.iter()
+        self.fields.iter().map(|(k, v)| (k, v.as_ref()))
     }
 
     /// Iterate mutably over all fields.
     pub fn fields_mut(&mut self) -> impl Iterator<Item = (&String, &mut FilterField)> {
-        self.fields.iter_mut()
+        self.fields.iter_mut().map(|(k, v)| (k, Arc::make_mut(v)))
     }
 
     /// Get the total number of bitmaps across all fields.

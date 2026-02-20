@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -171,6 +171,25 @@ impl WriteBatch {
         self.alive_removes.sort_unstable();
     }
 
+    /// Returns true if this batch contains alive bitmap mutations (inserts or removes).
+    /// When alive changes, all cached NotEq/Not results are stale (they bake in alive).
+    pub fn has_alive_mutations(&self) -> bool {
+        !self.alive_inserts.is_empty() || !self.alive_removes.is_empty()
+    }
+
+    /// Returns the set of filter field names that were mutated in this batch.
+    /// Valid after `group_and_sort()` has been called.
+    pub fn mutated_filter_fields(&self) -> HashSet<&str> {
+        let mut fields = HashSet::new();
+        for key in self.filter_inserts.keys() {
+            fields.insert(&*key.field);
+        }
+        for key in self.filter_removes.keys() {
+            fields.insert(&*key.field);
+        }
+        fields
+    }
+
     /// Apply all grouped mutations to the bitmap state using bulk operations.
     ///
     /// For inserts: uses `extend()` with sorted slot IDs for maximum throughput.
@@ -308,6 +327,43 @@ impl WriteCoalescer {
         self.batch.group_and_sort();
         self.batch.apply(slots, filters, sorts);
         count
+    }
+
+    /// Phase 1: Drain channel and group/sort ops. No lock needed.
+    /// Returns the number of ops prepared (0 = nothing to apply).
+    pub fn prepare(&mut self) -> usize {
+        self.batch.drain_channel(&self.rx);
+
+        if self.batch.is_empty() {
+            return 0;
+        }
+
+        let count = self.batch.len();
+        self.batch.group_and_sort();
+        count
+    }
+
+    /// Phase 2: Apply the prepared batch to bitmap state. Requires write lock.
+    /// Only call after `prepare()` returned > 0.
+    pub fn apply_prepared(
+        &self,
+        slots: &mut SlotAllocator,
+        filters: &mut FilterIndex,
+        sorts: &mut SortIndex,
+    ) {
+        self.batch.apply(slots, filters, sorts);
+    }
+
+    /// Returns true if the prepared batch contains alive bitmap mutations.
+    /// When alive changes, cached NotEq/Not results (which bake in alive) are stale.
+    pub fn has_alive_mutations(&self) -> bool {
+        self.batch.has_alive_mutations()
+    }
+
+    /// Returns the set of filter field names mutated in the prepared batch.
+    /// Valid after `prepare()` returned > 0, before the next `prepare()` call.
+    pub fn mutated_filter_fields(&self) -> HashSet<&str> {
+        self.batch.mutated_filter_fields()
     }
 }
 

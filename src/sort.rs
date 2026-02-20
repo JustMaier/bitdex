@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use roaring::RoaringBitmap;
 
 use crate::config::SortFieldConfig;
@@ -13,9 +15,12 @@ use crate::config::SortFieldConfig;
 /// If the intersection has >= N results, narrow to that set and descend.
 /// If < N, keep both groups and continue. This is binary search across all documents
 /// simultaneously. All sort operations are bitmap AND operations.
+///
+/// Bit layers are Arc-wrapped for clone-on-write snapshot sharing.
+#[derive(Clone)]
 pub struct SortField {
     /// One bitmap per bit position. Index 0 = LSB, index 31 = MSB (for 32-bit).
-    bit_layers: Vec<RoaringBitmap>,
+    bit_layers: Vec<Arc<RoaringBitmap>>,
     /// Number of bit layers (typically 32 for u32).
     num_bits: usize,
     /// Field configuration.
@@ -25,7 +30,9 @@ pub struct SortField {
 impl SortField {
     pub fn new(config: SortFieldConfig) -> Self {
         let num_bits = config.bits as usize;
-        let bit_layers = (0..num_bits).map(|_| RoaringBitmap::new()).collect();
+        let bit_layers = (0..num_bits)
+            .map(|_| Arc::new(RoaringBitmap::new()))
+            .collect();
         Self {
             bit_layers,
             num_bits,
@@ -47,7 +54,7 @@ impl SortField {
     pub fn insert(&mut self, slot: u32, value: u32) {
         for bit in 0..self.num_bits {
             if (value >> bit) & 1 == 1 {
-                self.bit_layers[bit].insert(slot);
+                Arc::make_mut(&mut self.bit_layers[bit]).insert(slot);
             }
         }
     }
@@ -55,7 +62,7 @@ impl SortField {
     /// Remove a slot from all bit layers. Used by autovac.
     pub fn remove(&mut self, slot: u32) {
         for layer in &mut self.bit_layers {
-            layer.remove(slot);
+            Arc::make_mut(layer).remove(slot);
         }
     }
 
@@ -65,11 +72,12 @@ impl SortField {
         let diff = old_value ^ new_value;
         for bit in 0..self.num_bits {
             if (diff >> bit) & 1 == 1 {
+                let layer = Arc::make_mut(&mut self.bit_layers[bit]);
                 // This bit changed, flip it in the layer
-                if self.bit_layers[bit].contains(slot) {
-                    self.bit_layers[bit].remove(slot);
+                if layer.contains(slot) {
+                    layer.remove(slot);
                 } else {
-                    self.bit_layers[bit].insert(slot);
+                    layer.insert(slot);
                 }
             }
         }
@@ -78,22 +86,23 @@ impl SortField {
     /// Bulk-set a bit layer for multiple slots. Slots should be sorted for performance.
     pub fn set_layer_bulk(&mut self, bit: usize, slots: impl IntoIterator<Item = u32>) {
         if let Some(layer) = self.bit_layers.get_mut(bit) {
-            layer.extend(slots);
+            Arc::make_mut(layer).extend(slots);
         }
     }
 
     /// Bulk-clear a bit layer for multiple slots.
     pub fn clear_layer_bulk(&mut self, bit: usize, slots: &[u32]) {
         if let Some(layer) = self.bit_layers.get_mut(bit) {
+            let inner = Arc::make_mut(layer);
             for &slot in slots {
-                layer.remove(slot);
+                inner.remove(slot);
             }
         }
     }
 
     /// Get a reference to a specific bit layer.
     pub fn layer(&self, bit: usize) -> Option<&RoaringBitmap> {
-        self.bit_layers.get(bit)
+        self.bit_layers.get(bit).map(|a| a.as_ref())
     }
 
     /// Perform top-N sort traversal on a candidate set using MSB-to-LSB bifurcation.
@@ -166,7 +175,7 @@ impl SortField {
                 break;
             }
 
-            let layer = &self.bit_layers[bit];
+            let layer: &RoaringBitmap = &self.bit_layers[bit];
 
             // preferred = slots that have the "better" bit value at this position
             let preferred = if descending {
@@ -259,7 +268,7 @@ impl SortField {
             }
 
             let cursor_bit_set = (cursor_value >> bit) & 1 == 1;
-            let layer = &self.bit_layers[bit];
+            let layer: &RoaringBitmap = &self.bit_layers[bit];
 
             let equal_with_bit_set = &equal & layer;
             let equal_with_bit_clear = &equal - layer;
@@ -325,9 +334,15 @@ impl SortField {
 }
 
 /// Manages all sort fields.
+///
+/// Each SortField is Arc-wrapped for clone-on-write at the field level.
+/// Cloning SortIndex copies only the outer HashMap and bumps Arc refcounts.
+/// Mutation via `get_field_mut()` uses `Arc::make_mut()` to clone only the
+/// specific sort field being modified when shared with a published snapshot.
+#[derive(Clone)]
 pub struct SortIndex {
-    /// Map from field name to SortField.
-    fields: std::collections::HashMap<String, SortField>,
+    /// Map from field name to Arc-wrapped SortField.
+    fields: std::collections::HashMap<String, Arc<SortField>>,
 }
 
 impl SortIndex {
@@ -340,27 +355,29 @@ impl SortIndex {
     /// Add a sort field from configuration.
     pub fn add_field(&mut self, config: SortFieldConfig) {
         let name = config.name.clone();
-        self.fields.insert(name, SortField::new(config));
+        self.fields.insert(name, Arc::new(SortField::new(config)));
     }
 
     /// Get a reference to a sort field by name.
     pub fn get_field(&self, name: &str) -> Option<&SortField> {
-        self.fields.get(name)
+        self.fields.get(name).map(|f| f.as_ref())
     }
 
     /// Get a mutable reference to a sort field by name.
+    /// Uses Arc::make_mut for clone-on-write: only clones the field's data
+    /// when shared with a published snapshot (refcount > 1).
     pub fn get_field_mut(&mut self, name: &str) -> Option<&mut SortField> {
-        self.fields.get_mut(name)
+        self.fields.get_mut(name).map(|f| Arc::make_mut(f))
     }
 
     /// Iterate over all fields.
     pub fn fields(&self) -> impl Iterator<Item = (&String, &SortField)> {
-        self.fields.iter()
+        self.fields.iter().map(|(k, v)| (k, v.as_ref()))
     }
 
     /// Iterate mutably over all fields.
     pub fn fields_mut(&mut self) -> impl Iterator<Item = (&String, &mut SortField)> {
-        self.fields.iter_mut()
+        self.fields.iter_mut().map(|(k, v)| (k, Arc::make_mut(v)))
     }
 
     /// Return the serialized byte size of all bitmaps across all sort fields.

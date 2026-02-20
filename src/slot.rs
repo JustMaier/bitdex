@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
@@ -12,23 +13,36 @@ use crate::error::{BitdexError, Result};
 /// - Deleted slots are NOT immediately recycled -- the alive bitmap hides them.
 /// - An autovac process periodically produces a clean bitmap of recycled slots.
 /// - New inserts check the clean bitmap first (grab first set bit), append only if none available.
+///
+/// Bitmaps are Arc-wrapped for clone-on-write: cloning the allocator only bumps
+/// refcounts. `Arc::make_mut` on mutation ensures copy-on-write semantics.
 pub struct SlotAllocator {
     /// Next slot to assign if no recycled slots are available.
     next_slot: AtomicU32,
 
     /// Bitmap of all alive (active) documents. ANDed into every query.
-    alive: RoaringBitmap,
+    alive: Arc<RoaringBitmap>,
 
     /// Bitmap of slots that have been cleaned by autovac and are available for reuse.
-    clean: RoaringBitmap,
+    clean: Arc<RoaringBitmap>,
+}
+
+impl Clone for SlotAllocator {
+    fn clone(&self) -> Self {
+        Self {
+            next_slot: AtomicU32::new(self.next_slot.load(Ordering::Relaxed)),
+            alive: Arc::clone(&self.alive),
+            clean: Arc::clone(&self.clean),
+        }
+    }
 }
 
 impl SlotAllocator {
     pub fn new() -> Self {
         Self {
             next_slot: AtomicU32::new(0),
-            alive: RoaringBitmap::new(),
-            clean: RoaringBitmap::new(),
+            alive: Arc::new(RoaringBitmap::new()),
+            clean: Arc::new(RoaringBitmap::new()),
         }
     }
 
@@ -36,8 +50,8 @@ impl SlotAllocator {
     pub fn from_state(next_slot: u32, alive: RoaringBitmap, clean: RoaringBitmap) -> Self {
         Self {
             next_slot: AtomicU32::new(next_slot),
-            alive,
-            clean,
+            alive: Arc::new(alive),
+            clean: Arc::new(clean),
         }
     }
 
@@ -55,10 +69,10 @@ impl SlotAllocator {
         }
 
         // Remove from clean bitmap if it was a recycled slot
-        self.clean.remove(slot);
+        Arc::make_mut(&mut self.clean).remove(slot);
 
         // Mark as alive
-        self.alive.insert(slot);
+        Arc::make_mut(&mut self.alive).insert(slot);
 
         Ok(slot)
     }
@@ -68,14 +82,14 @@ impl SlotAllocator {
     pub fn allocate_next(&mut self) -> u32 {
         // Try to reuse a cleaned slot first
         if let Some(recycled) = self.clean.min() {
-            self.clean.remove(recycled);
-            self.alive.insert(recycled);
+            Arc::make_mut(&mut self.clean).remove(recycled);
+            Arc::make_mut(&mut self.alive).insert(recycled);
             return recycled;
         }
 
         // No recycled slots, use next sequential
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
-        self.alive.insert(slot);
+        Arc::make_mut(&mut self.alive).insert(slot);
         slot
     }
 
@@ -85,7 +99,7 @@ impl SlotAllocator {
         if !self.alive.contains(slot) {
             return Err(BitdexError::SlotNotFound(slot));
         }
-        self.alive.remove(slot);
+        Arc::make_mut(&mut self.alive).remove(slot);
         Ok(())
     }
 
@@ -106,9 +120,9 @@ impl SlotAllocator {
         &self.alive
     }
 
-    /// Get a mutable reference to the alive bitmap.
+    /// Get a mutable reference to the alive bitmap (CoW via Arc::make_mut).
     pub fn alive_bitmap_mut(&mut self) -> &mut RoaringBitmap {
-        &mut self.alive
+        Arc::make_mut(&mut self.alive)
     }
 
     /// Get the clean bitmap (recycled slots available for reuse).
@@ -116,9 +130,9 @@ impl SlotAllocator {
         &self.clean
     }
 
-    /// Get a mutable reference to the clean bitmap.
+    /// Get a mutable reference to the clean bitmap (CoW via Arc::make_mut).
     pub fn clean_bitmap_mut(&mut self) -> &mut RoaringBitmap {
-        &mut self.clean
+        Arc::make_mut(&mut self.clean)
     }
 
     /// Mark a slot as clean (recycled by autovac, available for reuse).
@@ -127,7 +141,7 @@ impl SlotAllocator {
             !self.alive.contains(slot),
             "cannot mark alive slot as clean"
         );
-        self.clean.insert(slot);
+        Arc::make_mut(&mut self.clean).insert(slot);
     }
 
     /// Get the number of alive documents.

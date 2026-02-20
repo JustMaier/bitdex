@@ -42,6 +42,16 @@ impl<'a> QueryExecutor<'a> {
         }
     }
 
+    /// Get a reference to the filter index.
+    pub fn filter_index(&self) -> &'a FilterIndex {
+        self.filters
+    }
+
+    /// Get a reference to the slot allocator.
+    pub fn slot_allocator(&self) -> &'a SlotAllocator {
+        self.slots
+    }
+
     /// Execute a full query: plan -> filter -> sort -> paginate -> return IDs.
     pub fn execute(
         &self,
@@ -177,10 +187,50 @@ impl<'a> QueryExecutor<'a> {
         Ok(true)
     }
 
+    /// Execute from a pre-computed filter bitmap: alive AND + sort + paginate.
+    /// Used when the caller handles cache interaction separately.
+    pub fn execute_from_bitmap(
+        &self,
+        filter_bitmap: RoaringBitmap,
+        sort: Option<&SortClause>,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+        use_simple_sort: bool,
+    ) -> Result<QueryResult> {
+        let limit = limit.min(self.max_page_size);
+
+        // AND with alive bitmap
+        let alive = self.slots.alive_bitmap();
+        let candidates = &filter_bitmap & alive;
+        let total_matched = candidates.len();
+
+        // Sort and paginate
+        let (ids, next_cursor) = if let Some(sort_clause) = sort {
+            if use_simple_sort {
+                self.simple_sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+            } else {
+                self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+            }
+        } else {
+            let ids: Vec<i64> = candidates.iter().take(limit).map(|s| s as i64).collect();
+            let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
+                sort_value: 0,
+                slot_id: last_id as u32,
+            });
+            (ids, next_cursor)
+        };
+
+        Ok(QueryResult {
+            ids,
+            cursor: next_cursor,
+            total_matched,
+        })
+    }
+
     /// Compute the combined filter bitmap from a list of filter clauses.
     /// Top-level clauses are implicitly ANDed together.
     /// Clauses are expected to be pre-ordered by the planner for optimal evaluation.
-    fn compute_filters(&self, clauses: &[FilterClause]) -> Result<RoaringBitmap> {
+    pub(crate) fn compute_filters(&self, clauses: &[FilterClause]) -> Result<RoaringBitmap> {
         if clauses.is_empty() {
             return Ok(self.slots.alive_bitmap().clone());
         }
@@ -199,7 +249,7 @@ impl<'a> QueryExecutor<'a> {
     }
 
     /// Evaluate a single filter clause to a bitmap.
-    fn evaluate_clause(&self, clause: &FilterClause) -> Result<RoaringBitmap> {
+    pub(crate) fn evaluate_clause(&self, clause: &FilterClause) -> Result<RoaringBitmap> {
         match clause {
             FilterClause::Eq(field, value) => {
                 let filter_field = self

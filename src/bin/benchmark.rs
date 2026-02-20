@@ -10,7 +10,7 @@
 //!   --data <PATH>     Path to images.ndjson (default: auto-detect)
 //!   --limit <N>       Max records to load (default: all)
 //!   --json            Output machine-readable JSON report
-//!   --stages <LIST>   Comma-separated stages to run: insert,update,query,concurrent,mixed,all (default: all)
+//!   --stages <LIST>   Comma-separated stages to run: insert,update,query,concurrent,mixed,contention,all (default: all)
 //!   --threads <N>     Number of threads for concurrent benchmarks (default: 4)
 //!   --in-memory-docstore  Use in-memory docstore instead of on-disk (default: on-disk)
 
@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use rand::Rng;
 
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
@@ -431,6 +433,7 @@ struct BenchmarkReport {
     query_benchmarks: Vec<QueryBenchmark>,
     concurrent_insert_benchmark: Option<ConcurrentInsertBenchmark>,
     mixed_rw_benchmark: Option<MixedRwBenchmark>,
+    contention_benchmark: Option<ContentionBenchmark>,
     memory_snapshots: Vec<MemorySnapshot>,
 }
 
@@ -490,6 +493,23 @@ struct MixedRwBenchmark {
     wall_ms: f64,
     insert_rate_per_sec: f64,
     query_stats: LatencyStats,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ContentionBenchmark {
+    duration_secs: f64,
+    reader_threads: usize,
+    total_queries: usize,
+    queries_per_sec: f64,
+    query_stats: LatencyStats,
+    total_inserts: usize,
+    insert_rate_per_sec: f64,
+    total_updates: usize,
+    update_rate_per_sec: f64,
+    alive_before: u64,
+    alive_after: u64,
+    rss_before_bytes: u64,
+    rss_after_bytes: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -672,6 +692,7 @@ fn main() {
         query_benchmarks: Vec::new(),
         concurrent_insert_benchmark: None,
         mixed_rw_benchmark: None,
+        contention_benchmark: None,
         memory_snapshots: vec![MemorySnapshot {
             stage: "before_insert".into(),
             rss_bytes: rss_bytes(),
@@ -1357,6 +1378,343 @@ fn main() {
                 query_stats: stats,
             });
         }
+        println!();
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 7: Realistic contention benchmark
+    //
+    // Models production traffic: slow trickle of new docs, moderate update
+    // rate on reactionCount, and readers hammering at max rate with
+    // randomized filters/sorts so the cache doesn't just absorb everything.
+    // -----------------------------------------------------------------------
+    if should_run(&args.stages, "contention") {
+        println!("--- Phase 7: Realistic Contention Benchmark ---");
+
+        let duration_secs = 15;
+        let insert_target_per_sec = 15.0_f64;  // slow trickle of new docs
+        let update_target_per_sec = 150.0_f64; // moderate reaction count churn
+        let reader_thread_count = 4.max(args.threads.saturating_sub(2));
+
+        println!("  Duration:       {}s", duration_secs);
+        println!("  Insert target:  {:.0}/s (new docs)", insert_target_per_sec);
+        println!("  Update target:  {:.0}/s (reactionCount++)", update_target_per_sec);
+        println!("  Reader threads: {}", reader_thread_count);
+        println!();
+
+        // Build a ConcurrentEngine loaded with the full dataset
+        println!("  Building ConcurrentEngine with full dataset...");
+        let mut conc_config = civitai_config();
+        if args.channel_capacity > 0 {
+            conc_config.channel_capacity = args.channel_capacity;
+        } else {
+            conc_config.channel_capacity = (total_records * 50).max(100_000).min(10_000_000);
+        }
+        conc_config.flush_interval_us = args.flush_interval_us;
+        let conc_engine = Arc::new(create_concurrent_engine(conc_config, &bench_dir, "contention", args.in_memory_docstore));
+
+        let load_start = Instant::now();
+        stream_records(&args.data_path, limit, |rec| {
+            let id = rec.id as u32;
+            let doc = rec.to_document();
+            conc_engine.put(id, &doc).unwrap();
+        });
+        // Wait for full flush before measuring
+        wait_for_flush(&conc_engine, total_records as u64, 60_000);
+        println!("  Loaded in {:.2}s, alive: {}", load_start.elapsed().as_secs_f64(), conc_engine.alive_count());
+
+        // Collect sample values for randomized queries
+        let mut sample_nsfw_levels: Vec<i64> = Vec::new();
+        let mut sample_user_ids: Vec<i64> = Vec::new();
+        let mut sample_tags: Vec<i64> = Vec::new();
+        let mut max_id: u32 = 0;
+
+        stream_records(&args.data_path, 100_000.min(total_records), |rec| {
+            if rec.id as u32 > max_id { max_id = rec.id as u32; }
+            if let Some(v) = rec.nsfw_level {
+                if sample_nsfw_levels.len() < 50 && !sample_nsfw_levels.contains(&(v as i64)) {
+                    sample_nsfw_levels.push(v as i64);
+                }
+            }
+            if let Some(v) = rec.user_id {
+                if sample_user_ids.len() < 200 {
+                    sample_user_ids.push(v as i64);
+                }
+            }
+            if let Some(ref tags) = rec.tag_ids {
+                for &t in tags {
+                    if sample_tags.len() < 500 {
+                        sample_tags.push(t as i64);
+                    }
+                }
+            }
+        });
+
+        if sample_nsfw_levels.is_empty() { sample_nsfw_levels.push(1); }
+        if sample_user_ids.is_empty() { sample_user_ids.push(1); }
+        if sample_tags.is_empty() { sample_tags.push(304); }
+
+        let sample_nsfw_levels = Arc::new(sample_nsfw_levels);
+        let sample_user_ids = Arc::new(sample_user_ids);
+        let sample_tags = Arc::new(sample_tags);
+
+        let sort_fields: Arc<Vec<&str>> = Arc::new(vec![
+            "reactionCount", "sortAt", "commentCount", "collectedCount", "id",
+        ]);
+
+        let alive_before = conc_engine.alive_count();
+        let rss_before = rss_bytes();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let insert_count = Arc::new(AtomicUsize::new(0));
+        let update_count = Arc::new(AtomicUsize::new(0));
+        let query_count = Arc::new(AtomicUsize::new(0));
+        let query_durations: Arc<parking_lot::Mutex<Vec<Duration>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+
+        // --- Insert thread: slow trickle of new documents ---
+        {
+            let engine = Arc::clone(&conc_engine);
+            let stop = Arc::clone(&stop);
+            let counter = Arc::clone(&insert_count);
+            let sleep_per_insert = Duration::from_secs_f64(1.0 / insert_target_per_sec);
+            let start_id = max_id + 1_000_000; // well beyond existing IDs
+
+            handles.push(thread::spawn(move || {
+                let mut rng = rand::thread_rng();
+                let mut id = start_id;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut fields = HashMap::new();
+                    fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(
+                        *[1i64, 2, 4, 8, 16, 28, 32].get(rng.gen_range(0..7)).unwrap()
+                    )));
+                    fields.insert("onSite".into(), FieldValue::Single(Value::Bool(rng.gen_bool(0.7))));
+                    fields.insert("hasMeta".into(), FieldValue::Single(Value::Bool(rng.gen_bool(0.5))));
+                    fields.insert("reactionCount".into(), FieldValue::Single(Value::Integer(
+                        rng.gen_range(0..500)
+                    )));
+                    fields.insert("commentCount".into(), FieldValue::Single(Value::Integer(
+                        rng.gen_range(0..50)
+                    )));
+                    fields.insert("id".into(), FieldValue::Single(Value::Integer(id as i64)));
+                    let doc = Document { fields };
+                    let _ = engine.put(id, &doc);
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    id += 1;
+                    thread::sleep(sleep_per_insert);
+                }
+            }));
+        }
+
+        // --- Update thread: moderate rate reactionCount increments ---
+        {
+            let engine = Arc::clone(&conc_engine);
+            let stop = Arc::clone(&stop);
+            let counter = Arc::clone(&update_count);
+            let sleep_per_update = Duration::from_secs_f64(1.0 / update_target_per_sec);
+            // Collect a set of existing IDs to update (re-read from file)
+            let mut update_ids: Vec<u32> = Vec::new();
+            stream_records(&args.data_path, 50_000.min(total_records), |rec| {
+                update_ids.push(rec.id as u32);
+            });
+
+            handles.push(thread::spawn(move || {
+                let mut rng = rand::thread_rng();
+                while !stop.load(Ordering::Relaxed) {
+                    let idx = rng.gen_range(0..update_ids.len());
+                    let id = update_ids[idx];
+                    // Minimal update: just bump reactionCount
+                    let mut fields = HashMap::new();
+                    fields.insert("reactionCount".into(), FieldValue::Single(Value::Integer(
+                        rng.gen_range(1..10_000)
+                    )));
+                    fields.insert("id".into(), FieldValue::Single(Value::Integer(id as i64)));
+                    let doc = Document { fields };
+                    let _ = engine.put(id, &doc);
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    thread::sleep(sleep_per_update);
+                }
+            }));
+        }
+
+        // --- Reader threads: max rate, randomized queries ---
+        for _ in 0..reader_thread_count {
+            let engine = Arc::clone(&conc_engine);
+            let stop = Arc::clone(&stop);
+            let counter = Arc::clone(&query_count);
+            let durations = Arc::clone(&query_durations);
+            let nsfw = Arc::clone(&sample_nsfw_levels);
+            let users = Arc::clone(&sample_user_ids);
+            let tags = Arc::clone(&sample_tags);
+            let sorts = Arc::clone(&sort_fields);
+
+            handles.push(thread::spawn(move || {
+                let mut rng = rand::thread_rng();
+                let mut local_durations = Vec::with_capacity(100_000);
+
+                while !stop.load(Ordering::Relaxed) {
+                    // Build a randomized query
+                    let num_clauses = rng.gen_range(1..=3);
+                    let mut filters: Vec<FilterClause> = Vec::new();
+
+                    for _ in 0..num_clauses {
+                        let clause_type = rng.gen_range(0..6);
+                        let clause = match clause_type {
+                            0 => {
+                                // nsfwLevel eq
+                                let v = nsfw[rng.gen_range(0..nsfw.len())];
+                                FilterClause::Eq("nsfwLevel".into(), Value::Integer(v))
+                            }
+                            1 => {
+                                // tagId eq
+                                let v = tags[rng.gen_range(0..tags.len())];
+                                FilterClause::Eq("tagIds".into(), Value::Integer(v))
+                            }
+                            2 => {
+                                // userId eq
+                                let v = users[rng.gen_range(0..users.len())];
+                                FilterClause::Eq("userId".into(), Value::Integer(v))
+                            }
+                            3 => {
+                                // boolean filters
+                                let field = match rng.gen_range(0..3) {
+                                    0 => "onSite",
+                                    1 => "hasMeta",
+                                    _ => "minor",
+                                };
+                                FilterClause::Eq(field.into(), Value::Bool(rng.gen_bool(0.5)))
+                            }
+                            4 => {
+                                // IN on nsfwLevel (2-4 random values)
+                                let count = rng.gen_range(2..=4);
+                                let vals: Vec<Value> = (0..count)
+                                    .map(|_| Value::Integer(nsfw[rng.gen_range(0..nsfw.len())]))
+                                    .collect();
+                                FilterClause::In("nsfwLevel".into(), vals)
+                            }
+                            _ => {
+                                // NOT eq on nsfwLevel
+                                let v = nsfw[rng.gen_range(0..nsfw.len())];
+                                FilterClause::NotEq("nsfwLevel".into(), Value::Integer(v))
+                            }
+                        };
+                        filters.push(clause);
+                    }
+
+                    // Random sort
+                    let sort_field = sorts[rng.gen_range(0..sorts.len())];
+                    let direction = if rng.gen_bool(0.5) {
+                        SortDirection::Desc
+                    } else {
+                        SortDirection::Asc
+                    };
+                    let sort = SortClause {
+                        field: sort_field.to_string(),
+                        direction,
+                    };
+
+                    let limit = *[20, 50, 100].get(rng.gen_range(0..3)).unwrap();
+
+                    let start = Instant::now();
+                    let _ = engine.query(&filters, Some(&sort), limit);
+                    local_durations.push(start.elapsed());
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+
+                durations.lock().extend(local_durations);
+            }));
+        }
+
+        // Let it run for the configured duration
+        println!("  Running for {}s...", duration_secs);
+        let bench_start = Instant::now();
+
+        // Print progress every 3 seconds
+        for tick in 1..=(duration_secs / 3) {
+            thread::sleep(Duration::from_secs(3));
+            let elapsed = bench_start.elapsed().as_secs();
+            println!("    [{:>2}s] inserts: {}  updates: {}  queries: {}",
+                elapsed,
+                insert_count.load(Ordering::Relaxed),
+                update_count.load(Ordering::Relaxed),
+                query_count.load(Ordering::Relaxed),
+            );
+            let _ = tick;
+        }
+
+        // Sleep remaining time if any
+        let remaining = Duration::from_secs(duration_secs as u64).saturating_sub(bench_start.elapsed());
+        if !remaining.is_zero() {
+            thread::sleep(remaining);
+        }
+
+        // Signal stop
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let wall_elapsed = bench_start.elapsed();
+        let total_inserts = insert_count.load(Ordering::Relaxed);
+        let total_updates = update_count.load(Ordering::Relaxed);
+        let total_queries = query_count.load(Ordering::Relaxed);
+
+        // Wait for flush to settle
+        thread::sleep(Duration::from_millis(200));
+        let alive_after = conc_engine.alive_count();
+        let rss_after = rss_bytes();
+
+        let all_durations = Arc::try_unwrap(query_durations)
+            .unwrap_or_else(|arc| arc.lock().clone().into())
+            .into_inner();
+
+        println!();
+        println!("  Realistic contention results:");
+        println!("    Wall time:       {:.2}s", wall_elapsed.as_secs_f64());
+        println!("    Inserts:         {} ({:.1}/s)", total_inserts,
+            total_inserts as f64 / wall_elapsed.as_secs_f64());
+        println!("    Updates:         {} ({:.1}/s)", total_updates,
+            total_updates as f64 / wall_elapsed.as_secs_f64());
+        println!("    Queries:         {} ({:.0}/s)", total_queries,
+            total_queries as f64 / wall_elapsed.as_secs_f64());
+        println!("    Alive:           {} -> {} (+{})", alive_before, alive_after,
+            alive_after - alive_before);
+        println!("    RSS:             {} -> {} (delta: {})",
+            format_bytes(rss_before), format_bytes(rss_after),
+            format_bytes(rss_after.saturating_sub(rss_before)));
+
+        if !all_durations.is_empty() {
+            let stats = compute_stats(all_durations);
+            println!("    Query latency under contention:");
+            println!("      p50: {:.3}ms  p95: {:.3}ms  p99: {:.3}ms  max: {:.3}ms  mean: {:.3}ms",
+                stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.max_ms, stats.mean_ms);
+
+            report.contention_benchmark = Some(ContentionBenchmark {
+                duration_secs: wall_elapsed.as_secs_f64(),
+                reader_threads: reader_thread_count,
+                total_queries,
+                queries_per_sec: total_queries as f64 / wall_elapsed.as_secs_f64(),
+                query_stats: stats,
+                total_inserts,
+                insert_rate_per_sec: total_inserts as f64 / wall_elapsed.as_secs_f64(),
+                total_updates,
+                update_rate_per_sec: total_updates as f64 / wall_elapsed.as_secs_f64(),
+                alive_before,
+                alive_after,
+                rss_before_bytes: rss_before,
+                rss_after_bytes: rss_after,
+            });
+        }
+
+        report.memory_snapshots.push(MemorySnapshot {
+            stage: "contention".into(),
+            rss_bytes: rss_after,
+            rss_human: format_bytes(rss_after),
+            alive_count: alive_after,
+        });
+
         println!();
     }
 
