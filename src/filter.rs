@@ -160,6 +160,15 @@ impl FilterField {
             }
         }
     }
+
+    /// Merge a specific value's VersionedBitmap if it exists and is dirty.
+    pub fn merge_field(&mut self, value: u64) {
+        if let Some(vb) = self.bitmaps.get_mut(&value) {
+            if vb.is_dirty() {
+                vb.merge();
+            }
+        }
+    }
 }
 
 /// The type of a filter field, determining how values map to bitmaps.

@@ -61,6 +61,29 @@ impl BitmapStore {
         format!("{}:{}", field, value)
     }
 
+    /// Load a single bitmap by field name and value.
+    ///
+    /// Returns an empty bitmap if the key doesn't exist in the store.
+    pub fn load_single(&self, field: &str, value: u64) -> Result<RoaringBitmap> {
+        let key = Self::make_key(field, value);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        let table = read_txn
+            .open_table(TABLE_BITMAPS)
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        match table.get(key.as_str()) {
+            Ok(Some(data)) => {
+                let bytes = data.value();
+                RoaringBitmap::deserialize_from(bytes)
+                    .map_err(|e| BitdexError::DocStore(format!("bitmap deserialize: {e}")))
+            }
+            Ok(None) => Ok(RoaringBitmap::new()),
+            Err(e) => Err(BitdexError::DocStore(e.to_string())),
+        }
+    }
+
     /// Load all bitmaps for a single field.
     ///
     /// Scans all entries with keys starting with "field_name:" and returns

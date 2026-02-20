@@ -177,6 +177,44 @@ impl WriteBatch {
         !self.alive_inserts.is_empty() || !self.alive_removes.is_empty()
     }
 
+    /// Extract filter mutations for Tier 2 fields before apply.
+    ///
+    /// Removes all filter insert/remove entries whose field name is in `tier2_fields`
+    /// and returns them as `(field_name, value, slots, is_set)` tuples.
+    /// Must be called after `group_and_sort()` and before `apply()`.
+    pub fn take_tier2_mutations(
+        &mut self,
+        tier2_fields: &HashSet<String>,
+    ) -> Vec<(Arc<str>, u64, Vec<u32>, bool)> {
+        let mut result = Vec::new();
+
+        let insert_keys: Vec<FilterGroupKey> = self
+            .filter_inserts
+            .keys()
+            .filter(|k| tier2_fields.contains(k.field.as_ref()))
+            .cloned()
+            .collect();
+        for key in insert_keys {
+            if let Some(slots) = self.filter_inserts.remove(&key) {
+                result.push((Arc::clone(&key.field), key.value, slots, true));
+            }
+        }
+
+        let remove_keys: Vec<FilterGroupKey> = self
+            .filter_removes
+            .keys()
+            .filter(|k| tier2_fields.contains(k.field.as_ref()))
+            .cloned()
+            .collect();
+        for key in remove_keys {
+            if let Some(slots) = self.filter_removes.remove(&key) {
+                result.push((Arc::clone(&key.field), key.value, slots, false));
+            }
+        }
+
+        result
+    }
+
     /// Returns the set of filter field names that were mutated in this batch.
     /// Valid after `group_and_sort()` has been called.
     pub fn mutated_filter_fields(&self) -> HashSet<&str> {
@@ -379,6 +417,15 @@ impl WriteCoalescer {
         sorts: &mut SortIndex,
     ) {
         self.batch.apply(slots, filters, sorts);
+    }
+
+    /// Extract Tier 2 filter mutations from the prepared batch.
+    /// Must be called after `prepare()` and before `apply_prepared()`.
+    pub fn take_tier2_mutations(
+        &mut self,
+        tier2_fields: &HashSet<String>,
+    ) -> Vec<(Arc<str>, u64, Vec<u32>, bool)> {
+        self.batch.take_tier2_mutations(tier2_fields)
     }
 
     /// Returns true if the prepared batch contains alive bitmap mutations.
