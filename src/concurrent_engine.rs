@@ -631,7 +631,7 @@ impl ConcurrentEngine {
             executor.execute_from_bitmap(effective_bitmap, sort, limit, None, use_simple)?;
 
         // D2: Form or update bound from sort results
-        self.update_bound_from_results(&snap, sort, &cache_key, &result.ids);
+        self.update_bound_from_results(&snap, sort, &cache_key, &result.ids, None);
 
         // Post-validation against in-flight writes
         self.post_validate(&mut result, filters, &executor)?;
@@ -680,8 +680,14 @@ impl ConcurrentEngine {
             use_simple,
         )?;
 
-        // D2: Form or update bound from sort results
-        self.update_bound_from_results(&snap, query.sort.as_ref(), &cache_key, &result.ids);
+        // D2/D6: Form or update bound from sort results (with cursor for tiered bounds)
+        self.update_bound_from_results(
+            &snap,
+            query.sort.as_ref(),
+            &cache_key,
+            &result.ids,
+            query.cursor.as_ref(),
+        );
 
         self.post_validate(&mut result, &query.filters, &executor)?;
 
@@ -796,56 +802,107 @@ impl ConcurrentEngine {
             filter_key: filter_key.clone(),
             sort_field: sort_clause.field.clone(),
             direction: sort_clause.direction,
+            tier: 0,
         };
 
         let mut bc = self.bound_cache.lock();
-        if let Some(entry) = bc.lookup_mut(&bound_key) {
-            if !entry.needs_rebuild() {
-                // D6: Skip if cursor is past the bound's range
-                if let Some(c) = cursor {
-                    let cursor_val = c.sort_value as u32;
-                    match sort_clause.direction {
-                        SortDirection::Desc if cursor_val < entry.min_tracked_value() => {
-                            return (filter_bitmap, use_simple_sort, cache_key);
-                        }
-                        SortDirection::Asc if cursor_val > entry.min_tracked_value() => {
-                            return (filter_bitmap, use_simple_sort, cache_key);
-                        }
-                        _ => {}
-                    }
-                }
 
-                entry.touch();
-                let narrowed = &filter_bitmap & entry.bitmap();
-                // With a bound, force bitmap sort (not simple sort) since working set is small
-                return (narrowed, false, cache_key);
+        // D6: Try tier 0 first, then escalate to higher tiers if cursor is past bound
+        let max_tiers = 4u32; // cap to avoid unbounded tier growth
+        let mut try_key = bound_key;
+        for _tier in 0..max_tiers {
+            if let Some(entry) = bc.lookup_mut(&try_key) {
+                if !entry.needs_rebuild() {
+                    // Check if cursor is past this tier's range
+                    let cursor_past = if let Some(c) = cursor {
+                        let cursor_val = c.sort_value as u32;
+                        match sort_clause.direction {
+                            SortDirection::Desc => cursor_val < entry.min_tracked_value(),
+                            SortDirection::Asc => cursor_val > entry.min_tracked_value(),
+                        }
+                    } else {
+                        false
+                    };
+
+                    if cursor_past {
+                        // Try next tier
+                        try_key = BoundKey {
+                            filter_key: try_key.filter_key,
+                            sort_field: try_key.sort_field,
+                            direction: try_key.direction,
+                            tier: try_key.tier + 1,
+                        };
+                        continue;
+                    }
+
+                    entry.touch();
+                    let narrowed = &filter_bitmap & entry.bitmap();
+                    return (narrowed, false, cache_key);
+                }
             }
+            break; // No bound at this tier, fall through to full traversal
         }
         drop(bc);
 
         (filter_bitmap, use_simple_sort, cache_key)
     }
 
-    /// D2: Form or update a bound from sort query results.
+    /// D2/D6: Form or update a bound from sort query results.
+    /// With cursor awareness: if a cursor was past tier 0's range, form a tiered bound.
     fn update_bound_from_results(
         &self,
         snap: &Guard<Arc<InnerEngine>>,
         sort: Option<&SortClause>,
         cache_key: &Option<CacheKey>,
         result_ids: &[i64],
+        cursor: Option<&crate::query::CursorPosition>,
     ) {
         let Some(sort_clause) = sort else { return };
         let Some(ref filter_key) = cache_key else { return };
+        if result_ids.is_empty() { return; }
 
         let sort_field = match snap.sorts.get_field(&sort_clause.field) {
             Some(f) => f,
             None => return,
         };
 
+        // D6: Determine which tier to form/update.
+        // If there's a cursor, check which tier the cursor falls past.
+        let tier = if let Some(c) = cursor {
+            let cursor_val = c.sort_value as u32;
+            let mut t = 0u32;
+            let bc = self.bound_cache.lock();
+            loop {
+                let key = BoundKey {
+                    filter_key: filter_key.clone(),
+                    sort_field: sort_clause.field.clone(),
+                    direction: sort_clause.direction,
+                    tier: t,
+                };
+                if let Some(entry) = bc.lookup(&key) {
+                    let past = match sort_clause.direction {
+                        SortDirection::Desc => cursor_val < entry.min_tracked_value(),
+                        SortDirection::Asc => cursor_val > entry.min_tracked_value(),
+                    };
+                    if past {
+                        t += 1;
+                        if t >= 4 { break; } // cap tiers
+                        continue;
+                    }
+                }
+                break;
+            }
+            drop(bc);
+            t
+        } else {
+            0
+        };
+
         let bound_key = BoundKey {
             filter_key: filter_key.clone(),
             sort_field: sort_clause.field.clone(),
             direction: sort_clause.direction,
+            tier,
         };
 
         let sorted_slots: Vec<u32> = result_ids.iter().map(|&id| id as u32).collect();

@@ -6,15 +6,20 @@ use roaring::RoaringBitmap;
 use crate::cache::CacheKey;
 use crate::query::SortDirection;
 
-/// Unique key for a bound: the combination of filter definition + sort specification.
+/// Unique key for a bound: the combination of filter definition + sort specification + tier.
 ///
 /// Two queries hit the same bound iff they share the same canonical filter key,
-/// the same sort field, and the same sort direction.
+/// the same sort field, the same sort direction, and the same tier.
+///
+/// Tier 0 is the default top-K bound. Higher tiers cover deeper pagination ranges
+/// (D6). When cursor-past-bound is detected for tier N, the engine checks tier N+1.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BoundKey {
     pub filter_key: CacheKey,
     pub sort_field: String,
     pub direction: SortDirection,
+    /// Pagination tier: 0 = top-K, 1 = next range, etc.
+    pub tier: u32,
 }
 
 /// A cached approximate top-K bitmap for a specific filter+sort combination.
@@ -294,6 +299,7 @@ mod tests {
             filter_key: make_filter_key(filter_field, filter_value),
             sort_field: sort.to_string(),
             direction: dir,
+            tier: 0,
         }
     }
 
@@ -584,5 +590,116 @@ mod tests {
 
         assert!(mgr.lookup(&key_nsfw).unwrap().needs_rebuild());
         assert!(!mgr.lookup(&key_type).unwrap().needs_rebuild());
+    }
+
+    // ---- D6: Tiered bounds tests ----
+
+    #[test]
+    fn test_d6_tier_field_in_bound_key() {
+        // Same filter+sort but different tiers should be distinct keys
+        let key_t0 = BoundKey {
+            filter_key: make_filter_key("nsfwLevel", "1"),
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+            tier: 0,
+        };
+        let key_t1 = BoundKey {
+            filter_key: make_filter_key("nsfwLevel", "1"),
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+            tier: 1,
+        };
+
+        let mut mgr = BoundCacheManager::new(5, 10);
+        mgr.form_bound(key_t0.clone(), &[10, 8, 6, 4, 2], |s| s * 100);
+        mgr.form_bound(key_t1.clone(), &[1, 3, 5, 7, 9], |s| s * 10);
+
+        assert!(mgr.lookup(&key_t0).is_some());
+        assert!(mgr.lookup(&key_t1).is_some());
+        assert_eq!(mgr.len(), 2);
+
+        // Different min_tracked_value per tier
+        assert_eq!(mgr.lookup(&key_t0).unwrap().min_tracked_value(), 200);
+        assert_eq!(mgr.lookup(&key_t1).unwrap().min_tracked_value(), 90);
+    }
+
+    #[test]
+    fn test_d6_tiered_bound_lru_eviction() {
+        // Tiered bounds should be LRU-evicted just like regular bounds
+        let mut mgr = BoundCacheManager::new(5, 10);
+        let key_t0 = BoundKey {
+            filter_key: make_filter_key("nsfwLevel", "1"),
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+            tier: 0,
+        };
+        let key_t1 = BoundKey {
+            filter_key: make_filter_key("nsfwLevel", "1"),
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+            tier: 1,
+        };
+
+        mgr.form_bound(key_t0.clone(), &[10, 8, 6], |s| s * 100);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        mgr.form_bound(key_t1.clone(), &[1, 3, 5], |s| s * 10);
+
+        // Touch tier 1 to make it more recent
+        mgr.lookup_mut(&key_t1).unwrap().touch();
+
+        // Evict LRU — should be tier 0 (older)
+        let evicted = mgr.evict_lru();
+        assert_eq!(evicted, Some(key_t0));
+        assert!(mgr.lookup(&key_t1).is_some());
+    }
+
+    #[test]
+    fn test_d6_cursor_past_tier0_range() {
+        // Simulate cursor-past-bound detection for tiered lookup
+        let mut mgr = BoundCacheManager::new(5, 10);
+
+        // Tier 0: top-5 with floor=200 (Desc: min_tracked_value = smallest value)
+        let key_t0 = BoundKey {
+            filter_key: make_filter_key("nsfwLevel", "1"),
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+            tier: 0,
+        };
+        mgr.form_bound(key_t0.clone(), &[10, 8, 6, 4, 2], |s| s * 100);
+        // Floor = 200 (slot 2 * 100)
+
+        // Tier 1: next range with floor=50
+        let key_t1 = BoundKey {
+            filter_key: make_filter_key("nsfwLevel", "1"),
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+            tier: 1,
+        };
+        mgr.form_bound(key_t1.clone(), &[1, 3, 5], |s| s * 50);
+        // Floor = 250 (slot 5 * 50) — wait, that's higher
+
+        // Better: tier 1 covers slots with lower values
+        let key_t1b = BoundKey {
+            filter_key: make_filter_key("nsfwLevel", "1"),
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+            tier: 1,
+        };
+        // Overwrite tier 1: sorted desc by value, slots with values below tier 0 floor
+        // Slots [15, 14, 13, 12, 11] → values [150, 140, 130, 120, 110]
+        // min_tracked_value = value of last (slot 11) = 110
+        mgr.form_bound(key_t1b.clone(), &[15, 14, 13, 12, 11], |s| s * 10);
+
+        let t0 = mgr.lookup(&key_t0).unwrap();
+        let t1 = mgr.lookup(&key_t1b).unwrap();
+
+        // Tier 0 floor = 200, Tier 1 floor = 110
+        assert_eq!(t0.min_tracked_value(), 200);
+        assert_eq!(t1.min_tracked_value(), 110);
+
+        // Cursor at 150 (below tier 0's 200 floor for Desc) → skip tier 0, use tier 1
+        let cursor_val = 150u32;
+        assert!(cursor_val < t0.min_tracked_value()); // past tier 0
+        assert!(cursor_val >= t1.min_tracked_value()); // within tier 1
     }
 }

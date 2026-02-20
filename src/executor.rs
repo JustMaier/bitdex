@@ -259,39 +259,51 @@ impl<'a> QueryExecutor<'a> {
             return (candidates.clone(), false);
         };
 
-        let bound_key = BoundKey {
+        let mut try_key = BoundKey {
             filter_key: filter_key.clone(),
             sort_field: sort_clause.field.clone(),
             direction: sort_clause.direction,
+            tier: 0,
         };
 
         let mut bc = bc_mutex.lock();
-        let Some(entry) = bc.lookup_mut(&bound_key) else {
-            return (candidates.clone(), false);
-        };
+        let max_tiers = 4u32;
+        for _tier in 0..max_tiers {
+            let Some(entry) = bc.lookup_mut(&try_key) else {
+                break;
+            };
 
-        // Don't use bounds that need rebuild — let the query do full traversal and rebuild after
-        if entry.needs_rebuild() {
-            return (candidates.clone(), false);
-        }
-
-        // D6: If cursor is past the bound's range, skip the bound
-        if let Some(cursor) = cursor {
-            let cursor_val = cursor.sort_value as u32;
-            match sort_clause.direction {
-                SortDirection::Desc if cursor_val < entry.min_tracked_value() => {
-                    return (candidates.clone(), false);
-                }
-                SortDirection::Asc if cursor_val > entry.min_tracked_value() => {
-                    return (candidates.clone(), false);
-                }
-                _ => {}
+            if entry.needs_rebuild() {
+                break; // Let query do full traversal and rebuild
             }
+
+            // D6: If cursor is past this tier's range, try next tier
+            let cursor_past = if let Some(cursor) = cursor {
+                let cursor_val = cursor.sort_value as u32;
+                match sort_clause.direction {
+                    SortDirection::Desc => cursor_val < entry.min_tracked_value(),
+                    SortDirection::Asc => cursor_val > entry.min_tracked_value(),
+                }
+            } else {
+                false
+            };
+
+            if cursor_past {
+                try_key = BoundKey {
+                    filter_key: try_key.filter_key,
+                    sort_field: try_key.sort_field,
+                    direction: try_key.direction,
+                    tier: try_key.tier + 1,
+                };
+                continue;
+            }
+
+            entry.touch();
+            let narrowed = candidates & entry.bitmap();
+            return (narrowed, true);
         }
 
-        entry.touch();
-        let narrowed = candidates & entry.bitmap();
-        (narrowed, true)
+        (candidates.clone(), false)
     }
 
     /// D2: Form or update a bound from sort results.
@@ -307,6 +319,7 @@ impl<'a> QueryExecutor<'a> {
             filter_key: filter_key.clone(),
             sort_field: sort_clause.field.clone(),
             direction: sort_clause.direction,
+            tier: 0,
         };
 
         let sort_field = match self.sorts.get_field(&sort_clause.field) {
