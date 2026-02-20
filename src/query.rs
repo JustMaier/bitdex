@@ -74,7 +74,7 @@ pub struct SortClause {
     pub direction: SortDirection,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SortDirection {
     Asc,
     Desc,

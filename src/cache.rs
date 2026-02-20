@@ -496,6 +496,7 @@ mod tests {
         CacheConfig {
             max_entries,
             decay_rate: 0.95,
+            ..Default::default()
         }
     }
 
@@ -688,6 +689,7 @@ mod tests {
         let config = CacheConfig {
             max_entries: 100,
             decay_rate: 0.5,
+            ..Default::default()
         };
         let mut cache = TrieCache::new(config);
 

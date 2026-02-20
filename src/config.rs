@@ -237,6 +237,14 @@ pub struct CacheConfig {
     /// Exponential decay rate for hit stats (0.0, 1.0].
     #[serde(default = "default_cache_decay_rate")]
     pub decay_rate: f64,
+    /// Target number of slots in a bound cache entry.
+    /// Bound caches reduce sort working sets to approximately this many candidates.
+    #[serde(default = "default_bound_target_size")]
+    pub bound_target_size: usize,
+    /// Maximum bound size before triggering a rebuild.
+    /// When live maintenance grows a bound beyond this, the next query rebuilds it.
+    #[serde(default = "default_bound_max_size")]
+    pub bound_max_size: usize,
 }
 
 fn default_cache_max_entries() -> usize {
@@ -245,12 +253,20 @@ fn default_cache_max_entries() -> usize {
 fn default_cache_decay_rate() -> f64 {
     0.95
 }
+fn default_bound_target_size() -> usize {
+    10_000
+}
+fn default_bound_max_size() -> usize {
+    20_000
+}
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_entries: default_cache_max_entries(),
             decay_rate: default_cache_decay_rate(),
+            bound_target_size: default_bound_target_size(),
+            bound_max_size: default_bound_max_size(),
         }
     }
 }

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::bitmap_store::BitmapStore;
-use crate::cache::{self, CacheLookup, TrieCache};
+use crate::bound_cache::{BoundCacheManager, BoundKey};
+use crate::cache::{self, CacheLookup, CacheKey, TrieCache};
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
 use crate::pending_buffer::PendingBuffer;
@@ -43,6 +44,7 @@ pub struct QueryExecutor<'a> {
     tier2: Option<&'a Tier2Resolver>,
     time_buckets: Option<&'a crate::time_buckets::TimeBucketManager>,
     now_unix: u64,
+    bound_cache: Option<&'a parking_lot::Mutex<BoundCacheManager>>,
 }
 
 impl<'a> QueryExecutor<'a> {
@@ -60,6 +62,7 @@ impl<'a> QueryExecutor<'a> {
             tier2: None,
             time_buckets: None,
             now_unix: 0,
+            bound_cache: None,
         }
     }
 
@@ -78,7 +81,15 @@ impl<'a> QueryExecutor<'a> {
             tier2: Some(tier2),
             time_buckets: None,
             now_unix: 0,
+            bound_cache: None,
         }
+    }
+
+    /// Attach a bound cache for sort working set reduction (D5).
+    /// Bounds shrink the candidate set before sort traversal.
+    pub fn with_bound_cache(mut self, bc: &'a parking_lot::Mutex<BoundCacheManager>) -> Self {
+        self.bound_cache = Some(bc);
+        self
     }
 
     /// Attach a time bucket manager for in-executor bucket snapping (C3).
@@ -198,13 +209,28 @@ impl<'a> QueryExecutor<'a> {
 
         let total_matched = candidates.len();
 
-        // Step 4: Sort and paginate
+        // Step 4: Sort and paginate — with optional bound cache (D5)
         let (ids, next_cursor) = if let Some(sort_clause) = sort {
-            if plan.use_simple_sort {
-                self.simple_sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+            // D5: Try to narrow working set with bound cache before sort traversal
+            let (sort_candidates, did_use_bound) = self.apply_bound_if_available(
+                &candidates,
+                &cache_key,
+                sort_clause,
+                cursor,
+            );
+
+            let (result_ids, result_cursor) = if plan.use_simple_sort && !did_use_bound {
+                self.simple_sort_and_paginate(&sort_candidates, sort_clause, limit, cursor)?
             } else {
-                self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+                self.sort_and_paginate(&sort_candidates, sort_clause, limit, cursor)?
+            };
+
+            // D2: Form or update bound from sort results (promotion_threshold = 0)
+            if let (Some(bc), Some(ref key)) = (&self.bound_cache, &cache_key) {
+                self.form_or_update_bound(bc, key, sort_clause, &result_ids);
             }
+
+            (result_ids, result_cursor)
         } else {
             // No sort: return in descending slot order (newest first)
             self.slot_order_paginate(&candidates, limit, cursor)
@@ -215,6 +241,93 @@ impl<'a> QueryExecutor<'a> {
             cursor: next_cursor,
             total_matched,
         })
+    }
+
+    /// D5: Check bound cache and narrow candidates if a matching bound exists.
+    /// Returns (narrowed_candidates, did_use_bound).
+    fn apply_bound_if_available(
+        &self,
+        candidates: &RoaringBitmap,
+        cache_key: &Option<CacheKey>,
+        sort_clause: &SortClause,
+        cursor: Option<&crate::query::CursorPosition>,
+    ) -> (RoaringBitmap, bool) {
+        let Some(bc_mutex) = self.bound_cache else {
+            return (candidates.clone(), false);
+        };
+        let Some(ref filter_key) = cache_key else {
+            return (candidates.clone(), false);
+        };
+
+        let bound_key = BoundKey {
+            filter_key: filter_key.clone(),
+            sort_field: sort_clause.field.clone(),
+            direction: sort_clause.direction,
+        };
+
+        let mut bc = bc_mutex.lock();
+        let Some(entry) = bc.lookup_mut(&bound_key) else {
+            return (candidates.clone(), false);
+        };
+
+        // Don't use bounds that need rebuild — let the query do full traversal and rebuild after
+        if entry.needs_rebuild() {
+            return (candidates.clone(), false);
+        }
+
+        // D6: If cursor is past the bound's range, skip the bound
+        if let Some(cursor) = cursor {
+            let cursor_val = cursor.sort_value as u32;
+            match sort_clause.direction {
+                SortDirection::Desc if cursor_val < entry.min_tracked_value() => {
+                    return (candidates.clone(), false);
+                }
+                SortDirection::Asc if cursor_val > entry.min_tracked_value() => {
+                    return (candidates.clone(), false);
+                }
+                _ => {}
+            }
+        }
+
+        entry.touch();
+        let narrowed = candidates & entry.bitmap();
+        (narrowed, true)
+    }
+
+    /// D2: Form or update a bound from sort results.
+    /// Called after every sort query with promotion_threshold = 0.
+    fn form_or_update_bound(
+        &self,
+        bc_mutex: &parking_lot::Mutex<BoundCacheManager>,
+        filter_key: &CacheKey,
+        sort_clause: &SortClause,
+        result_ids: &[i64],
+    ) {
+        let bound_key = BoundKey {
+            filter_key: filter_key.clone(),
+            sort_field: sort_clause.field.clone(),
+            direction: sort_clause.direction,
+        };
+
+        let sort_field = match self.sorts.get_field(&sort_clause.field) {
+            Some(f) => f,
+            None => return,
+        };
+
+        let sorted_slots: Vec<u32> = result_ids.iter().map(|&id| id as u32).collect();
+
+        let mut bc = bc_mutex.lock();
+
+        if let Some(entry) = bc.get_mut(&bound_key) {
+            if entry.needs_rebuild() {
+                // Rebuild with fresh results
+                entry.rebuild(&sorted_slots, |slot| sort_field.reconstruct_value(slot));
+            }
+            // Otherwise, bound exists and doesn't need rebuild — leave it alone
+        } else {
+            // No bound exists — form one
+            bc.form_bound(bound_key, &sorted_slots, |slot| sort_field.reconstruct_value(slot));
+        }
     }
 
     /// Check if a single slot matches all the given filter clauses.
@@ -614,6 +727,7 @@ impl<'a> QueryExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bound_cache::BoundCacheManager;
     use crate::config::{BucketConfig, Config, FilterFieldConfig, SortFieldConfig};
     use crate::filter::FilterFieldType;
     use crate::mutation::{Document, FieldValue, MutationEngine};
@@ -1174,5 +1288,135 @@ mod tests {
         assert_eq!(mgr.field_name(), "sortAt");
         // Verify executor was constructed successfully (indirectly)
         let _ = executor.filter_index();
+    }
+
+    // --- D5/D2/D8: Bound cache integration tests ---
+
+    #[test]
+    fn test_d5_bound_forms_on_first_sort_query() {
+        let mut h = TestHarness::new();
+
+        // Insert docs with varying reactionCount
+        for i in 1..=20u32 {
+            h.put(i, &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                ("reactionCount", FieldValue::Single(Value::Integer((i * 100) as i64))),
+            ]));
+        }
+
+        let bc = parking_lot::Mutex::new(BoundCacheManager::new(10, 20));
+        let mut cache = TrieCache::new(h.config.cache.clone());
+
+        let executor = QueryExecutor::new(
+            &h.slots, &h.filters, &h.sorts, h.config.max_page_size,
+        ).with_bound_cache(&bc);
+
+        let sort = SortClause { field: "reactionCount".to_string(), direction: SortDirection::Desc };
+        let filters = vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))];
+
+        // First query — should form a bound
+        let result = executor.execute_with_cache(&filters, Some(&sort), 5, None, &mut cache).unwrap();
+        assert_eq!(result.ids.len(), 5);
+        assert_eq!(result.ids[0], 20); // highest reactionCount
+
+        // Bound should now exist
+        let bc_guard = bc.lock();
+        assert_eq!(bc_guard.len(), 1);
+    }
+
+    #[test]
+    fn test_d5_bound_used_on_second_query() {
+        let mut h = TestHarness::new();
+
+        for i in 1..=50u32 {
+            h.put(i, &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                ("reactionCount", FieldValue::Single(Value::Integer((i * 10) as i64))),
+            ]));
+        }
+
+        let bc = parking_lot::Mutex::new(BoundCacheManager::new(10, 20));
+        let mut cache = TrieCache::new(h.config.cache.clone());
+
+        let executor = QueryExecutor::new(
+            &h.slots, &h.filters, &h.sorts, h.config.max_page_size,
+        ).with_bound_cache(&bc);
+
+        let sort = SortClause { field: "reactionCount".to_string(), direction: SortDirection::Desc };
+        let filters = vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))];
+
+        // First query forms the bound
+        let r1 = executor.execute_with_cache(&filters, Some(&sort), 5, None, &mut cache).unwrap();
+        assert_eq!(r1.ids, vec![50, 49, 48, 47, 46]);
+
+        // Second query should use the bound (same results expected)
+        let r2 = executor.execute_with_cache(&filters, Some(&sort), 5, None, &mut cache).unwrap();
+        assert_eq!(r2.ids, vec![50, 49, 48, 47, 46]);
+
+        // Bound should still be present
+        assert_eq!(bc.lock().len(), 1);
+    }
+
+    #[test]
+    fn test_d5_no_bound_without_sort() {
+        let mut h = TestHarness::new();
+
+        for i in 1..=10u32 {
+            h.put(i, &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+            ]));
+        }
+
+        let bc = parking_lot::Mutex::new(BoundCacheManager::new(5, 10));
+        let mut cache = TrieCache::new(h.config.cache.clone());
+
+        let executor = QueryExecutor::new(
+            &h.slots, &h.filters, &h.sorts, h.config.max_page_size,
+        ).with_bound_cache(&bc);
+
+        // Query without sort — should NOT form a bound
+        let _ = executor.execute_with_cache(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None, 10, None, &mut cache,
+        ).unwrap();
+
+        assert_eq!(bc.lock().len(), 0);
+    }
+
+    #[test]
+    fn test_d5_different_filter_misses_bound() {
+        let mut h = TestHarness::new();
+
+        for i in 1..=20u32 {
+            let level = if i <= 10 { 1 } else { 2 };
+            h.put(i, &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(level))),
+                ("reactionCount", FieldValue::Single(Value::Integer((i * 10) as i64))),
+            ]));
+        }
+
+        let bc = parking_lot::Mutex::new(BoundCacheManager::new(5, 10));
+        let mut cache = TrieCache::new(h.config.cache.clone());
+
+        let executor = QueryExecutor::new(
+            &h.slots, &h.filters, &h.sorts, h.config.max_page_size,
+        ).with_bound_cache(&bc);
+
+        let sort = SortClause { field: "reactionCount".to_string(), direction: SortDirection::Desc };
+
+        // Query with nsfwLevel=1 — forms a bound
+        let _ = executor.execute_with_cache(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            Some(&sort), 5, None, &mut cache,
+        ).unwrap();
+
+        // Query with nsfwLevel=2 — different filter, should form a separate bound
+        let _ = executor.execute_with_cache(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(2))],
+            Some(&sort), 5, None, &mut cache,
+        ).unwrap();
+
+        // Should have 2 separate bounds
+        assert_eq!(bc.lock().len(), 2);
     }
 }
