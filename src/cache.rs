@@ -106,6 +106,83 @@ pub fn canonicalize(clauses: &[FilterClause]) -> Option<CacheKey> {
     Some(key_parts)
 }
 
+/// Produce a stable canonical clause for a bucket-snapped range filter (C5).
+/// Used by `canonicalize_with_buckets` to ensure range queries on bucketed fields
+/// produce deterministic cache keys independent of the raw timestamp value.
+pub fn snap_clause_key(
+    clause: &FilterClause,
+    tb: &crate::time_buckets::TimeBucketManager,
+    now_unix: u64,
+) -> Option<CanonicalClause> {
+    match clause {
+        FilterClause::Gt(field, value) | FilterClause::Gte(field, value)
+            if field == tb.field_name() =>
+        {
+            let threshold = match value {
+                Value::Integer(v) => Some(*v as u64),
+                _ => None,
+            }?;
+            let duration = now_unix.saturating_sub(threshold);
+            let bucket_name = tb.snap_duration(duration, 0.10)?;
+            Some(CanonicalClause {
+                field: field.clone(),
+                op: "bucket_gte".to_string(),
+                value_repr: bucket_name.to_string(),
+            })
+        }
+        FilterClause::Lt(field, value) | FilterClause::Lte(field, value)
+            if field == tb.field_name() =>
+        {
+            let threshold = match value {
+                Value::Integer(v) => Some(*v as u64),
+                _ => None,
+            }?;
+            let duration = threshold.saturating_sub(now_unix);
+            let bucket_name = tb.snap_duration(duration, 0.10)?;
+            Some(CanonicalClause {
+                field: field.clone(),
+                op: "bucket_lte".to_string(),
+                value_repr: bucket_name.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Canonicalize filter clauses with optional bucket snapping (C5).
+/// Bucket-eligible range clauses produce stable keys (e.g., "sortAt:bucket_gte:7d")
+/// instead of raw timestamps that change every second.
+pub fn canonicalize_with_buckets(
+    clauses: &[FilterClause],
+    tb: Option<&crate::time_buckets::TimeBucketManager>,
+    now_unix: u64,
+) -> Option<CacheKey> {
+    let mut canonical_clauses: Vec<CanonicalClause> = Vec::new();
+    for clause in clauses {
+        // Try bucket snapping first
+        if let Some(tb) = tb {
+            if let Some(snapped) = snap_clause_key(clause, tb, now_unix) {
+                canonical_clauses.push(snapped);
+                continue;
+            }
+        }
+        // Fall through to normal canonicalization
+        match clause {
+            // Flatten top-level And into individual clauses
+            FilterClause::And(inner) => {
+                for c in inner {
+                    canonical_clauses.push(CanonicalClause::from_filter(c)?);
+                }
+            }
+            _ => {
+                canonical_clauses.push(CanonicalClause::from_filter(clause)?);
+            }
+        }
+    }
+    canonical_clauses.sort();
+    Some(canonical_clauses)
+}
+
 /// A cached entry in the trie.
 struct CacheEntry {
     /// The cached filter result bitmap.
@@ -852,5 +929,145 @@ mod tests {
         assert_eq!(key[0].field, "nsfwLevel");
         assert_eq!(key[1].field, "sortAt");
         assert_eq!(key[1].op, "bucket");
+    }
+
+    fn make_bucket_manager(now: u64) -> crate::time_buckets::TimeBucketManager {
+        use crate::config::BucketConfig;
+        let configs = vec![
+            BucketConfig { name: "24h".to_string(), duration_secs: 86400, refresh_interval_secs: 300 },
+            BucketConfig { name: "7d".to_string(), duration_secs: 604800, refresh_interval_secs: 3600 },
+        ];
+        let mut mgr = crate::time_buckets::TimeBucketManager::new("sortAt".to_string(), configs);
+        mgr.rebuild_bucket("24h", std::iter::empty(), now);
+        mgr.rebuild_bucket("7d", std::iter::empty(), now);
+        mgr
+    }
+
+    #[test]
+    fn test_snap_clause_key_gte_snaps_to_24h() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_bucket_manager(now);
+
+        // Gte("sortAt", now - 86400) — exact 24h, should snap to bucket_gte:24h
+        let ts = (now - 86400) as i64;
+        let clause = FilterClause::Gte("sortAt".to_string(), Value::Integer(ts));
+        let snapped = snap_clause_key(&clause, &mgr, now).unwrap();
+
+        assert_eq!(snapped.field, "sortAt");
+        assert_eq!(snapped.op, "bucket_gte");
+        assert_eq!(snapped.value_repr, "24h");
+    }
+
+    #[test]
+    fn test_snap_clause_key_gt_snaps_to_7d() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_bucket_manager(now);
+
+        // Gt("sortAt", now - 590000) — within 10% of 7d (604800)
+        let ts = (now - 590000) as i64;
+        let clause = FilterClause::Gt("sortAt".to_string(), Value::Integer(ts));
+        let snapped = snap_clause_key(&clause, &mgr, now).unwrap();
+
+        assert_eq!(snapped.op, "bucket_gte");
+        assert_eq!(snapped.value_repr, "7d");
+    }
+
+    #[test]
+    fn test_snap_clause_key_outside_tolerance_returns_none() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_bucket_manager(now);
+
+        // Duration = 200000s — outside tolerance of both 24h and 7d
+        let ts = (now - 200000) as i64;
+        let clause = FilterClause::Gte("sortAt".to_string(), Value::Integer(ts));
+        assert!(snap_clause_key(&clause, &mgr, now).is_none());
+    }
+
+    #[test]
+    fn test_snap_clause_key_non_bucketed_field_returns_none() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_bucket_manager(now);
+
+        // nsfwLevel is not the bucketed field (sortAt)
+        let clause = FilterClause::Gte("nsfwLevel".to_string(), Value::Integer(1));
+        assert!(snap_clause_key(&clause, &mgr, now).is_none());
+    }
+
+    #[test]
+    fn test_snap_clause_key_non_range_clause_returns_none() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_bucket_manager(now);
+
+        let clause = FilterClause::Eq("sortAt".to_string(), Value::Integer(1_700_000_000));
+        assert!(snap_clause_key(&clause, &mgr, now).is_none());
+    }
+
+    #[test]
+    fn test_canonicalize_with_buckets_snaps_gte() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_bucket_manager(now);
+
+        let ts = (now - 86400) as i64;
+        let clauses = vec![
+            FilterClause::Gte("sortAt".to_string(), Value::Integer(ts)),
+            eq_clause("nsfwLevel", 1),
+        ];
+        let key = canonicalize_with_buckets(&clauses, Some(&mgr), now).unwrap();
+
+        assert_eq!(key.len(), 2);
+        // Sorted by field: "nsfwLevel" < "sortAt"
+        assert_eq!(key[0].field, "nsfwLevel");
+        assert_eq!(key[0].op, "eq");
+        assert_eq!(key[1].field, "sortAt");
+        assert_eq!(key[1].op, "bucket_gte");
+        assert_eq!(key[1].value_repr, "24h");
+    }
+
+    #[test]
+    fn test_canonicalize_with_buckets_stable_key_across_different_timestamps() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_bucket_manager(now);
+
+        // Two slightly different timestamps that both snap to 24h
+        let ts1 = (now - 86400) as i64;
+        let ts2 = (now - 83000) as i64; // within 10% tolerance of 24h
+
+        let key1 = canonicalize_with_buckets(
+            &[FilterClause::Gte("sortAt".to_string(), Value::Integer(ts1))],
+            Some(&mgr),
+            now,
+        ).unwrap();
+        let key2 = canonicalize_with_buckets(
+            &[FilterClause::Gte("sortAt".to_string(), Value::Integer(ts2))],
+            Some(&mgr),
+            now,
+        ).unwrap();
+
+        // Both should produce the same stable cache key
+        assert_eq!(key1, key2);
+        assert_eq!(key1[0].value_repr, "24h");
+    }
+
+    #[test]
+    fn test_canonicalize_with_buckets_falls_through_for_eq() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_bucket_manager(now);
+
+        let clauses = vec![eq_clause("nsfwLevel", 1)];
+        let key = canonicalize_with_buckets(&clauses, Some(&mgr), now).unwrap();
+
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].op, "eq");
+    }
+
+    #[test]
+    fn test_canonicalize_with_buckets_none_tb_behaves_like_canonicalize() {
+        let clauses = vec![
+            eq_clause("nsfwLevel", 1),
+            eq_clause("userId", 42),
+        ];
+        let key_plain = canonicalize(&clauses).unwrap();
+        let key_buckets = canonicalize_with_buckets(&clauses, None, 0).unwrap();
+        assert_eq!(key_plain, key_buckets);
     }
 }

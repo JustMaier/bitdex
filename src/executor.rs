@@ -41,6 +41,8 @@ pub struct QueryExecutor<'a> {
     sorts: &'a SortIndex,
     max_page_size: usize,
     tier2: Option<&'a Tier2Resolver>,
+    time_buckets: Option<&'a crate::time_buckets::TimeBucketManager>,
+    now_unix: u64,
 }
 
 impl<'a> QueryExecutor<'a> {
@@ -56,6 +58,8 @@ impl<'a> QueryExecutor<'a> {
             sorts,
             max_page_size,
             tier2: None,
+            time_buckets: None,
+            now_unix: 0,
         }
     }
 
@@ -72,7 +76,17 @@ impl<'a> QueryExecutor<'a> {
             sorts,
             max_page_size,
             tier2: Some(tier2),
+            time_buckets: None,
+            now_unix: 0,
         }
+    }
+
+    /// Attach a time bucket manager for in-executor bucket snapping (C3).
+    /// Range filters on the bucketed field will be snapped to pre-computed bitmaps.
+    pub fn with_time_buckets(mut self, tb: &'a crate::time_buckets::TimeBucketManager, now: u64) -> Self {
+        self.time_buckets = Some(tb);
+        self.now_unix = now;
+        self
     }
 
     /// Get a reference to the filter index.
@@ -141,8 +155,12 @@ impl<'a> QueryExecutor<'a> {
         // Step 1: Plan the query (reorder clauses by cardinality)
         let plan = planner::plan_query(filters, self.filters, self.slots, sort.is_some());
 
-        // Step 2: Try cache lookup using canonical key
-        let cache_key = cache::canonicalize(&plan.ordered_clauses);
+        // Step 2: Try cache lookup using canonical key (C5: use bucket-stable keys when available)
+        let cache_key = if let Some(tb) = self.time_buckets {
+            cache::canonicalize_with_buckets(&plan.ordered_clauses, Some(tb), self.now_unix)
+        } else {
+            cache::canonicalize(&plan.ordered_clauses)
+        };
 
         let filter_bitmap = if let Some(ref key) = cache_key {
             match cache.lookup(key) {
@@ -350,10 +368,34 @@ impl<'a> QueryExecutor<'a> {
                 Ok(result)
             }
 
-            FilterClause::Gt(field, value) => self.range_scan(field, value, |k, t| k > t),
-            FilterClause::Gte(field, value) => self.range_scan(field, value, |k, t| k >= t),
-            FilterClause::Lt(field, value) => self.range_scan(field, value, |k, t| k < t),
-            FilterClause::Lte(field, value) => self.range_scan(field, value, |k, t| k <= t),
+            // C3: Try bucket snapping for Gt/Gte on timestamp fields before falling back to range_scan.
+            FilterClause::Gt(field, value) | FilterClause::Gte(field, value) => {
+                if let Some(tb) = &self.time_buckets {
+                    if field == tb.field_name() {
+                        if let Some(threshold) = value_to_bitmap_key(value) {
+                            let duration = self.now_unix.saturating_sub(threshold);
+                            if let Some(bucket_name) = tb.snap_duration(duration, 0.10) {
+                                if let Some(bucket) = tb.get_bucket(bucket_name) {
+                                    return Ok(bucket.bitmap().clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                match clause {
+                    FilterClause::Gt(..) => self.range_scan(field, value, |k, t| k > t),
+                    FilterClause::Gte(..) => self.range_scan(field, value, |k, t| k >= t),
+                    _ => unreachable!(),
+                }
+            }
+
+            FilterClause::Lt(field, value) | FilterClause::Lte(field, value) => {
+                match clause {
+                    FilterClause::Lt(..) => self.range_scan(field, value, |k, t| k < t),
+                    FilterClause::Lte(..) => self.range_scan(field, value, |k, t| k <= t),
+                    _ => unreachable!(),
+                }
+            }
 
             // Pre-computed bucket bitmap from range snapping (C3): use the bitmap directly.
             FilterClause::BucketBitmap { bitmap, .. } => Ok(bitmap.as_ref().clone()),
@@ -572,9 +614,10 @@ impl<'a> QueryExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
+    use crate::config::{BucketConfig, Config, FilterFieldConfig, SortFieldConfig};
     use crate::filter::FilterFieldType;
     use crate::mutation::{Document, FieldValue, MutationEngine};
+    use crate::time_buckets::TimeBucketManager;
 
     fn test_config() -> Config {
         Config {
@@ -686,6 +729,27 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
         }
+    }
+
+    fn make_time_bucket_manager(now: u64) -> TimeBucketManager {
+        let configs = vec![
+            BucketConfig { name: "24h".to_string(), duration_secs: 86400, refresh_interval_secs: 300 },
+            BucketConfig { name: "7d".to_string(), duration_secs: 604800, refresh_interval_secs: 3600 },
+        ];
+        let mut mgr = TimeBucketManager::new("sortAt".to_string(), configs);
+        // Slots 1-3 within 24h, slots 4-6 within 7d but outside 24h, slot 7 outside both
+        let data: Vec<(u32, u64)> = vec![
+            (1, now - 3600),
+            (2, now - 7200),
+            (3, now - 43200),
+            (4, now - 90000),
+            (5, now - 200000),
+            (6, now - 500000),
+            (7, now - 700000),
+        ];
+        mgr.rebuild_bucket("24h", data.iter().copied(), now);
+        mgr.rebuild_bucket("7d", data.iter().copied(), now);
+        mgr
     }
 
     #[test]
@@ -990,5 +1054,125 @@ mod tests {
             None,
         );
         assert_eq!(result.ids, vec![10, 8, 6, 4, 2]);
+    }
+
+    #[test]
+    fn test_c3_bucket_snapping_gte_snaps_to_24h() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        let h = TestHarness::new();
+        let executor = QueryExecutor::new(
+            &h.slots,
+            &h.filters,
+            &h.sorts,
+            h.config.max_page_size,
+        ).with_time_buckets(&mgr, now);
+
+        // Gte("sortAt", now - 86400) — exact 24h match, not in FilterIndex, but bucket snapping
+        // should return the 24h bucket bitmap (slots 1, 2, 3 from make_time_bucket_manager)
+        let ts = (now - 86400) as i64;
+        let clause = FilterClause::Gte("sortAt".to_string(), Value::Integer(ts));
+        let bitmap = executor.evaluate_clause(&clause).unwrap();
+        // Slots 1, 2, 3 are within 24h in make_time_bucket_manager
+        assert!(bitmap.contains(1));
+        assert!(bitmap.contains(2));
+        assert!(bitmap.contains(3));
+        // Slot 4 is at 90000s (25h) — outside 24h bucket
+        assert!(!bitmap.contains(4));
+    }
+
+    #[test]
+    fn test_c3_bucket_snapping_gt_snaps_to_7d() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        let h = TestHarness::new();
+        let executor = QueryExecutor::new(
+            &h.slots,
+            &h.filters,
+            &h.sorts,
+            h.config.max_page_size,
+        ).with_time_buckets(&mgr, now);
+
+        // Gt("sortAt", now - 590000) — duration=590000, within 10% of 7d (604800)
+        let ts = (now - 590000) as i64;
+        let clause = FilterClause::Gt("sortAt".to_string(), Value::Integer(ts));
+        let bitmap = executor.evaluate_clause(&clause).unwrap();
+        // Slots 1-6 are within 7d
+        assert!(bitmap.contains(1));
+        assert!(bitmap.contains(6));
+        // Slot 7 at 700000s is outside 7d
+        assert!(!bitmap.contains(7));
+    }
+
+    #[test]
+    fn test_c3_no_snap_outside_tolerance() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        let h = TestHarness::new();
+        // Register "sortAt" as a filter field so range_scan won't error
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "sortAt".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            storage: crate::config::StorageMode::default(),
+            behaviors: None,
+        });
+        let executor = QueryExecutor::new(
+            &h.slots,
+            &filters,
+            &h.sorts,
+            h.config.max_page_size,
+        ).with_time_buckets(&mgr, now);
+
+        // Duration = 200000s — outside tolerance of both 24h and 7d, falls through to range_scan
+        let ts = (now - 200000) as i64;
+        let clause = FilterClause::Gte("sortAt".to_string(), Value::Integer(ts));
+        // range_scan on empty filter index returns empty bitmap (no values stored)
+        let bitmap = executor.evaluate_clause(&clause).unwrap();
+        assert!(bitmap.is_empty());
+    }
+
+    #[test]
+    fn test_c3_no_snap_for_non_bucketed_field() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        let h = TestHarness::new();
+        let executor = QueryExecutor::new(
+            &h.slots,
+            &h.filters,
+            &h.sorts,
+            h.config.max_page_size,
+        ).with_time_buckets(&mgr, now);
+
+        // nsfwLevel is not the bucketed field (sortAt), so should fall through to range_scan
+        // which will return an error since nsfwLevel has no stored range values matching Gt
+        let ts = (now - 86400) as i64;
+        let clause = FilterClause::Gte("nsfwLevel".to_string(), Value::Integer(ts));
+        // This should succeed (nsfwLevel is in FilterIndex), returning empty (no values >= ts)
+        let bitmap = executor.evaluate_clause(&clause).unwrap();
+        assert!(bitmap.is_empty());
+    }
+
+    #[test]
+    fn test_with_time_buckets_builder() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+        let h = TestHarness::new();
+
+        let executor = QueryExecutor::new(
+            &h.slots,
+            &h.filters,
+            &h.sorts,
+            h.config.max_page_size,
+        ).with_time_buckets(&mgr, now);
+
+        // Verify field_name from the manager is accessible via bucket snapping
+        assert_eq!(mgr.field_name(), "sortAt");
+        // Verify executor was constructed successfully (indirectly)
+        let _ = executor.filter_index();
     }
 }
