@@ -163,6 +163,43 @@ impl Config {
                     f.name
                 )));
             }
+            if let Some(behaviors) = &f.behaviors {
+                // Warn (as error) if deferred_alive is set on a boolean field
+                if behaviors.deferred_alive && f.field_type == FilterFieldType::Boolean {
+                    return Err(BitdexError::Config(format!(
+                        "filter field '{}': deferred_alive is not meaningful on boolean fields",
+                        f.name
+                    )));
+                }
+                // Validate range_buckets: unique names, non-zero durations
+                let mut bucket_names = std::collections::HashSet::new();
+                for bucket in &behaviors.range_buckets {
+                    if bucket.name.is_empty() {
+                        return Err(BitdexError::Config(format!(
+                            "filter field '{}': bucket name must not be empty",
+                            f.name
+                        )));
+                    }
+                    if !bucket_names.insert(&bucket.name) {
+                        return Err(BitdexError::Config(format!(
+                            "filter field '{}': duplicate bucket name '{}'",
+                            f.name, bucket.name
+                        )));
+                    }
+                    if bucket.duration_secs == 0 {
+                        return Err(BitdexError::Config(format!(
+                            "filter field '{}', bucket '{}': duration_secs must be > 0",
+                            f.name, bucket.name
+                        )));
+                    }
+                    if bucket.refresh_interval_secs == 0 {
+                        return Err(BitdexError::Config(format!(
+                            "filter field '{}', bucket '{}': refresh_interval_secs must be > 0",
+                            f.name, bucket.name
+                        )));
+                    }
+                }
+            }
         }
 
         // Check for duplicate sort field names and validate bits
@@ -283,6 +320,32 @@ pub struct FilterFieldConfig {
     pub field_type: FilterFieldType,
     #[serde(default)]
     pub storage: StorageMode,
+    /// Optional time-related behaviors (only valid for timestamp fields).
+    #[serde(default)]
+    pub behaviors: Option<FieldBehaviors>,
+}
+
+/// Time-related behaviors for timestamp fields.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FieldBehaviors {
+    /// If true, documents with future values in this field won't be marked alive
+    /// until the scheduled time arrives.
+    #[serde(default)]
+    pub deferred_alive: bool,
+    /// Pre-computed range buckets for this field (e.g., "24h", "7d", "30d").
+    #[serde(default)]
+    pub range_buckets: Vec<BucketConfig>,
+}
+
+/// Configuration for a single time range bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketConfig {
+    /// Human-readable name (used in cache keys, e.g., "24h", "7d").
+    pub name: String,
+    /// Duration of the bucket in seconds (e.g., 86400 for 24h).
+    pub duration_secs: u64,
+    /// How often to rebuild this bucket's bitmap, in seconds.
+    pub refresh_interval_secs: u64,
 }
 
 /// Configuration for a single sort field.
@@ -511,11 +574,13 @@ cache:
                     name: "status".to_string(),
                     field_type: FilterFieldType::SingleValue,
                     storage: StorageMode::default(),
+                    behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "status".to_string(),
                     field_type: FilterFieldType::SingleValue,
                     storage: StorageMode::default(),
+                    behaviors: None,
                 },
             ],
             ..Default::default()
@@ -552,6 +617,7 @@ cache:
                 name: "".to_string(),
                 field_type: FilterFieldType::SingleValue,
                 storage: StorageMode::default(),
+                behaviors: None,
             }],
             ..Default::default()
         };
@@ -735,6 +801,7 @@ sort_fields:
                 name: "status".into(),
                 field_type: FilterFieldType::SingleValue,
                 storage: StorageMode::default(),
+                behaviors: None,
             }],
             ..Config::default()
         };
@@ -813,11 +880,193 @@ max_page_size = 50
                 name: "tagIds".into(),
                 field_type: FilterFieldType::MultiValue,
                 storage: StorageMode::Cached,
+                behaviors: None,
             }],
             ..Config::default()
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let roundtrip = Config::from_toml(&toml_str).unwrap();
         assert_eq!(roundtrip.filter_fields[0].storage, StorageMode::Cached);
+    }
+
+    #[test]
+    fn test_field_behaviors_toml_parsing() {
+        let toml_str = r#"
+[[filter_fields]]
+name = "scheduledAt"
+field_type = "single_value"
+
+[filter_fields.behaviors]
+deferred_alive = true
+
+[[filter_fields.behaviors.range_buckets]]
+name = "24h"
+duration_secs = 86400
+refresh_interval_secs = 60
+
+[[filter_fields.behaviors.range_buckets]]
+name = "7d"
+duration_secs = 604800
+refresh_interval_secs = 300
+"#;
+        let config = Config::from_toml(toml_str).unwrap();
+        assert_eq!(config.filter_fields.len(), 1);
+        let behaviors = config.filter_fields[0].behaviors.as_ref().unwrap();
+        assert!(behaviors.deferred_alive);
+        assert_eq!(behaviors.range_buckets.len(), 2);
+        assert_eq!(behaviors.range_buckets[0].name, "24h");
+        assert_eq!(behaviors.range_buckets[0].duration_secs, 86400);
+        assert_eq!(behaviors.range_buckets[0].refresh_interval_secs, 60);
+        assert_eq!(behaviors.range_buckets[1].name, "7d");
+        assert_eq!(behaviors.range_buckets[1].duration_secs, 604800);
+        assert_eq!(behaviors.range_buckets[1].refresh_interval_secs, 300);
+    }
+
+    #[test]
+    fn test_field_behaviors_yaml_parsing() {
+        let yaml = r#"
+filter_fields:
+  - name: scheduledAt
+    field_type: single_value
+    behaviors:
+      deferred_alive: true
+      range_buckets:
+        - name: "24h"
+          duration_secs: 86400
+          refresh_interval_secs: 60
+        - name: "30d"
+          duration_secs: 2592000
+          refresh_interval_secs: 3600
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        let behaviors = config.filter_fields[0].behaviors.as_ref().unwrap();
+        assert!(behaviors.deferred_alive);
+        assert_eq!(behaviors.range_buckets.len(), 2);
+        assert_eq!(behaviors.range_buckets[1].name, "30d");
+        assert_eq!(behaviors.range_buckets[1].duration_secs, 2592000);
+    }
+
+    #[test]
+    fn test_field_behaviors_defaults_to_none() {
+        let toml_str = r#"
+[[filter_fields]]
+name = "nsfwLevel"
+field_type = "single_value"
+"#;
+        let config = Config::from_toml(toml_str).unwrap();
+        assert!(config.filter_fields[0].behaviors.is_none());
+    }
+
+    #[test]
+    fn test_validation_rejects_deferred_alive_on_boolean() {
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "onSite".into(),
+                field_type: FilterFieldType::Boolean,
+                storage: StorageMode::default(),
+                behaviors: Some(FieldBehaviors {
+                    deferred_alive: true,
+                    range_buckets: vec![],
+                }),
+            }],
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_duplicate_bucket_names() {
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "scheduledAt".into(),
+                field_type: FilterFieldType::SingleValue,
+                storage: StorageMode::default(),
+                behaviors: Some(FieldBehaviors {
+                    deferred_alive: false,
+                    range_buckets: vec![
+                        BucketConfig {
+                            name: "24h".into(),
+                            duration_secs: 86400,
+                            refresh_interval_secs: 60,
+                        },
+                        BucketConfig {
+                            name: "24h".into(),
+                            duration_secs: 86400,
+                            refresh_interval_secs: 60,
+                        },
+                    ],
+                }),
+            }],
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_duration_secs() {
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "scheduledAt".into(),
+                field_type: FilterFieldType::SingleValue,
+                storage: StorageMode::default(),
+                behaviors: Some(FieldBehaviors {
+                    deferred_alive: false,
+                    range_buckets: vec![BucketConfig {
+                        name: "bad".into(),
+                        duration_secs: 0,
+                        refresh_interval_secs: 60,
+                    }],
+                }),
+            }],
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_refresh_interval_secs() {
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "scheduledAt".into(),
+                field_type: FilterFieldType::SingleValue,
+                storage: StorageMode::default(),
+                behaviors: Some(FieldBehaviors {
+                    deferred_alive: false,
+                    range_buckets: vec![BucketConfig {
+                        name: "bad".into(),
+                        duration_secs: 86400,
+                        refresh_interval_secs: 0,
+                    }],
+                }),
+            }],
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_field_behaviors_serde_roundtrip_toml() {
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "scheduledAt".into(),
+                field_type: FilterFieldType::SingleValue,
+                storage: StorageMode::default(),
+                behaviors: Some(FieldBehaviors {
+                    deferred_alive: true,
+                    range_buckets: vec![BucketConfig {
+                        name: "7d".into(),
+                        duration_secs: 604800,
+                        refresh_interval_secs: 300,
+                    }],
+                }),
+            }],
+            ..Config::default()
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let roundtrip = Config::from_toml(&toml_str).unwrap();
+        let behaviors = roundtrip.filter_fields[0].behaviors.as_ref().unwrap();
+        assert!(behaviors.deferred_alive);
+        assert_eq!(behaviors.range_buckets[0].name, "7d");
+        assert_eq!(behaviors.range_buckets[0].duration_secs, 604800);
     }
 }

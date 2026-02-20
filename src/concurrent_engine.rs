@@ -100,6 +100,26 @@ impl ConcurrentEngine {
             None
         };
 
+        // Load Tier 1 filter bitmaps from redb on startup (A8)
+        if let Some(ref store) = bitmap_store {
+            let tier1_names: Vec<&str> = config
+                .filter_fields
+                .iter()
+                .filter(|f| f.storage == StorageMode::Snapshot)
+                .map(|f| f.name.as_str())
+                .collect();
+            if !tier1_names.is_empty() {
+                let loaded = store.load_all_fields(&tier1_names)?;
+                for (field_name, bitmaps) in loaded {
+                    if !bitmaps.is_empty() {
+                        if let Some(field) = filters.get_field_mut(&field_name) {
+                            field.load_from(bitmaps);
+                        }
+                    }
+                }
+            }
+        }
+
         // Initialize Tier 2 cache if any fields are Cached
         let has_tier2 = config.filter_fields.iter().any(|f| f.storage == StorageMode::Cached);
         let tier2_cache = if has_tier2 {
@@ -829,16 +849,19 @@ mod tests {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
                     storage: crate::config::StorageMode::default(),
+                    behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
                     storage: crate::config::StorageMode::default(),
+                    behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
                     storage: crate::config::StorageMode::default(),
+                    behaviors: None,
                 },
             ],
             sort_fields: vec![SortFieldConfig {

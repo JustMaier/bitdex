@@ -16,6 +16,7 @@ pub mod query;
 pub mod slot;
 pub mod sort;
 pub mod tier2_cache;
+pub mod time_buckets;
 pub mod types;
 pub mod versioned_bitmap;
 pub mod write_coalescer;

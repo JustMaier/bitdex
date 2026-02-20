@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -27,6 +28,10 @@ pub struct SlotAllocator {
 
     /// Bitmap of slots that have been cleaned by autovac and are available for reuse.
     clean: Arc<RoaringBitmap>,
+
+    /// Slots waiting for their scheduled activation time.
+    /// Key: unix timestamp (seconds), Value: list of slots to activate.
+    deferred: BTreeMap<u64, Vec<u32>>,
 }
 
 impl Clone for SlotAllocator {
@@ -35,6 +40,7 @@ impl Clone for SlotAllocator {
             next_slot: AtomicU32::new(self.next_slot.load(Ordering::Relaxed)),
             alive: self.alive.clone(),
             clean: Arc::clone(&self.clean),
+            deferred: self.deferred.clone(),
         }
     }
 }
@@ -45,6 +51,7 @@ impl SlotAllocator {
             next_slot: AtomicU32::new(0),
             alive: VersionedBitmap::new_empty(),
             clean: Arc::new(RoaringBitmap::new()),
+            deferred: BTreeMap::new(),
         }
     }
 
@@ -54,6 +61,7 @@ impl SlotAllocator {
             next_slot: AtomicU32::new(next_slot),
             alive: VersionedBitmap::new(alive),
             clean: Arc::new(clean),
+            deferred: BTreeMap::new(),
         }
     }
 
@@ -185,6 +193,53 @@ impl SlotAllocator {
     /// Return the serialized byte size of all bitmaps owned by the slot allocator.
     pub fn bitmap_bytes(&self) -> usize {
         self.alive.bitmap_bytes() + self.clean.serialized_size()
+    }
+
+    /// Schedule a slot for deferred activation.
+    ///
+    /// The slot's high-water mark is updated (it is allocated), but it is NOT set alive.
+    /// Instead, it is added to the deferred map to be activated at `activate_at_unix`.
+    pub fn schedule_alive(&mut self, slot: u32, activate_at_unix: u64) {
+        // Update high-water mark
+        let current = self.next_slot.load(Ordering::Relaxed);
+        if slot >= current {
+            self.next_slot.store(slot + 1, Ordering::Relaxed);
+        }
+        // Add to deferred map (not alive yet)
+        self.deferred.entry(activate_at_unix).or_default().push(slot);
+    }
+
+    /// Activate all slots whose scheduled time has arrived (key <= now_unix).
+    ///
+    /// Sets the alive bit for each activated slot and returns the list of newly-alive slots.
+    pub fn activate_due(&mut self, now_unix: u64) -> Vec<u32> {
+        // Collect all keys <= now_unix
+        let due_keys: Vec<u64> = self
+            .deferred
+            .range(..=now_unix)
+            .map(|(k, _)| *k)
+            .collect();
+
+        let mut activated = Vec::new();
+        for key in due_keys {
+            if let Some(slots) = self.deferred.remove(&key) {
+                for slot in slots {
+                    self.alive.insert(slot);
+                    activated.push(slot);
+                }
+            }
+        }
+        activated
+    }
+
+    /// Total number of slots waiting for deferred activation.
+    pub fn deferred_count(&self) -> usize {
+        self.deferred.values().map(|v| v.len()).sum()
+    }
+
+    /// Check if a slot is currently in the deferred (not-yet-alive) set.
+    pub fn is_deferred(&self, slot: u32) -> bool {
+        self.deferred.values().any(|slots| slots.contains(&slot))
     }
 }
 
@@ -348,5 +403,117 @@ mod tests {
         assert_eq!(alloc.slot_counter(), 11);
         assert!(alloc.is_alive(5));
         assert!(!alloc.is_alive(3));
+    }
+
+    #[test]
+    fn test_schedule_alive_not_immediately_alive() {
+        let mut alloc = SlotAllocator::new();
+        // Schedule slot 42 to activate at unix time 9999
+        alloc.schedule_alive(42, 9999);
+
+        // Slot is NOT alive yet
+        assert!(!alloc.is_alive(42));
+        // But high-water mark is updated
+        assert_eq!(alloc.slot_counter(), 43);
+        // deferred_count reflects 1 pending slot
+        assert_eq!(alloc.deferred_count(), 1);
+        assert!(alloc.is_deferred(42));
+    }
+
+    #[test]
+    fn test_activate_due_future_time_does_not_activate() {
+        let mut alloc = SlotAllocator::new();
+        alloc.schedule_alive(10, 1_000_000);
+
+        // Passing a time before the scheduled time does nothing
+        let activated = alloc.activate_due(500_000);
+        assert!(activated.is_empty());
+        assert!(!alloc.is_alive(10));
+        assert_eq!(alloc.deferred_count(), 1);
+    }
+
+    #[test]
+    fn test_activate_due_past_time_activates_slot() {
+        let mut alloc = SlotAllocator::new();
+        alloc.schedule_alive(10, 1_000_000);
+
+        // Passing a time at or after the scheduled time activates
+        let activated = alloc.activate_due(1_000_000);
+        assert_eq!(activated, vec![10]);
+        assert!(alloc.is_alive(10));
+        assert_eq!(alloc.deferred_count(), 0);
+        assert!(!alloc.is_deferred(10));
+    }
+
+    #[test]
+    fn test_activate_due_drains_correct_subset() {
+        let mut alloc = SlotAllocator::new();
+        // Three slots at different times
+        alloc.schedule_alive(1, 100);
+        alloc.schedule_alive(2, 200);
+        alloc.schedule_alive(3, 300);
+
+        assert_eq!(alloc.deferred_count(), 3);
+
+        // Activate up to t=150 — only slot 1 should activate
+        let activated = alloc.activate_due(150);
+        assert_eq!(activated, vec![1]);
+        assert!(alloc.is_alive(1));
+        assert!(!alloc.is_alive(2));
+        assert!(!alloc.is_alive(3));
+        assert_eq!(alloc.deferred_count(), 2);
+
+        // Activate up to t=200 — slot 2 activates
+        let activated = alloc.activate_due(200);
+        assert_eq!(activated, vec![2]);
+        assert!(alloc.is_alive(2));
+        assert!(!alloc.is_alive(3));
+        assert_eq!(alloc.deferred_count(), 1);
+
+        // Activate up to t=9999 — slot 3 activates
+        let activated = alloc.activate_due(9999);
+        assert_eq!(activated, vec![3]);
+        assert!(alloc.is_alive(3));
+        assert_eq!(alloc.deferred_count(), 0);
+    }
+
+    #[test]
+    fn test_deferred_count_accuracy() {
+        let mut alloc = SlotAllocator::new();
+        assert_eq!(alloc.deferred_count(), 0);
+
+        alloc.schedule_alive(10, 500);
+        alloc.schedule_alive(11, 500); // same timestamp bucket
+        alloc.schedule_alive(12, 600);
+        assert_eq!(alloc.deferred_count(), 3);
+
+        let activated = alloc.activate_due(500);
+        assert_eq!(activated.len(), 2);
+        assert_eq!(alloc.deferred_count(), 1);
+
+        alloc.activate_due(600);
+        assert_eq!(alloc.deferred_count(), 0);
+    }
+
+    #[test]
+    fn test_schedule_alive_updates_high_water_mark() {
+        let mut alloc = SlotAllocator::new();
+        alloc.schedule_alive(99, 1000);
+        assert_eq!(alloc.slot_counter(), 100);
+
+        // Lower ID does not decrease counter
+        alloc.schedule_alive(50, 2000);
+        assert_eq!(alloc.slot_counter(), 100);
+    }
+
+    #[test]
+    fn test_is_deferred_false_after_activation() {
+        let mut alloc = SlotAllocator::new();
+        alloc.schedule_alive(7, 100);
+        assert!(alloc.is_deferred(7));
+
+        alloc.activate_due(100);
+        assert!(!alloc.is_deferred(7));
+        assert!(alloc.is_alive(7));
     }
 }

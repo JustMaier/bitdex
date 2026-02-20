@@ -397,4 +397,123 @@ mod tests {
         let loaded = store2.load_field("tagIds").unwrap();
         assert_eq!(loaded[&42], bm);
     }
+
+    // A11: Write → close → reopen → verify all bitmaps survive.
+    // Writes multiple bitmaps across fields, drops the store, reopens, and
+    // verifies load_field() and load_all_fields() return the correct data.
+    #[test]
+    fn test_restart_write_close_reopen_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bitmaps.redb");
+
+        let bm_tag1 = make_bitmap(&[1, 2, 3, 100]);
+        let bm_tag2 = make_bitmap(&[50, 60]);
+        let bm_nsfw = make_bitmap(&[10, 20]);
+        let bm_type = make_bitmap(&[5]);
+
+        {
+            let store = BitmapStore::new(&path).unwrap();
+            store
+                .write_batch(&[
+                    ("tagIds", 10, &bm_tag1),
+                    ("tagIds", 20, &bm_tag2),
+                    ("nsfwLevel", 1, &bm_nsfw),
+                    ("type", 0, &bm_type),
+                ])
+                .unwrap();
+            // store dropped here — file closed
+        }
+
+        let store2 = BitmapStore::new(&path).unwrap();
+
+        // Verify via load_field
+        let tags = store2.load_field("tagIds").unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[&10], bm_tag1);
+        assert_eq!(tags[&20], bm_tag2);
+
+        let nsfw = store2.load_field("nsfwLevel").unwrap();
+        assert_eq!(nsfw.len(), 1);
+        assert_eq!(nsfw[&1], bm_nsfw);
+
+        // Verify via load_all_fields
+        let all = store2
+            .load_all_fields(&["tagIds", "nsfwLevel", "type"])
+            .unwrap();
+        assert_eq!(all["tagIds"].len(), 2);
+        assert_eq!(all["nsfwLevel"].len(), 1);
+        assert_eq!(all["type"].len(), 1);
+        assert_eq!(all["type"][&0], bm_type);
+    }
+
+    // A11: Multiple write batches → reopen — later writes win for overlapping keys.
+    #[test]
+    fn test_restart_multiple_batches_later_writes_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bitmaps.redb");
+
+        let bm_v1 = make_bitmap(&[1, 2, 3]);
+        let bm_v2 = make_bitmap(&[100, 200, 300]);
+        let bm_other = make_bitmap(&[9, 8, 7]);
+
+        {
+            let store = BitmapStore::new(&path).unwrap();
+
+            // Batch 1: tagIds:42 = v1, tagIds:99 = other
+            store
+                .write_batch(&[("tagIds", 42, &bm_v1), ("tagIds", 99, &bm_other)])
+                .unwrap();
+
+            // Batch 2: overwrite tagIds:42 with v2
+            store.write_batch(&[("tagIds", 42, &bm_v2)]).unwrap();
+            // store dropped
+        }
+
+        let store2 = BitmapStore::new(&path).unwrap();
+        let tags = store2.load_field("tagIds").unwrap();
+        assert_eq!(tags.len(), 2);
+        // Later write (v2) wins for tagIds:42
+        assert_eq!(tags[&42], bm_v2);
+        // Unmodified entry survives
+        assert_eq!(tags[&99], bm_other);
+    }
+
+    // A11: Delete → reopen → verify deletions persisted.
+    #[test]
+    fn test_restart_delete_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bitmaps.redb");
+
+        let bm1 = make_bitmap(&[1, 2, 3]);
+        let bm2 = make_bitmap(&[4, 5, 6]);
+        let bm3 = make_bitmap(&[7, 8, 9]);
+
+        {
+            let store = BitmapStore::new(&path).unwrap();
+            store
+                .write_batch(&[
+                    ("tagIds", 1, &bm1),
+                    ("tagIds", 2, &bm2),
+                    ("tagIds", 3, &bm3),
+                ])
+                .unwrap();
+
+            // Delete tagIds:2
+            store.delete_field_value("tagIds", 2).unwrap();
+            // store dropped
+        }
+
+        let store2 = BitmapStore::new(&path).unwrap();
+        let tags = store2.load_field("tagIds").unwrap();
+
+        // Only 2 entries remain
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[&1], bm1);
+        assert!(!tags.contains_key(&2), "deleted entry should not survive restart");
+        assert_eq!(tags[&3], bm3);
+
+        // load_single on the deleted key returns empty
+        let deleted = store2.load_single("tagIds", 2).unwrap();
+        assert!(deleted.is_empty());
+    }
 }

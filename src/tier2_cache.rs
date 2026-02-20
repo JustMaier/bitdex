@@ -204,4 +204,132 @@ mod tests {
         let size_after = cache.weighted_size();
         assert!(size_after > size_before);
     }
+
+    // A10: Concurrent reads / thundering herd
+    // Spawn multiple threads that all call get_or_load() for the same cold key.
+    // The loader must only be called ONCE; all threads should get the same bitmap.
+    #[test]
+    fn test_thundering_herd_loader_called_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let cache = Arc::new(Tier2Cache::new(100));
+        let field: Arc<str> = Arc::from("tagIds");
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+        bm.insert(2);
+        bm.insert(3);
+        let expected_bm = Arc::new(bm);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let field = Arc::clone(&field);
+                let call_count = Arc::clone(&call_count);
+                let expected_bm = Arc::clone(&expected_bm);
+                thread::spawn(move || {
+                    let result = cache
+                        .get_or_load(&field, 42, || {
+                            call_count.fetch_add(1, Ordering::SeqCst);
+                            Ok((*expected_bm).clone())
+                        })
+                        .unwrap();
+                    assert_eq!(result.len(), 3);
+                    assert!(result.contains(1));
+                    assert!(result.contains(2));
+                    assert!(result.contains(3));
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // moka's get_with() coalesces concurrent loaders — loader called exactly once
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // A10: Pending mutation correctness
+    // Load a bitmap from BitmapStore (open_temp), apply PendingMutations via apply_to(),
+    // verify the result is correct.
+    #[test]
+    fn test_pending_mutation_applied_on_load() {
+        use crate::bitmap_store::BitmapStore;
+        use crate::pending_buffer::PendingBuffer;
+
+        // Seed the store with a base bitmap
+        let store = BitmapStore::open_temp().unwrap();
+        let mut base_bm = RoaringBitmap::new();
+        base_bm.insert(10);
+        base_bm.insert(20);
+        base_bm.insert(30);
+        store
+            .write_batch(&[("tagIds", 42, &base_bm)])
+            .unwrap();
+
+        // Build pending mutations: set 40, clear 10
+        let field: Arc<str> = Arc::from("tagIds");
+        let mut buf = PendingBuffer::new();
+        buf.add_set(&field, 42, 40);
+        buf.add_clear(&field, 42, 10);
+
+        // Simulate cache miss: load from store then apply pending
+        let mut loaded = store.load_single("tagIds", 42).unwrap();
+        if let Some(pending) = buf.take(&field, 42) {
+            pending.apply_to(&mut loaded);
+        }
+
+        // 10 was cleared, 20 and 30 remain, 40 was added
+        assert!(!loaded.contains(10));
+        assert!(loaded.contains(20));
+        assert!(loaded.contains(30));
+        assert!(loaded.contains(40));
+        assert_eq!(loaded.len(), 3);
+    }
+
+    // A10: Cache eviction behavior
+    // Verify that moka enforces its memory budget by checking weighted_size after
+    // inserting entries that collectively exceed the budget.
+    #[test]
+    fn test_cache_eviction_under_small_budget() {
+        // 1 MB budget
+        let cache = Tier2Cache::new(1);
+        let field: Arc<str> = Arc::from("tagIds");
+
+        let mut total_inserted_weight: u64 = 0;
+        for i in 0u64..20 {
+            let mut bm = RoaringBitmap::new();
+            // Use a simple hash-like scatter: bit = i*prime mod large_range
+            // This defeats all roaring compression (array containers, no runs).
+            let base = (i as u32) * 7_919; // prime offset per bitmap
+            for j in 0u32..200_000 {
+                // Scatter across a large range to avoid bitset containers
+                let bit = base.wrapping_add(j.wrapping_mul(104_729)); // prime stride
+                bm.insert(bit);
+            }
+            total_inserted_weight += bm.serialized_size() as u64;
+            cache.insert(&field, i, Arc::new(bm));
+            cache.cache.run_pending_tasks();
+        }
+
+        // Sanity check: we did insert more than the budget
+        assert!(
+            total_inserted_weight > 1024 * 1024,
+            "total inserted weight {} should exceed 1 MB budget",
+            total_inserted_weight
+        );
+
+        // moka should have evicted enough to stay near budget.
+        // Use weighted_size which is authoritative — entry_count may lag.
+        let weighted = cache.weighted_size();
+        assert!(
+            weighted < total_inserted_weight,
+            "weighted size {} should be less than total inserted {}",
+            weighted,
+            total_inserted_weight
+        );
+    }
 }

@@ -21,16 +21,19 @@ fn test_config() -> Config {
                 name: "category".to_string(),
                 field_type: FilterFieldType::SingleValue,
                 storage: Default::default(),
+                behaviors: None,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
                 field_type: FilterFieldType::MultiValue,
                 storage: Default::default(),
+                behaviors: None,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
                 field_type: FilterFieldType::Boolean,
                 storage: Default::default(),
+                behaviors: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {

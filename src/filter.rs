@@ -33,6 +33,15 @@ impl FilterField {
         }
     }
 
+    /// Bulk-load bitmaps from a map of (value -> bitmap).
+    /// Used during startup to restore Tier 1 filter state from redb.
+    /// Each bitmap becomes a VersionedBitmap base (no dirty diff).
+    pub fn load_from(&mut self, data: HashMap<u64, RoaringBitmap>) {
+        for (value, bitmap) in data {
+            self.bitmaps.insert(value, VersionedBitmap::new(bitmap));
+        }
+    }
+
     /// Get the field name.
     pub fn name(&self) -> &str {
         &self.config.name
@@ -265,6 +274,7 @@ mod tests {
             name: name.to_string(),
             field_type: FilterFieldType::SingleValue,
             storage: crate::config::StorageMode::default(),
+            behaviors: None,
         }
     }
 
@@ -273,6 +283,7 @@ mod tests {
             name: name.to_string(),
             field_type: FilterFieldType::MultiValue,
             storage: crate::config::StorageMode::default(),
+            behaviors: None,
         }
     }
 
@@ -281,6 +292,7 @@ mod tests {
             name: name.to_string(),
             field_type: FilterFieldType::Boolean,
             storage: crate::config::StorageMode::default(),
+            behaviors: None,
         }
     }
 
