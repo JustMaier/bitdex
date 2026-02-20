@@ -8,7 +8,8 @@ use arc_swap::{ArcSwap, Guard};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::bitmap_store::BitmapStore;
-use crate::cache::{self, CacheLookup, TrieCache};
+use crate::bound_cache::{BoundCacheManager, BoundKey};
+use crate::cache::{self, CacheLookup, CacheKey, TrieCache};
 use crate::concurrency::InFlightTracker;
 use crate::config::{Config, StorageMode};
 use crate::docstore::{DocStore, StoredDoc};
@@ -17,7 +18,7 @@ use crate::executor::{QueryExecutor, Tier2Resolver};
 use crate::mutation::{diff_document, diff_patch, Document, FieldRegistry, PatchPayload};
 use crate::pending_buffer::PendingBuffer;
 use crate::planner;
-use crate::query::{BitdexQuery, FilterClause, SortClause};
+use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
 use crate::tier2_cache::Tier2Cache;
 use crate::types::QueryResult;
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
@@ -58,6 +59,7 @@ pub struct ConcurrentEngine {
     bitmap_store: Option<Arc<BitmapStore>>,
     tier2_cache: Option<Arc<Tier2Cache>>,
     pending: Arc<parking_lot::Mutex<PendingBuffer>>,
+    bound_cache: Arc<parking_lot::Mutex<BoundCacheManager>>,
 }
 
 impl ConcurrentEngine {
@@ -129,6 +131,10 @@ impl ConcurrentEngine {
         };
 
         let pending = Arc::new(parking_lot::Mutex::new(PendingBuffer::new()));
+        let bound_cache = Arc::new(parking_lot::Mutex::new(BoundCacheManager::new(
+            config.cache.bound_target_size,
+            config.cache.bound_max_size,
+        )));
 
         let inner_engine = InnerEngine {
             slots: crate::slot::SlotAllocator::new(),
@@ -395,6 +401,7 @@ impl ConcurrentEngine {
             bitmap_store,
             tier2_cache,
             pending,
+            bound_cache,
         })
     }
 
@@ -546,8 +553,15 @@ impl ConcurrentEngine {
         let (filter_bitmap, use_simple_sort) =
             self.resolve_filters(&executor, filters, sort.is_some())?;
 
+        // D5: Narrow filter bitmap with bound cache for sort queries
+        let (effective_bitmap, use_simple, cache_key) =
+            self.apply_bound(&executor, filter_bitmap, use_simple_sort, sort, filters, None);
+
         let mut result =
-            executor.execute_from_bitmap(filter_bitmap, sort, limit, None, use_simple_sort)?;
+            executor.execute_from_bitmap(effective_bitmap, sort, limit, None, use_simple)?;
+
+        // D2: Form or update bound from sort results
+        self.update_bound_from_results(&snap, sort, &cache_key, &result.ids);
 
         // Post-validation against in-flight writes
         self.post_validate(&mut result, filters, &executor)?;
@@ -578,13 +592,26 @@ impl ConcurrentEngine {
         let (filter_bitmap, use_simple_sort) =
             self.resolve_filters(&executor, &query.filters, query.sort.is_some())?;
 
-        let mut result = executor.execute_from_bitmap(
+        // D5: Narrow filter bitmap with bound cache for sort queries
+        let (effective_bitmap, use_simple, cache_key) = self.apply_bound(
+            &executor,
             filter_bitmap,
+            use_simple_sort,
+            query.sort.as_ref(),
+            &query.filters,
+            query.cursor.as_ref(),
+        );
+
+        let mut result = executor.execute_from_bitmap(
+            effective_bitmap,
             query.sort.as_ref(),
             query.limit,
             query.cursor.as_ref(),
-            use_simple_sort,
+            use_simple,
         )?;
+
+        // D2: Form or update bound from sort results
+        self.update_bound_from_results(&snap, query.sort.as_ref(), &cache_key, &result.ids);
 
         self.post_validate(&mut result, &query.filters, &executor)?;
 
@@ -670,6 +697,97 @@ impl ConcurrentEngine {
         }
 
         Ok(())
+    }
+
+    /// D5: Apply bound cache narrowing for sort queries.
+    ///
+    /// If a matching bound exists and is usable, ANDs the filter bitmap with the
+    /// bound bitmap to reduce the sort working set. Returns the effective bitmap,
+    /// whether to use simple sort, and the cache key for bound formation.
+    fn apply_bound(
+        &self,
+        _executor: &QueryExecutor,
+        filter_bitmap: roaring::RoaringBitmap,
+        use_simple_sort: bool,
+        sort: Option<&SortClause>,
+        filters: &[FilterClause],
+        cursor: Option<&crate::query::CursorPosition>,
+    ) -> (roaring::RoaringBitmap, bool, Option<CacheKey>) {
+        let Some(sort_clause) = sort else {
+            return (filter_bitmap, use_simple_sort, None);
+        };
+
+        let cache_key = cache::canonicalize(filters);
+        let Some(ref filter_key) = cache_key else {
+            return (filter_bitmap, use_simple_sort, None);
+        };
+
+        let bound_key = BoundKey {
+            filter_key: filter_key.clone(),
+            sort_field: sort_clause.field.clone(),
+            direction: sort_clause.direction,
+        };
+
+        let mut bc = self.bound_cache.lock();
+        if let Some(entry) = bc.lookup_mut(&bound_key) {
+            if !entry.needs_rebuild() {
+                // D6: Skip if cursor is past the bound's range
+                if let Some(c) = cursor {
+                    let cursor_val = c.sort_value as u32;
+                    match sort_clause.direction {
+                        SortDirection::Desc if cursor_val < entry.min_tracked_value() => {
+                            return (filter_bitmap, use_simple_sort, cache_key);
+                        }
+                        SortDirection::Asc if cursor_val > entry.min_tracked_value() => {
+                            return (filter_bitmap, use_simple_sort, cache_key);
+                        }
+                        _ => {}
+                    }
+                }
+
+                entry.touch();
+                let narrowed = &filter_bitmap & entry.bitmap();
+                // With a bound, force bitmap sort (not simple sort) since working set is small
+                return (narrowed, false, cache_key);
+            }
+        }
+        drop(bc);
+
+        (filter_bitmap, use_simple_sort, cache_key)
+    }
+
+    /// D2: Form or update a bound from sort query results.
+    fn update_bound_from_results(
+        &self,
+        snap: &Guard<Arc<InnerEngine>>,
+        sort: Option<&SortClause>,
+        cache_key: &Option<CacheKey>,
+        result_ids: &[i64],
+    ) {
+        let Some(sort_clause) = sort else { return };
+        let Some(ref filter_key) = cache_key else { return };
+
+        let sort_field = match snap.sorts.get_field(&sort_clause.field) {
+            Some(f) => f,
+            None => return,
+        };
+
+        let bound_key = BoundKey {
+            filter_key: filter_key.clone(),
+            sort_field: sort_clause.field.clone(),
+            direction: sort_clause.direction,
+        };
+
+        let sorted_slots: Vec<u32> = result_ids.iter().map(|&id| id as u32).collect();
+
+        let mut bc = self.bound_cache.lock();
+        if let Some(entry) = bc.get_mut(&bound_key) {
+            if entry.needs_rebuild() {
+                entry.rebuild(&sorted_slots, |slot| sort_field.reconstruct_value(slot));
+            }
+        } else {
+            bc.form_bound(bound_key, &sorted_slots, |slot| sort_field.reconstruct_value(slot));
+        }
     }
 
     /// Load the current snapshot (lock-free). Public API for advanced use.
