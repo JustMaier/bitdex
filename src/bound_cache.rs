@@ -340,6 +340,14 @@ impl BoundCacheManager {
     pub fn max_size(&self) -> usize {
         self.max_size
     }
+
+    /// Clear all bounds and reset the meta-index.
+    pub fn clear(&mut self) {
+        self.bounds.clear();
+        self.key_to_meta_id.clear();
+        self.meta_id_to_key.clear();
+        self.meta = MetaIndex::new();
+    }
 }
 
 #[cfg(test)]

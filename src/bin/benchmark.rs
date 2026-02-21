@@ -29,7 +29,7 @@ use bitdex_v2::concurrent_engine::ConcurrentEngine;
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
 use bitdex_v2::filter::FilterFieldType;
 use bitdex_v2::mutation::{Document, FieldValue};
-use bitdex_v2::query::{FilterClause, SortClause, SortDirection, Value};
+use bitdex_v2::query::{BitdexQuery, CursorPosition, FilterClause, SortClause, SortDirection, Value};
 
 // ---------------------------------------------------------------------------
 // NDJSON record definition
@@ -588,7 +588,8 @@ fn load_records(path: &PathBuf, limit: usize, remap_ids: bool) -> Vec<(u32, Docu
 fn print_bitmap_memory(engine: &ConcurrentEngine) {
     let (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details) =
         engine.bitmap_memory_report();
-    let total = slot_bytes + filter_bytes + sort_bytes + cache_bytes;
+    let (bound_entries, bound_bytes, meta_entries, meta_bytes) = engine.bound_cache_stats();
+    let total = slot_bytes + filter_bytes + sort_bytes + cache_bytes + bound_bytes + meta_bytes;
 
     println!("--- Bitmap Memory (pure Bitdex, excludes docstore/allocator) ---");
     println!("  Slots (alive+clean):  {:>10}", format_bytes(slot_bytes as u64));
@@ -601,6 +602,8 @@ fn print_bitmap_memory(engine: &ConcurrentEngine) {
         println!("    {:<22}              {:>10}", name, format_bytes(*bytes as u64));
     }
     println!("  Trie cache:           {:>10}  ({} entries)", format_bytes(cache_bytes as u64), cache_entries);
+    println!("  Bound cache:          {:>10}  ({} bounds)", format_bytes(bound_bytes as u64), bound_entries);
+    println!("  Meta-index:           {:>10}  ({} registered)", format_bytes(meta_bytes as u64), meta_entries);
     println!("  ----------------------------------------");
     println!("  Total bitmap memory:  {:>10}", format_bytes(total as u64));
     println!();
@@ -1231,8 +1234,177 @@ fn main() {
         }
         println!();
 
-        // Show bitmap memory after queries (trie cache is now populated)
+        // Show bitmap memory after queries (trie cache + bound cache populated)
         print_bitmap_memory(&engine);
+
+        // -------------------------------------------------------------------
+        // Phase 5b: Bound Cache Effectiveness
+        //
+        // Measures the speedup from bound cache narrowing on sort queries.
+        // Clear the bound cache, run each sort query once (cold — trie cache
+        // warm but no bound), then run it again with the bound formed.
+        // -------------------------------------------------------------------
+        println!("--- Phase 5b: Bound Cache Effectiveness (cold vs warm) ---");
+        println!();
+
+        engine.clear_bound_cache();
+
+        struct BoundTestSpec {
+            name: &'static str,
+            filters: Vec<FilterClause>,
+            sort: SortClause,
+            limit: usize,
+        }
+
+        let bound_tests = vec![
+            BoundTestSpec {
+                name: "all_sort_reactions",
+                filters: vec![],
+                sort: SortClause { field: "reactionCount".into(), direction: SortDirection::Desc },
+                limit: 50,
+            },
+            BoundTestSpec {
+                name: "nsfw1_sort_reactions",
+                filters: vec![FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+                sort: SortClause { field: "reactionCount".into(), direction: SortDirection::Desc },
+                limit: 50,
+            },
+            BoundTestSpec {
+                name: "nsfw1_onSite_sort_reactions",
+                filters: vec![
+                    FilterClause::Eq("nsfwLevel".into(), Value::Integer(1)),
+                    FilterClause::Eq("onSite".into(), Value::Bool(true)),
+                ],
+                sort: SortClause { field: "reactionCount".into(), direction: SortDirection::Desc },
+                limit: 50,
+            },
+            BoundTestSpec {
+                name: "tag_sort_reactions",
+                filters: vec![FilterClause::Eq("tagIds".into(), Value::Integer(popular_tag))],
+                sort: SortClause { field: "reactionCount".into(), direction: SortDirection::Desc },
+                limit: 50,
+            },
+            BoundTestSpec {
+                name: "nsfw1_sort_commentCount",
+                filters: vec![FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+                sort: SortClause { field: "commentCount".into(), direction: SortDirection::Desc },
+                limit: 50,
+            },
+            BoundTestSpec {
+                name: "nsfw1_sort_id_asc",
+                filters: vec![FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+                sort: SortClause { field: "id".into(), direction: SortDirection::Asc },
+                limit: 50,
+            },
+        ];
+
+        println!("  {:<36} {:>8} {:>8} {:>8} {:>8}",
+            "Query", "cold", "warm p50", "warm p95", "speedup");
+        println!("  {}", "-".repeat(72));
+
+        for bt in &bound_tests {
+            // Cold: no bound exists (trie cache still warm)
+            let cold_start = Instant::now();
+            let _ = engine.query(&bt.filters, Some(&bt.sort), bt.limit).unwrap();
+            let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Warm: bound was just formed, subsequent queries benefit
+            let warm_iters = 100;
+            let mut warm_durations = Vec::with_capacity(warm_iters);
+            for _ in 0..warm_iters {
+                let start = Instant::now();
+                let _ = engine.query(&bt.filters, Some(&bt.sort), bt.limit).unwrap();
+                warm_durations.push(start.elapsed());
+            }
+            let warm_stats = compute_stats(warm_durations);
+            let speedup = cold_ms / warm_stats.p50_ms;
+
+            println!("  {:<36} {:>7.3} {:>7.3} {:>7.3}ms {:>7.1}x",
+                bt.name, cold_ms, warm_stats.p50_ms, warm_stats.p95_ms, speedup);
+        }
+        println!();
+
+        // Report bound cache stats after effectiveness test
+        {
+            let (be, bb, me, mb) = engine.bound_cache_stats();
+            println!("  Bound cache after effectiveness test: {} bounds, {}", be, format_bytes(bb as u64));
+            println!("  Meta-index: {} entries, {}", me, format_bytes(mb as u64));
+        }
+        println!();
+
+        // -------------------------------------------------------------------
+        // Phase 5c: Deep Pagination Benchmark
+        //
+        // Tests cursor-based pagination through 10 pages. Measures per-page
+        // latency to verify tiered bounds maintain performance at depth.
+        // -------------------------------------------------------------------
+        println!("--- Phase 5c: Deep Pagination (cursor through 10 pages) ---");
+        println!();
+
+        let pagination_filters = vec![
+            FilterClause::Eq("nsfwLevel".into(), Value::Integer(1)),
+            FilterClause::Eq("onSite".into(), Value::Bool(true)),
+        ];
+        let pagination_sort = SortClause {
+            field: "reactionCount".into(),
+            direction: SortDirection::Desc,
+        };
+        let page_size = 50;
+
+        println!("  Filters: nsfwLevel=1 AND onSite=true");
+        println!("  Sort: reactionCount DESC, page_size={}", page_size);
+        println!();
+        println!("  {:>6} {:>8} {:>10} {:>14}",
+            "Page", "latency", "results", "cursor_value");
+        println!("  {}", "-".repeat(44));
+
+        let snap = engine.snapshot_public();
+        let sort_field = snap.sorts.get_field("reactionCount").unwrap();
+        let mut cursor: Option<CursorPosition> = None;
+
+        for page in 1..=10 {
+            let query = BitdexQuery {
+                filters: pagination_filters.clone(),
+                sort: Some(pagination_sort.clone()),
+                limit: page_size,
+                cursor: cursor.clone(),
+            };
+
+            let start = Instant::now();
+            let result = engine.execute_query(&query).unwrap();
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            let result_count = result.ids.len();
+
+            if let Some(&last_id) = result.ids.last() {
+                let last_slot = last_id as u32;
+                let sv = sort_field.reconstruct_value(last_slot);
+                println!("  {:>6} {:>7.3}ms {:>10} {:>14}",
+                    page, elapsed_ms, result_count, sv);
+                cursor = Some(CursorPosition {
+                    sort_value: sv as u64,
+                    slot_id: last_slot,
+                });
+            } else {
+                println!("  {:>6} {:>7.3}ms {:>10} {:>14}",
+                    page, elapsed_ms, result_count, "-");
+                break; // No more results
+            }
+
+            if result_count < page_size {
+                break; // Partial page = end of results
+            }
+        }
+        drop(snap);
+
+        // Report bound cache stats after pagination
+        {
+            let (be, bb, me, mb) = engine.bound_cache_stats();
+            println!();
+            println!("  Bound cache after pagination: {} bounds, {}", be, format_bytes(bb as u64));
+            println!("  Meta-index: {} entries, {}", me, format_bytes(mb as u64));
+        }
+        println!();
     }
 
     // -----------------------------------------------------------------------

@@ -961,6 +961,24 @@ impl ConcurrentEngine {
         (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details)
     }
 
+    /// Report bound cache statistics.
+    ///
+    /// Returns (bound_entries, bound_bitmap_bytes, meta_index_entries, meta_index_bytes).
+    pub fn bound_cache_stats(&self) -> (usize, usize, usize, usize) {
+        let bc = self.bound_cache.lock();
+        let bound_entries = bc.len();
+        let bound_bytes = bc.total_memory_bytes();
+        let meta = bc.meta_index();
+        let meta_entries = meta.entry_count();
+        let meta_bytes = meta.memory_bytes();
+        (bound_entries, bound_bytes, meta_entries, meta_bytes)
+    }
+
+    /// Clear all bound cache entries (for benchmarking cold vs warm).
+    pub fn clear_bound_cache(&self) {
+        self.bound_cache.lock().clear();
+    }
+
     /// Get a reference to the config.
     pub fn config(&self) -> &Config {
         &self.config
