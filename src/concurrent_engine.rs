@@ -21,6 +21,7 @@ use crate::pending_buffer::PendingBuffer;
 use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
 use crate::tier2_cache::Tier2Cache;
+use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 
@@ -62,6 +63,7 @@ pub struct ConcurrentEngine {
     pending: Arc<parking_lot::Mutex<PendingBuffer>>,
     bound_cache: Arc<parking_lot::Mutex<BoundCacheManager>>,
     loading_mode: Arc<AtomicBool>,
+    time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
 }
 
 impl ConcurrentEngine {
@@ -164,6 +166,23 @@ impl ConcurrentEngine {
         )));
         let loading_mode = Arc::new(AtomicBool::new(false));
 
+        // S3.3: Instantiate TimeBucketManager if any filter field has range_buckets configured
+        let time_buckets = {
+            let mut tb: Option<TimeBucketManager> = None;
+            for fc in &config.filter_fields {
+                if let Some(ref behaviors) = fc.behaviors {
+                    if !behaviors.range_buckets.is_empty() {
+                        tb = Some(TimeBucketManager::new(
+                            fc.name.clone(),
+                            behaviors.range_buckets.clone(),
+                        ));
+                        break; // Only one field can have range buckets
+                    }
+                }
+            }
+            tb.map(|m| Arc::new(parking_lot::Mutex::new(m)))
+        };
+
         let inner_engine = InnerEngine {
             slots,
             filters,
@@ -249,6 +268,20 @@ impl ConcurrentEngine {
                             &mut staging.filters,
                             &mut staging.sorts,
                         );
+
+                        // Activate deferred alive slots whose time has come.
+                        // O(pending count) — typically small; runs every flush cycle for
+                        // sub-second activation precision.
+                        {
+                            let now_unix = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let activated = staging.slots.activate_due(now_unix);
+                            if !activated.is_empty() {
+                                staging.slots.merge_alive();
+                            }
+                        }
 
                         // In loading mode, skip all maintenance and snapshot publishing.
                         // This avoids the expensive staging.clone() → Arc::make_mut clone
@@ -622,6 +655,7 @@ impl ConcurrentEngine {
             pending,
             bound_cache,
             loading_mode,
+            time_buckets,
         })
     }
 
@@ -754,24 +788,37 @@ impl ConcurrentEngine {
     ) -> Result<QueryResult> {
         let snap = self.snapshot(); // lock-free
         let tier2_resolver = self.make_tier2_resolver();
-        let executor = match tier2_resolver.as_ref() {
-            Some(t2) => QueryExecutor::with_tier2(
-                &snap.slots,
-                &snap.filters,
-                &snap.sorts,
-                self.config.max_page_size,
-                t2,
-            ),
-            None => QueryExecutor::new(
-                &snap.slots,
-                &snap.filters,
-                &snap.sorts,
-                self.config.max_page_size,
-            ),
+        // S3.4: Lock time_buckets once for the query lifetime
+        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let executor = {
+            let base = match tier2_resolver.as_ref() {
+                Some(t2) => QueryExecutor::with_tier2(
+                    &snap.slots,
+                    &snap.filters,
+                    &snap.sorts,
+                    self.config.max_page_size,
+                    t2,
+                ),
+                None => QueryExecutor::new(
+                    &snap.slots,
+                    &snap.filters,
+                    &snap.sorts,
+                    self.config.max_page_size,
+                ),
+            };
+            if let Some(ref tb) = tb_guard {
+                base.with_time_buckets(tb, now_unix)
+            } else {
+                base
+            }
         };
 
         let (filter_bitmap, use_simple_sort) =
-            self.resolve_filters(&executor, filters, sort.is_some())?;
+            self.resolve_filters(&executor, filters)?;
 
         // D5: Narrow filter bitmap with bound cache for sort queries
         let (effective_bitmap, use_simple, cache_key) =
@@ -793,24 +840,36 @@ impl ConcurrentEngine {
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
         let snap = self.snapshot(); // lock-free
         let tier2_resolver = self.make_tier2_resolver();
-        let executor = match tier2_resolver.as_ref() {
-            Some(t2) => QueryExecutor::with_tier2(
-                &snap.slots,
-                &snap.filters,
-                &snap.sorts,
-                self.config.max_page_size,
-                t2,
-            ),
-            None => QueryExecutor::new(
-                &snap.slots,
-                &snap.filters,
-                &snap.sorts,
-                self.config.max_page_size,
-            ),
+        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let executor = {
+            let base = match tier2_resolver.as_ref() {
+                Some(t2) => QueryExecutor::with_tier2(
+                    &snap.slots,
+                    &snap.filters,
+                    &snap.sorts,
+                    self.config.max_page_size,
+                    t2,
+                ),
+                None => QueryExecutor::new(
+                    &snap.slots,
+                    &snap.filters,
+                    &snap.sorts,
+                    self.config.max_page_size,
+                ),
+            };
+            if let Some(ref tb) = tb_guard {
+                base.with_time_buckets(tb, now_unix)
+            } else {
+                base
+            }
         };
 
         let (filter_bitmap, use_simple_sort) =
-            self.resolve_filters(&executor, &query.filters, query.sort.is_some())?;
+            self.resolve_filters(&executor, &query.filters)?;
 
         // D5: Narrow filter bitmap with bound cache for sort queries
         let (effective_bitmap, use_simple, cache_key) = self.apply_bound(
@@ -852,9 +911,8 @@ impl ConcurrentEngine {
         &self,
         executor: &QueryExecutor,
         filters: &[FilterClause],
-        has_sort: bool,
     ) -> Result<(roaring::RoaringBitmap, bool)> {
-        let plan = planner::plan_query(filters, executor.filter_index(), executor.slot_allocator(), has_sort);
+        let plan = planner::plan_query(filters, executor.filter_index(), executor.slot_allocator());
         let cache_key = cache::canonicalize(&plan.ordered_clauses);
 
         let filter_bitmap = if let Some(ref key) = cache_key {
@@ -990,8 +1048,23 @@ impl ConcurrentEngine {
                     return (narrowed, false, cache_key);
                 }
             }
-            break; // No bound at this tier, fall through to full traversal
+            break; // No bound at this tier, try superset matching
         }
+
+        // E4/S4.2: Superset matching — find a bound whose filter clauses are a
+        // subset of this query's. A bound for {nsfwLevel=1} can narrow a query
+        // for {nsfwLevel=1, onSite=true}. The bound bitmap is still ANDed with
+        // the full filter result, so correctness is preserved.
+        if let Some(entry) = bc.find_superset_bound(
+            filter_key,
+            &sort_clause.field,
+            sort_clause.direction,
+        ) {
+            entry.touch();
+            let narrowed = &filter_bitmap & entry.bitmap();
+            return (narrowed, false, cache_key);
+        }
+
         drop(bc);
 
         (filter_bitmap, use_simple_sort, cache_key)

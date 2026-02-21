@@ -121,7 +121,7 @@ impl<'a> QueryExecutor<'a> {
         let limit = limit.min(self.max_page_size);
 
         // Step 1: Plan the query (reorder clauses by cardinality)
-        let plan = planner::plan_query(filters, self.filters, self.slots, sort.is_some());
+        let plan = planner::plan_query(filters, self.filters, self.slots);
 
         // Step 2: Compute filter bitmap using planned clause order
         let filter_bitmap = self.compute_filters(&plan.ordered_clauses)?;
@@ -164,7 +164,7 @@ impl<'a> QueryExecutor<'a> {
         let limit = limit.min(self.max_page_size);
 
         // Step 1: Plan the query (reorder clauses by cardinality)
-        let plan = planner::plan_query(filters, self.filters, self.slots, sort.is_some());
+        let plan = planner::plan_query(filters, self.filters, self.slots);
 
         // Step 2: Try cache lookup using canonical key (C5: use bucket-stable keys when available)
         let cache_key = if let Some(tb) = self.time_buckets {
@@ -633,11 +633,28 @@ impl<'a> QueryExecutor<'a> {
         limit: usize,
         cursor: Option<&crate::query::CursorPosition>,
     ) -> (Vec<i64>, Option<crate::query::CursorPosition>) {
-        // For cursor-based pagination, narrow candidates to slots below cursor
+        self.slot_order_paginate_dir(candidates, limit, cursor, false)
+    }
+
+    /// Slot-order pagination with direction control.
+    /// `ascending`: if true, returns oldest-first (lowest slot IDs first).
+    /// If false (default), returns newest-first (highest slot IDs first).
+    fn slot_order_paginate_dir(
+        &self,
+        candidates: &RoaringBitmap,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+        ascending: bool,
+    ) -> (Vec<i64>, Option<crate::query::CursorPosition>) {
         let effective = if let Some(cursor) = cursor {
             let mut narrowed = candidates.clone();
-            // Remove slots >= cursor_slot_id (we want strictly less than cursor for desc order)
-            narrowed.remove_range(cursor.slot_id..=u32::MAX);
+            if ascending {
+                // Remove slots <= cursor_slot_id (want strictly greater for asc)
+                narrowed.remove_range(0..=cursor.slot_id);
+            } else {
+                // Remove slots >= cursor_slot_id (want strictly less for desc)
+                narrowed.remove_range(cursor.slot_id..=u32::MAX);
+            }
             narrowed
         } else {
             candidates.clone()
@@ -647,12 +664,16 @@ impl<'a> QueryExecutor<'a> {
             return (Vec::new(), None);
         }
 
-        // Take the last `limit` slots (highest slot IDs = newest)
-        let total = effective.len() as usize;
-        let skip = total.saturating_sub(limit);
-        let slots: Vec<u32> = effective.iter().skip(skip).collect();
-        // Reverse to get descending order
-        let ids: Vec<i64> = slots.iter().rev().map(|&s| s as i64).collect();
+        let ids: Vec<i64> = if ascending {
+            // Take first `limit` slots (lowest slot IDs = oldest)
+            effective.iter().take(limit).map(|s| s as i64).collect()
+        } else {
+            // Take last `limit` slots (highest slot IDs = newest), reverse
+            let total = effective.len() as usize;
+            let skip = total.saturating_sub(limit);
+            let slots: Vec<u32> = effective.iter().skip(skip).collect();
+            slots.iter().rev().map(|&s| s as i64).collect()
+        };
 
         let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
             sort_value: 0,
@@ -1445,5 +1466,94 @@ mod tests {
 
         // Should have 2 separate bounds
         assert_eq!(bc.lock().len(), 2);
+    }
+
+    // --- S4.5 / S4.6: Ascending slot-order and edge-case tests ---
+
+    #[test]
+    fn test_slot_order_ascending() {
+        let h = TestHarness::new();
+        let mut bm = RoaringBitmap::new();
+        for i in 1..=10u32 {
+            bm.insert(i);
+        }
+        let executor = QueryExecutor::new(&h.slots, &h.filters, &h.sorts, 100);
+
+        // Descending (default): highest IDs first
+        let (desc_ids, _) = executor.slot_order_paginate(&bm, 5, None);
+        assert_eq!(desc_ids, vec![10, 9, 8, 7, 6]);
+
+        // Ascending: lowest IDs first
+        let (asc_ids, _) = executor.slot_order_paginate_dir(&bm, 5, None, true);
+        assert_eq!(asc_ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_slot_order_ascending_cursor() {
+        let h = TestHarness::new();
+        let mut bm = RoaringBitmap::new();
+        for i in 1..=10u32 {
+            bm.insert(i);
+        }
+        let executor = QueryExecutor::new(&h.slots, &h.filters, &h.sorts, 100);
+
+        // Page 1 ascending
+        let (page1, cursor1) = executor.slot_order_paginate_dir(&bm, 3, None, true);
+        assert_eq!(page1, vec![1, 2, 3]);
+        assert!(cursor1.is_some());
+
+        // Page 2 ascending (cursor past slot 3)
+        let (page2, cursor2) = executor.slot_order_paginate_dir(&bm, 3, cursor1.as_ref(), true);
+        assert_eq!(page2, vec![4, 5, 6]);
+        assert!(cursor2.is_some());
+
+        // Page 3 ascending
+        let (page3, cursor3) = executor.slot_order_paginate_dir(&bm, 3, cursor2.as_ref(), true);
+        assert_eq!(page3, vec![7, 8, 9]);
+        assert!(cursor3.is_some());
+
+        // Page 4 ascending (only 1 left)
+        let (page4, _) = executor.slot_order_paginate_dir(&bm, 3, cursor3.as_ref(), true);
+        assert_eq!(page4, vec![10]);
+    }
+
+    #[test]
+    fn test_slot_order_empty_page() {
+        let h = TestHarness::new();
+        let bm = RoaringBitmap::new(); // empty
+        let executor = QueryExecutor::new(&h.slots, &h.filters, &h.sorts, 100);
+
+        let (ids, cursor) = executor.slot_order_paginate(&bm, 10, None);
+        assert!(ids.is_empty());
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn test_slot_order_cursor_beyond_all() {
+        let h = TestHarness::new();
+        let mut bm = RoaringBitmap::new();
+        for i in 1..=5u32 {
+            bm.insert(i);
+        }
+        let executor = QueryExecutor::new(&h.slots, &h.filters, &h.sorts, 100);
+
+        // Descending cursor at slot 1 — nothing below it
+        let cursor = crate::query::CursorPosition { sort_value: 0, slot_id: 1 };
+        let (ids, next) = executor.slot_order_paginate(&bm, 10, Some(&cursor));
+        assert!(ids.is_empty());
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn test_slot_order_single_result() {
+        let h = TestHarness::new();
+        let mut bm = RoaringBitmap::new();
+        bm.insert(42);
+        let executor = QueryExecutor::new(&h.slots, &h.filters, &h.sorts, 100);
+
+        let (ids, cursor) = executor.slot_order_paginate(&bm, 10, None);
+        assert_eq!(ids, vec![42]);
+        assert!(cursor.is_some());
+        assert_eq!(cursor.unwrap().slot_id, 42);
     }
 }

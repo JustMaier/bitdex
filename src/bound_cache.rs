@@ -347,6 +347,44 @@ impl BoundCacheManager {
             .collect()
     }
 
+    /// Find the best matching bound for a query via superset matching (E4/S4.2).
+    ///
+    /// A bound is "matching" if every clause in its filter_key is present in the
+    /// query's filter_key (the bound's filters are a subset of the query's filters).
+    /// Among matching bounds, the one with the most filter clauses (tightest) is preferred,
+    /// as it has the smallest working set.
+    ///
+    /// Returns `None` if no matching bound exists or all matches need rebuild.
+    pub fn find_superset_bound(
+        &mut self,
+        query_key: &CacheKey,
+        sort_field: &str,
+        direction: SortDirection,
+    ) -> Option<&mut BoundEntry> {
+        use std::collections::HashSet;
+        let query_set: HashSet<&crate::cache::CanonicalClause> = query_key.iter().collect();
+
+        let mut best_key: Option<BoundKey> = None;
+        let mut best_clause_count = 0;
+
+        for (key, entry) in &self.bounds {
+            if key.sort_field != sort_field || key.direction != direction {
+                continue;
+            }
+            if entry.needs_rebuild() {
+                continue;
+            }
+            // Check if bound's filter_key is a subset of query's filter_key
+            let is_subset = key.filter_key.iter().all(|c| query_set.contains(c));
+            if is_subset && key.filter_key.len() > best_clause_count {
+                best_clause_count = key.filter_key.len();
+                best_key = Some(key.clone());
+            }
+        }
+
+        best_key.and_then(move |k| self.bounds.get_mut(&k))
+    }
+
     /// Access the meta-index directly (for reporting/testing).
     pub fn meta_index(&self) -> &MetaIndex {
         &self.meta

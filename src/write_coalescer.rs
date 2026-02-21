@@ -40,6 +40,10 @@ pub enum MutationOp {
     AliveInsert { slots: Vec<u32> },
     /// Clear alive bits for slots
     AliveRemove { slots: Vec<u32> },
+    /// Schedule deferred alive activation at a future unix timestamp.
+    /// The slot's filter/sort bitmaps are set immediately, but the alive bit
+    /// is deferred until `activate_at` (seconds since epoch).
+    DeferredAlive { slot: u32, activate_at: u64 },
 }
 
 /// Key for grouping filter operations by target bitmap.
@@ -69,6 +73,7 @@ pub struct WriteBatch {
     sort_clears: HashMap<SortGroupKey, Vec<u32>>,
     alive_inserts: Vec<u32>,
     alive_removes: Vec<u32>,
+    deferred_alive: Vec<(u32, u64)>,
 }
 
 impl WriteBatch {
@@ -81,6 +86,7 @@ impl WriteBatch {
             sort_clears: HashMap::new(),
             alive_inserts: Vec::new(),
             alive_removes: Vec::new(),
+            deferred_alive: Vec::new(),
         }
     }
 
@@ -110,6 +116,7 @@ impl WriteBatch {
         self.sort_clears.clear();
         self.alive_inserts.clear();
         self.alive_removes.clear();
+        self.deferred_alive.clear();
 
         for op in self.ops.drain(..) {
             match op {
@@ -150,6 +157,9 @@ impl WriteBatch {
                 }
                 MutationOp::AliveRemove { slots } => {
                     self.alive_removes.extend(slots);
+                }
+                MutationOp::DeferredAlive { slot, activate_at } => {
+                    self.deferred_alive.push((slot, activate_at));
                 }
             }
         }
@@ -288,6 +298,11 @@ impl WriteBatch {
         // Apply alive removes (writes to diff layer)
         for &slot in &self.alive_removes {
             slots.alive_remove_one(slot);
+        }
+
+        // Schedule deferred alive activations
+        for &(slot, activate_at) in &self.deferred_alive {
+            slots.schedule_alive(slot, activate_at);
         }
 
         // Eager merge: sort diffs MUST be empty before readers see them.

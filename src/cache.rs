@@ -1,3 +1,22 @@
+// Trie Cache — Invalidation Model
+//
+// Bitdex uses a dual-cache architecture with intentionally different invalidation strategies:
+//
+// 1. **Trie cache** (this module): caches exact filter bitmap results keyed by canonical
+//    filter clause combinations. Uses generation-counter lazy invalidation — each filter
+//    field has a monotonic generation that increments on mutation. Cache entries store the
+//    generation at creation time; lookups compare and discard stale entries. This is cheap
+//    (one u64 compare per field) and correct for filter result caching.
+//
+// 2. **Bound cache** (`bound_cache.rs`): caches approximate sort working sets (top-N slot
+//    windows) for filter+sort combinations. Uses live maintenance — the flush thread adds
+//    newly inserted slots that pass the bound's filter predicate, and removes deleted slots.
+//    Bounds that grow too bloated are rebuilt from scratch.
+//
+// These serve different purposes: the trie cache answers "which IDs match these filters?"
+// (exact, invalidated on any filter change), while the bound cache answers "what's the
+// approximate top-N sort window?" (approximate, maintained incrementally from writes).
+
 use std::collections::HashMap;
 use std::time::Instant;
 

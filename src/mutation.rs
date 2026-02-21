@@ -241,8 +241,35 @@ pub fn diff_document(
         }
     }
 
-    // Alive insert (for both fresh insert and upsert -- idempotent)
-    ops.push(MutationOp::AliveInsert { slots: vec![slot] });
+    // Alive insert (for both fresh insert and upsert -- idempotent).
+    // If a field has deferred_alive behavior and its value is in the future,
+    // schedule a deferred activation instead of immediate alive insert.
+    let mut deferred = false;
+    for fc in &config.filter_fields {
+        if let Some(ref behaviors) = fc.behaviors {
+            if behaviors.deferred_alive {
+                if let Some(fv) = new_doc.fields.get(&fc.name) {
+                    if let FieldValue::Single(Value::Integer(ts)) = fv {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if (*ts as u64) > now {
+                            ops.push(MutationOp::DeferredAlive {
+                                slot,
+                                activate_at: *ts as u64,
+                            });
+                            deferred = true;
+                        }
+                    }
+                }
+                break; // Only one field can be deferred_alive
+            }
+        }
+    }
+    if !deferred {
+        ops.push(MutationOp::AliveInsert { slots: vec![slot] });
+    }
 
     ops
 }
