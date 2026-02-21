@@ -9,6 +9,13 @@ use crate::error::{BitdexError, Result};
 /// Table: composite key "field_name:value_u64" -> serialized bitmap bytes
 const TABLE_BITMAPS: TableDefinition<&str, &[u8]> = TableDefinition::new("bitmaps");
 
+/// Table: sort layer key "__sort:field:layer_idx" -> serialized bitmap bytes
+const TABLE_SORT_LAYERS: TableDefinition<&str, &[u8]> = TableDefinition::new("sort_layers");
+
+/// Table: metadata key -> value bytes
+/// Keys: "__alive" -> serialized alive bitmap, "__slot_counter" -> u32 LE bytes
+const TABLE_META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
 /// Persistent storage for filter bitmaps backed by redb.
 ///
 /// Stores serialized RoaringBitmaps keyed by (field_name, value).
@@ -26,8 +33,14 @@ impl BitmapStore {
             .begin_write()
             .map_err(|e| BitdexError::DocStore(e.to_string()))?;
         {
-            let _table = write_txn
+            let _t1 = write_txn
                 .open_table(TABLE_BITMAPS)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let _t2 = write_txn
+                .open_table(TABLE_SORT_LAYERS)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let _t3 = write_txn
+                .open_table(TABLE_META)
                 .map_err(|e| BitdexError::DocStore(e.to_string()))?;
         }
         write_txn
@@ -45,8 +58,14 @@ impl BitmapStore {
             .begin_write()
             .map_err(|e| BitdexError::DocStore(e.to_string()))?;
         {
-            let _table = write_txn
+            let _t1 = write_txn
                 .open_table(TABLE_BITMAPS)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let _t2 = write_txn
+                .open_table(TABLE_SORT_LAYERS)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let _t3 = write_txn
+                .open_table(TABLE_META)
                 .map_err(|e| BitdexError::DocStore(e.to_string()))?;
         }
         write_txn
@@ -216,6 +235,242 @@ impl BitmapStore {
             }
         }
         Ok(result)
+    }
+
+    // ---- Alive bitmap persistence ----
+
+    /// Write the alive bitmap to the meta table.
+    pub fn write_alive(&self, bitmap: &RoaringBitmap) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(TABLE_META)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let mut buf = Vec::with_capacity(bitmap.serialized_size());
+            bitmap
+                .serialize_into(&mut buf)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            table
+                .insert("__alive", buf.as_slice())
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the alive bitmap from the meta table.
+    pub fn load_alive(&self) -> Result<Option<RoaringBitmap>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        let table = read_txn
+            .open_table(TABLE_META)
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        match table.get("__alive") {
+            Ok(Some(data)) => {
+                let bitmap = RoaringBitmap::deserialize_from(data.value())
+                    .map_err(|e| BitdexError::DocStore(format!("alive deserialize: {e}")))?;
+                Ok(Some(bitmap))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(BitdexError::DocStore(e.to_string())),
+        }
+    }
+
+    // ---- Sort layer persistence ----
+
+    /// Write all sort layers for a field in a single transaction.
+    pub fn write_sort_layers(&self, field: &str, layers: &[&RoaringBitmap]) -> Result<()> {
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(TABLE_SORT_LAYERS)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            for (i, bm) in layers.iter().enumerate() {
+                let key = format!("{}:{}", field, i);
+                let mut buf = Vec::with_capacity(bm.serialized_size());
+                bm.serialize_into(&mut buf)
+                    .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+                table
+                    .insert(key.as_str(), buf.as_slice())
+                    .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load sort layers for a field. Returns None if the field has no persisted layers.
+    pub fn load_sort_layers(
+        &self,
+        field: &str,
+        num_layers: usize,
+    ) -> Result<Option<Vec<RoaringBitmap>>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        let table = read_txn
+            .open_table(TABLE_SORT_LAYERS)
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+
+        let mut layers = Vec::with_capacity(num_layers);
+        let mut found_any = false;
+
+        for i in 0..num_layers {
+            let key = format!("{}:{}", field, i);
+            match table.get(key.as_str()) {
+                Ok(Some(data)) => {
+                    found_any = true;
+                    let bitmap = RoaringBitmap::deserialize_from(data.value()).map_err(|e| {
+                        BitdexError::DocStore(format!("sort layer deserialize: {e}"))
+                    })?;
+                    layers.push(bitmap);
+                }
+                Ok(None) => {
+                    layers.push(RoaringBitmap::new());
+                }
+                Err(e) => return Err(BitdexError::DocStore(e.to_string())),
+            }
+        }
+
+        if found_any {
+            Ok(Some(layers))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ---- Slot counter persistence ----
+
+    /// Write the slot counter (high-water mark) to the meta table.
+    pub fn write_slot_counter(&self, counter: u32) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        {
+            let mut table = write_txn
+                .open_table(TABLE_META)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            table
+                .insert("__slot_counter", counter.to_le_bytes().as_slice())
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load the slot counter from the meta table.
+    pub fn load_slot_counter(&self) -> Result<Option<u32>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        let table = read_txn
+            .open_table(TABLE_META)
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        match table.get("__slot_counter") {
+            Ok(Some(data)) => {
+                let bytes = data.value();
+                if bytes.len() >= 4 {
+                    let counter = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    Ok(Some(counter))
+                } else {
+                    Err(BitdexError::DocStore(
+                        "slot counter has invalid length".to_string(),
+                    ))
+                }
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(BitdexError::DocStore(e.to_string())),
+        }
+    }
+
+    // ---- Batch persistence (all state in one transaction) ----
+
+    /// Write all engine state atomically: filter bitmaps, alive, sort layers, slot counter.
+    /// This is used by the merge thread to persist the entire snapshot.
+    pub fn write_full_snapshot(
+        &self,
+        filter_entries: &[(&str, u64, &RoaringBitmap)],
+        alive: &RoaringBitmap,
+        sort_layers: &[(&str, &[&RoaringBitmap])],
+        slot_counter: u32,
+    ) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        {
+            // Filter bitmaps
+            let mut bitmaps_table = write_txn
+                .open_table(TABLE_BITMAPS)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            for &(field, value, bitmap) in filter_entries {
+                let key = Self::make_key(field, value);
+                let mut buf = Vec::with_capacity(bitmap.serialized_size());
+                bitmap
+                    .serialize_into(&mut buf)
+                    .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+                bitmaps_table
+                    .insert(key.as_str(), buf.as_slice())
+                    .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            }
+            drop(bitmaps_table);
+
+            // Sort layers
+            let mut sort_table = write_txn
+                .open_table(TABLE_SORT_LAYERS)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            for &(field, layers) in sort_layers {
+                for (i, bm) in layers.iter().enumerate() {
+                    let key = format!("{}:{}", field, i);
+                    let mut buf = Vec::with_capacity(bm.serialized_size());
+                    bm.serialize_into(&mut buf)
+                        .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+                    sort_table
+                        .insert(key.as_str(), buf.as_slice())
+                        .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+                }
+            }
+            drop(sort_table);
+
+            // Meta: alive + slot counter
+            let mut meta_table = write_txn
+                .open_table(TABLE_META)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let mut alive_buf = Vec::with_capacity(alive.serialized_size());
+            alive
+                .serialize_into(&mut alive_buf)
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            meta_table
+                .insert("__alive", alive_buf.as_slice())
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            meta_table
+                .insert("__slot_counter", slot_counter.to_le_bytes().as_slice())
+                .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| BitdexError::DocStore(e.to_string()))?;
+        Ok(())
     }
 
     /// Count total stored bitmaps (for metrics).
@@ -515,5 +770,153 @@ mod tests {
         // load_single on the deleted key returns empty
         let deleted = store2.load_single("tagIds", 2).unwrap();
         assert!(deleted.is_empty());
+    }
+
+    // ---- S2.1: Alive, sort layer, and slot counter persistence tests ----
+
+    #[test]
+    fn test_alive_round_trip() {
+        let store = BitmapStore::open_temp().unwrap();
+
+        // No alive initially
+        assert!(store.load_alive().unwrap().is_none());
+
+        let alive = make_bitmap(&[1, 2, 5, 100, 9999]);
+        store.write_alive(&alive).unwrap();
+
+        let loaded = store.load_alive().unwrap().unwrap();
+        assert_eq!(alive, loaded);
+    }
+
+    #[test]
+    fn test_alive_overwrite() {
+        let store = BitmapStore::open_temp().unwrap();
+
+        let v1 = make_bitmap(&[1, 2, 3]);
+        store.write_alive(&v1).unwrap();
+
+        let v2 = make_bitmap(&[10, 20, 30]);
+        store.write_alive(&v2).unwrap();
+
+        let loaded = store.load_alive().unwrap().unwrap();
+        assert_eq!(v2, loaded);
+    }
+
+    #[test]
+    fn test_sort_layers_round_trip() {
+        let store = BitmapStore::open_temp().unwrap();
+
+        // No layers initially
+        assert!(store.load_sort_layers("score", 32).unwrap().is_none());
+
+        let l0 = make_bitmap(&[1, 3, 5]);
+        let l1 = make_bitmap(&[2, 4]);
+        let l2 = RoaringBitmap::new();
+        let layers: Vec<&RoaringBitmap> = vec![&l0, &l1, &l2];
+
+        store.write_sort_layers("score", &layers).unwrap();
+
+        let loaded = store.load_sort_layers("score", 3).unwrap().unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0], l0);
+        assert_eq!(loaded[1], l1);
+        assert_eq!(loaded[2], l2);
+    }
+
+    #[test]
+    fn test_sort_layers_multiple_fields() {
+        let store = BitmapStore::open_temp().unwrap();
+
+        let la = make_bitmap(&[1, 2]);
+        let lb = make_bitmap(&[10, 20]);
+
+        store.write_sort_layers("score", &[&la]).unwrap();
+        store.write_sort_layers("date", &[&lb]).unwrap();
+
+        let score = store.load_sort_layers("score", 1).unwrap().unwrap();
+        assert_eq!(score[0], la);
+
+        let date = store.load_sort_layers("date", 1).unwrap().unwrap();
+        assert_eq!(date[0], lb);
+    }
+
+    #[test]
+    fn test_slot_counter_round_trip() {
+        let store = BitmapStore::open_temp().unwrap();
+
+        // No counter initially
+        assert!(store.load_slot_counter().unwrap().is_none());
+
+        store.write_slot_counter(12345).unwrap();
+        assert_eq!(store.load_slot_counter().unwrap().unwrap(), 12345);
+
+        // Overwrite
+        store.write_slot_counter(99999).unwrap();
+        assert_eq!(store.load_slot_counter().unwrap().unwrap(), 99999);
+    }
+
+    #[test]
+    fn test_full_snapshot_atomic() {
+        let store = BitmapStore::open_temp().unwrap();
+
+        let bm1 = make_bitmap(&[1, 2, 3]);
+        let bm2 = make_bitmap(&[4, 5]);
+        let alive = make_bitmap(&[1, 2, 3, 4, 5]);
+        let sl0 = make_bitmap(&[1, 3, 5]);
+        let sl1 = make_bitmap(&[2, 4]);
+        let sort_refs: Vec<&RoaringBitmap> = vec![&sl0, &sl1];
+
+        store
+            .write_full_snapshot(
+                &[("nsfwLevel", 1, &bm1), ("nsfwLevel", 2, &bm2)],
+                &alive,
+                &[("score", &sort_refs)],
+                42,
+            )
+            .unwrap();
+
+        // Verify all data
+        let loaded_alive = store.load_alive().unwrap().unwrap();
+        assert_eq!(loaded_alive, alive);
+
+        let loaded_counter = store.load_slot_counter().unwrap().unwrap();
+        assert_eq!(loaded_counter, 42);
+
+        let loaded_filters = store.load_field("nsfwLevel").unwrap();
+        assert_eq!(loaded_filters[&1], bm1);
+        assert_eq!(loaded_filters[&2], bm2);
+
+        let loaded_sort = store.load_sort_layers("score", 2).unwrap().unwrap();
+        assert_eq!(loaded_sort[0], sl0);
+        assert_eq!(loaded_sort[1], sl1);
+    }
+
+    #[test]
+    fn test_full_snapshot_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bitmaps.redb");
+
+        let bm = make_bitmap(&[1, 2, 3]);
+        let alive = make_bitmap(&[1, 2, 3]);
+        let sl = make_bitmap(&[1, 3]);
+        let sort_refs: Vec<&RoaringBitmap> = vec![&sl];
+
+        {
+            let store = BitmapStore::new(&path).unwrap();
+            store
+                .write_full_snapshot(
+                    &[("field", 10, &bm)],
+                    &alive,
+                    &[("sort", &sort_refs)],
+                    100,
+                )
+                .unwrap();
+        }
+
+        let store2 = BitmapStore::new(&path).unwrap();
+        assert_eq!(store2.load_alive().unwrap().unwrap(), alive);
+        assert_eq!(store2.load_slot_counter().unwrap().unwrap(), 100);
+        assert_eq!(store2.load_field("field").unwrap()[&10], bm);
+        assert_eq!(store2.load_sort_layers("sort", 1).unwrap().unwrap()[0], sl);
     }
 }

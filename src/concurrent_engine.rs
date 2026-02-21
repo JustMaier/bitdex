@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
 use crossbeam_channel::{Receiver, Sender};
+use roaring::RoaringBitmap;
 
 use crate::bitmap_store::BitmapStore;
 use crate::bound_cache::{BoundCacheManager, BoundKey};
@@ -123,6 +124,30 @@ impl ConcurrentEngine {
             }
         }
 
+        // S2.3: Load alive, sort layers, and slot counter from redb on startup
+        let mut slots = crate::slot::SlotAllocator::new();
+        if let Some(ref store) = bitmap_store {
+            let alive = store.load_alive()?;
+            let counter = store.load_slot_counter()?;
+            if let Some(alive_bm) = alive {
+                let counter_val = counter.unwrap_or(0);
+                slots = crate::slot::SlotAllocator::from_state(
+                    counter_val,
+                    alive_bm,
+                    RoaringBitmap::new(),
+                );
+            }
+
+            // Load sort layers
+            for sc in &config.sort_fields {
+                if let Some(layers) = store.load_sort_layers(&sc.name, sc.bits as usize)? {
+                    if let Some(sf) = sorts.get_field_mut(&sc.name) {
+                        sf.load_layers(layers);
+                    }
+                }
+            }
+        }
+
         // Initialize Tier 2 cache if any fields are Cached
         let has_tier2 = config.filter_fields.iter().any(|f| f.storage == StorageMode::Cached);
         let tier2_cache = if has_tier2 {
@@ -139,7 +164,7 @@ impl ConcurrentEngine {
         let loading_mode = Arc::new(AtomicBool::new(false));
 
         let inner_engine = InnerEngine {
-            slots: crate::slot::SlotAllocator::new(),
+            slots,
             filters,
             sorts,
         };
@@ -457,19 +482,84 @@ impl ConcurrentEngine {
 
         let merge_handle = {
             let shutdown = Arc::clone(&shutdown);
+            let merge_inner = Arc::clone(&inner);
             let merge_interval_ms = config.merge_interval_ms;
             let merge_pending = Arc::clone(&pending);
             let merge_bitmap_store = bitmap_store.clone();
             let merge_tier2_cache = tier2_cache.clone();
             let pending_drain_cap = config.storage.pending_drain_cap;
+            let sort_field_configs: Vec<crate::config::SortFieldConfig> =
+                config.sort_fields.clone();
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(sleep_duration);
 
-                    // Drain pending buffer to redb
+                    // S2.2: Snapshot, compact Tier 1 filter diffs, persist to redb
                     if let Some(ref store) = merge_bitmap_store {
+                        // Take a snapshot and compact filter diffs
+                        let snap = merge_inner.load_full();
+                        let mut compacted = (*snap).clone();
+                        for (_name, field) in compacted.filters.fields_mut() {
+                            field.merge_dirty();
+                        }
+
+                        // Collect Tier 1 filter bitmap entries for persistence
+                        let mut filter_entries: Vec<(String, u64, RoaringBitmap)> = Vec::new();
+                        for (name, field) in compacted.filters.fields() {
+                            for (&value, vb) in field.iter_versioned() {
+                                filter_entries.push((
+                                    name.clone(),
+                                    value,
+                                    vb.base().as_ref().clone(),
+                                ));
+                            }
+                        }
+
+                        // Collect sort layer bases
+                        let mut sort_data: Vec<(String, Vec<RoaringBitmap>)> = Vec::new();
+                        for sc in &sort_field_configs {
+                            if let Some(sf) = compacted.sorts.get_field(&sc.name) {
+                                let bases: Vec<RoaringBitmap> = sf
+                                    .layer_bases()
+                                    .iter()
+                                    .map(|b| (*b).clone())
+                                    .collect();
+                                sort_data.push((sc.name.clone(), bases));
+                            }
+                        }
+
+                        // Build references for write_full_snapshot
+                        let filter_refs: Vec<(&str, u64, &RoaringBitmap)> = filter_entries
+                            .iter()
+                            .map(|(f, v, b)| (f.as_str(), *v, b))
+                            .collect();
+                        let alive = compacted.slots.alive_bitmap().clone();
+                        let slot_counter = compacted.slots.slot_counter();
+
+                        // Sort layer refs: owned Vec<&BM> must outlive the slice refs
+                        let sort_owned_refs: Vec<(String, Vec<&RoaringBitmap>)> = sort_data
+                            .iter()
+                            .map(|(name, layers)| {
+                                (name.clone(), layers.iter().collect::<Vec<&RoaringBitmap>>())
+                            })
+                            .collect();
+                        let sort_slice_refs: Vec<(&str, &[&RoaringBitmap])> = sort_owned_refs
+                            .iter()
+                            .map(|(name, refs)| (name.as_str(), refs.as_slice()))
+                            .collect();
+
+                        if let Err(e) = store.write_full_snapshot(
+                            &filter_refs,
+                            &alive,
+                            &sort_slice_refs,
+                            slot_counter,
+                        ) {
+                            eprintln!("merge thread: redb snapshot write failed: {e}");
+                        }
+
+                        // Drain pending buffer to redb (Tier 2)
                         let to_drain = {
                             let mut p = merge_pending.lock();
                             p.drain_heaviest(pending_drain_cap)
@@ -478,20 +568,19 @@ impl ConcurrentEngine {
                         if !to_drain.is_empty() {
                             let mut batch: Vec<(String, u64, roaring::RoaringBitmap)> = Vec::new();
                             for ((field, value), mutations) in &to_drain {
-                                let mut bitmap = store.load_single(field, *value)
+                                let mut bitmap = store
+                                    .load_single(field, *value)
                                     .unwrap_or_default();
                                 mutations.apply_to(&mut bitmap);
                                 batch.push((field.to_string(), *value, bitmap));
                             }
-                            // Write compacted bitmaps back to redb
                             let refs: Vec<(&str, u64, &roaring::RoaringBitmap)> = batch
                                 .iter()
                                 .map(|(f, v, b)| (f.as_str(), *v, b))
                                 .collect();
                             if let Err(e) = store.write_batch(&refs) {
-                                eprintln!("merge thread: redb write failed: {e}");
+                                eprintln!("merge thread: redb Tier 2 write failed: {e}");
                             }
-                            // Update moka cache for entries that are currently loaded
                             if let Some(ref t2c) = merge_tier2_cache {
                                 for (i, ((field, value), _)) in to_drain.iter().enumerate() {
                                     if t2c.contains(field, *value) {

@@ -352,6 +352,28 @@ impl SortField {
         }
     }
 
+    /// Load persisted base bitmaps into the sort layers, replacing existing bases.
+    /// Each layer becomes a clean VersionedBitmap (no diff).
+    pub fn load_layers(&mut self, layers: Vec<RoaringBitmap>) {
+        for (i, bm) in layers.into_iter().enumerate() {
+            if i < self.bit_layers.len() {
+                self.bit_layers[i] = VersionedBitmap::new(bm);
+            }
+        }
+    }
+
+    /// Get base bitmap references for all layers (for persistence).
+    /// Only valid when layers are clean (merged).
+    pub fn layer_bases(&self) -> Vec<&RoaringBitmap> {
+        self.bit_layers
+            .iter()
+            .map(|vb| {
+                debug_assert!(!vb.is_dirty(), "persisting dirty sort layer");
+                vb.base().as_ref()
+            })
+            .collect()
+    }
+
     /// Return the serialized byte size of all bit layer bitmaps.
     pub fn bitmap_bytes(&self) -> usize {
         self.bit_layers.iter().map(|bm| bm.bitmap_bytes()).sum()
