@@ -94,13 +94,47 @@ impl FilterField {
         }
     }
 
-    /// Get the bitmap for a specific value.
-    /// The VersionedBitmap must be merged before calling this.
+    /// Get the base bitmap for a specific value.
+    /// Returns the base only (ignoring any pending diff). Use `get_versioned()`
+    /// for diff-aware reads, or `apply_diff_eq()` for fused reads.
     pub fn get(&self, value: u64) -> Option<&RoaringBitmap> {
+        self.bitmaps.get(&value).map(|vb| vb.base().as_ref())
+    }
+
+    /// Get the raw VersionedBitmap for a specific value, including its diff layer.
+    /// Use this when you need to fuse diffs at read time.
+    pub fn get_versioned(&self, value: u64) -> Option<&VersionedBitmap> {
+        self.bitmaps.get(&value)
+    }
+
+    /// Get the fused bitmap for a single value against a candidate set.
+    /// Applies the diff (sets/clears) to the intersection of base and candidates.
+    /// This is the primary diff-aware read path for Eq/NotEq queries.
+    pub fn apply_diff_eq(&self, value: u64, candidates: &RoaringBitmap) -> Option<RoaringBitmap> {
         self.bitmaps.get(&value).map(|vb| {
-            debug_assert!(!vb.is_dirty(), "filter bitmap must be merged before read");
-            vb.base().as_ref()
+            if vb.is_dirty() {
+                vb.apply_diff(candidates)
+            } else {
+                candidates & vb.base().as_ref()
+            }
         })
+    }
+
+    /// Compute the union of multiple values with diff fusion against candidates.
+    /// For each value, fuses diffs against candidates, then unions results.
+    /// This is the diff-aware read path for In/Or queries.
+    pub fn union_with_diff(&self, values: &[u64], candidates: &RoaringBitmap) -> RoaringBitmap {
+        let mut result = RoaringBitmap::new();
+        for value in values {
+            if let Some(vb) = self.bitmaps.get(value) {
+                if vb.is_dirty() {
+                    result |= vb.apply_diff(candidates);
+                } else {
+                    result |= candidates & vb.base().as_ref();
+                }
+            }
+        }
+        result
     }
 
     /// Get the cardinality (number of set bits) for a specific value.
@@ -139,9 +173,15 @@ impl FilterField {
         Some(result)
     }
 
-    /// Iterate over all (value, bitmap) pairs.
+    /// Iterate over all (value, bitmap) pairs (base only, no diff fusion).
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &RoaringBitmap)> {
         self.bitmaps.iter().map(|(k, vb)| (k, vb.base().as_ref()))
+    }
+
+    /// Iterate over all (value, VersionedBitmap) pairs for diff-aware access.
+    /// Used by range scans that need to fuse diffs.
+    pub fn iter_versioned(&self) -> impl Iterator<Item = (&u64, &VersionedBitmap)> {
+        self.bitmaps.iter()
     }
 
     /// Get the total number of bitmaps.

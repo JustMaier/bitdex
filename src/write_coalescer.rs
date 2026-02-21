@@ -305,14 +305,11 @@ impl WriteBatch {
             }
         }
 
-        // Eager merge: filter diffs must be compacted before readers see them.
-        // Merge only filter fields that were mutated in this batch.
-        let mutated_filter_fields = self.mutated_filter_fields();
-        for field_name in &mutated_filter_fields {
-            if let Some(field) = filters.get_field_mut(field_name) {
-                field.merge_dirty();
-            }
-        }
+        // Filter diffs are NOT merged here — they accumulate in the diff layer
+        // and are fused at read time by the executor (apply_diff). The merge
+        // thread compacts them periodically into bases. This avoids the
+        // Arc::make_mut() clone cascade that caused the write regression.
+        // See: docs/architecture-risk-review.md issue 3/4, P5/P7.
 
         // Merge alive bitmap
         slots.merge_alive();
