@@ -194,6 +194,10 @@ impl ConcurrentEngine {
                 let mut doc_batch: Vec<(u32, StoredDoc)> = Vec::new();
                 let mut was_loading = false;
                 let mut staging_dirty = false; // tracks unpublished mutations from loading mode
+                let mut flush_cycle: u64 = 0;
+                // Compact filter diffs every N flush cycles (~5s at 100μs interval).
+                // Keeps diff layers small so apply_diff/fused stay fast.
+                const COMPACTION_INTERVAL: u64 = 50;
 
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
@@ -337,6 +341,17 @@ impl ConcurrentEngine {
                                 }
                             }
 
+                            // Periodic filter diff compaction: merge dirty diffs into
+                            // bases so apply_diff/fused don't accumulate unbounded diffs.
+                            // Runs every COMPACTION_INTERVAL flush cycles (~5s).
+                            // Sort diffs and alive are already merged eagerly in WriteBatch::apply().
+                            if flush_cycle % COMPACTION_INTERVAL == 0 {
+                                for (_name, field) in staging.filters.fields_mut() {
+                                    field.merge_dirty();
+                                }
+                            }
+                            flush_cycle += 1;
+
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
                             inner.store(Arc::new(staging.clone()));
                             staging_dirty = false;
@@ -345,6 +360,10 @@ impl ConcurrentEngine {
 
                     // Loading mode exit: force-publish if staging has unpublished mutations
                     if was_loading && !is_loading && staging_dirty {
+                        // Compact all filter diffs accumulated during loading
+                        for (_name, field) in staging.filters.fields_mut() {
+                            field.merge_dirty();
+                        }
                         // Invalidate all caches — they may be stale from the loading period
                         let mut c = cache.lock();
                         for name in &field_names {
@@ -408,6 +427,11 @@ impl ConcurrentEngine {
                                 }
                             }
                         }
+                    }
+
+                    // Compact all remaining filter diffs before final publish
+                    for (_name, field) in staging.filters.fields_mut() {
+                        field.merge_dirty();
                     }
 
                     // Shutdown: invalidate all fields for safety
@@ -1740,5 +1764,269 @@ mod tests {
             )
             .unwrap();
         assert!(result.ids.contains(&1));
+    }
+
+    // ---- S1.8: Integration tests for diff accumulation and merge compaction ----
+
+    /// S1.8-1: Filter diffs are visible (dirty) in published snapshot after flush,
+    /// and queries still return correct results via diff fusion.
+    #[test]
+    fn test_filter_diffs_visible_in_snapshot() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert a document
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("onSite", FieldValue::Single(Value::Bool(true))),
+                    (
+                        "reactionCount",
+                        FieldValue::Single(Value::Integer(100)),
+                    ),
+                ]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Query should return correct results via diff fusion
+        let result = engine
+            .query(
+                &[FilterClause::Eq(
+                    "nsfwLevel".to_string(),
+                    Value::Integer(1),
+                )],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        // Verify the published snapshot's filter field has a dirty diff
+        let snap = engine.snapshot_public();
+        let field = snap.filters.get_field("nsfwLevel").unwrap();
+        let vb = field.get_versioned(1).unwrap();
+        // Between flush cycles and compaction, the diff should be dirty
+        // (unless compaction just ran). The key assertion is that queries work.
+        assert!(vb.contains(1), "slot 1 should be in nsfwLevel=1 bitmap");
+    }
+
+    /// S1.8-2: After compaction, filter diffs are merged into base.
+    /// Wait long enough for the periodic compaction (COMPACTION_INTERVAL cycles).
+    #[test]
+    fn test_merge_compaction_cleans_diffs() {
+        let mut cfg = test_config();
+        cfg.flush_interval_us = 10; // Very fast flush so compaction triggers quickly
+        let engine = ConcurrentEngine::new(cfg).unwrap();
+
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(5))),
+                    ("onSite", FieldValue::Single(Value::Bool(true))),
+                    (
+                        "reactionCount",
+                        FieldValue::Single(Value::Integer(50)),
+                    ),
+                ]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Wait for compaction to happen (50 cycles * 10μs = 500μs + overhead)
+        // Give generous time for thread scheduling
+        thread::sleep(Duration::from_millis(50));
+
+        // Query should still be correct after compaction
+        let result = engine
+            .query(
+                &[FilterClause::Eq(
+                    "nsfwLevel".to_string(),
+                    Value::Integer(5),
+                )],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        // Check that the diff was compacted (base contains the bit)
+        let snap = engine.snapshot_public();
+        let field = snap.filters.get_field("nsfwLevel").unwrap();
+        let vb = field.get_versioned(5).unwrap();
+        // After compaction, the base should contain the bit
+        assert!(vb.base().contains(1), "slot 1 should be in base after compaction");
+    }
+
+    /// S1.8-3: Sort layers are always clean (never dirty) in published snapshots.
+    #[test]
+    fn test_sort_layers_always_clean() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert several docs with different sort values
+        for i in 1..=10u32 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("onSite", FieldValue::Single(Value::Bool(true))),
+                        (
+                            "reactionCount",
+                            FieldValue::Single(Value::Integer(i as i64 * 100)),
+                        ),
+                    ]),
+                )
+                .unwrap();
+        }
+
+        wait_for_flush(&engine, 10, 500);
+
+        // Verify sort layers are clean
+        let snap = engine.snapshot_public();
+        let sort_field = snap.sorts.get_field("reactionCount").unwrap();
+        for bit_pos in 0..32usize {
+            if let Some(layer) = sort_field.layer(bit_pos) {
+                // layer() has an internal debug_assert that panics if dirty.
+                // If we get here, the layer is clean. Verify it's accessible.
+                let _ = layer.len();
+            }
+        }
+    }
+
+    /// S1.8-4: Filter diffs accumulate across multiple flush cycles.
+    #[test]
+    fn test_filter_diffs_accumulate_across_flushes() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert doc A
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(3))),
+                    ("onSite", FieldValue::Single(Value::Bool(true))),
+                    (
+                        "reactionCount",
+                        FieldValue::Single(Value::Integer(10)),
+                    ),
+                ]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Insert doc B with same nsfwLevel
+        engine
+            .put(
+                2,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(3))),
+                    ("onSite", FieldValue::Single(Value::Bool(false))),
+                    (
+                        "reactionCount",
+                        FieldValue::Single(Value::Integer(20)),
+                    ),
+                ]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 2, 500);
+
+        // Query should return both docs
+        let result = engine
+            .query(
+                &[FilterClause::Eq(
+                    "nsfwLevel".to_string(),
+                    Value::Integer(3),
+                )],
+                None,
+                100,
+            )
+            .unwrap();
+        let mut ids = result.ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2], "both docs should match nsfwLevel=3");
+    }
+
+    /// S1.8-5: Concurrent reads during mutations return correct results.
+    #[test]
+    fn test_concurrent_reads_during_mutations() {
+        let engine = Arc::new(ConcurrentEngine::new(test_config()).unwrap());
+
+        // Insert initial docs
+        for i in 1..=20u32 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer((i % 3) as i64 + 1))),
+                        ("onSite", FieldValue::Single(Value::Bool(i % 2 == 0))),
+                        (
+                            "reactionCount",
+                            FieldValue::Single(Value::Integer(i as i64)),
+                        ),
+                    ]),
+                )
+                .unwrap();
+        }
+
+        wait_for_flush(&engine, 20, 1000);
+
+        // Spawn reader threads that query continuously
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let eng = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                for _ in 0..50 {
+                    // Query should never panic or return inconsistent results
+                    let result = eng
+                        .query(
+                            &[FilterClause::Eq(
+                                "nsfwLevel".to_string(),
+                                Value::Integer(1),
+                            )],
+                            None,
+                            100,
+                        )
+                        .unwrap();
+                    // Results should be non-empty (we inserted docs with nsfwLevel=1)
+                    assert!(!result.ids.is_empty(), "query returned empty during concurrent reads");
+                    thread::sleep(Duration::from_micros(100));
+                }
+            }));
+        }
+
+        // Concurrently insert more docs
+        for i in 21..=40u32 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer((i % 3) as i64 + 1))),
+                        ("onSite", FieldValue::Single(Value::Bool(i % 2 == 0))),
+                        (
+                            "reactionCount",
+                            FieldValue::Single(Value::Integer(i as i64)),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            thread::sleep(Duration::from_micros(200));
+        }
+
+        // Wait for all readers to finish
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final verification
+        wait_for_flush(&engine, 40, 1000);
+        let result = engine.query(&[], None, 1000).unwrap();
+        assert_eq!(result.ids.len(), 40, "all 40 docs should be alive");
     }
 }

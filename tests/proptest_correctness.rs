@@ -414,3 +414,156 @@ proptest! {
         }
     }
 }
+
+// ===========================================================================
+// S1.7: VersionedBitmap property tests
+// ===========================================================================
+
+use std::sync::Arc;
+use bitdex_v2::versioned_bitmap::VersionedBitmap;
+use roaring::RoaringBitmap;
+
+/// Operation on a VersionedBitmap: insert or remove a bit.
+#[derive(Clone, Debug)]
+enum VbOp {
+    Insert(u32),
+    Remove(u32),
+}
+
+fn arb_vb_ops(max_ops: usize) -> impl Strategy<Value = Vec<VbOp>> {
+    prop::collection::vec(
+        prop::strategy::Union::new(vec![
+            (0..1000u32).prop_map(VbOp::Insert).boxed(),
+            (0..1000u32).prop_map(VbOp::Remove).boxed(),
+        ]),
+        0..max_ops,
+    )
+}
+
+/// Apply ops to a VersionedBitmap and also to a reference HashSet, return both.
+fn apply_ops(base_bits: &[u32], ops: &[VbOp]) -> (VersionedBitmap, HashSet<u32>) {
+    let mut base = RoaringBitmap::new();
+    let mut truth: HashSet<u32> = HashSet::new();
+    for &b in base_bits {
+        base.insert(b);
+        truth.insert(b);
+    }
+    let mut vb = VersionedBitmap::new(base);
+    for op in ops {
+        match op {
+            VbOp::Insert(bit) => {
+                vb.insert(*bit);
+                truth.insert(*bit);
+            }
+            VbOp::Remove(bit) => {
+                vb.remove(*bit);
+                truth.remove(bit);
+            }
+        }
+    }
+    (vb, truth)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// apply_diff(universe) produces the same bitmap as merge() then base().
+    #[test]
+    fn prop_vb_apply_diff_matches_merge(
+        base_bits in prop::collection::vec(0..500u32, 0..50),
+        ops in arb_vb_ops(100),
+    ) {
+        let (vb, _truth) = apply_ops(&base_bits, &ops);
+
+        // Full universe: 0..1000
+        let mut universe = RoaringBitmap::new();
+        for i in 0..1000u32 {
+            universe.insert(i);
+        }
+        let via_apply = vb.apply_diff(&universe);
+
+        let mut merged = vb.clone();
+        merged.merge();
+        let via_merge = merged.base().as_ref().clone();
+
+        prop_assert_eq!(via_apply, via_merge,
+            "apply_diff(universe) != merge+base");
+    }
+
+    /// fused() produces the same result as merge() then base().
+    #[test]
+    fn prop_vb_fused_matches_merge(
+        base_bits in prop::collection::vec(0..500u32, 0..50),
+        ops in arb_vb_ops(100),
+    ) {
+        let (vb, _truth) = apply_ops(&base_bits, &ops);
+
+        let via_fused = vb.fused();
+
+        let mut merged = vb.clone();
+        merged.merge();
+        let via_merge = merged.base().as_ref().clone();
+
+        prop_assert_eq!(via_fused, via_merge,
+            "fused() != merge+base");
+    }
+
+    /// merge() is idempotent: merging twice yields the same result.
+    #[test]
+    fn prop_vb_merge_idempotent(
+        base_bits in prop::collection::vec(0..500u32, 0..50),
+        ops in arb_vb_ops(100),
+    ) {
+        let (vb, _truth) = apply_ops(&base_bits, &ops);
+
+        let mut once = vb.clone();
+        once.merge();
+        let after_once = once.base().as_ref().clone();
+
+        once.merge(); // second merge
+        let after_twice = once.base().as_ref().clone();
+
+        prop_assert_eq!(after_once, after_twice, "merge is not idempotent");
+    }
+
+    /// contains(bit) matches apply_diff({bit}) for every bit in range.
+    #[test]
+    fn prop_vb_contains_matches_apply(
+        base_bits in prop::collection::vec(0..200u32, 0..30),
+        ops in arb_vb_ops(50),
+    ) {
+        let (vb, truth) = apply_ops(&base_bits, &ops);
+
+        for bit in 0..200u32 {
+            let via_contains = vb.contains(bit);
+            let expected = truth.contains(&bit);
+            prop_assert_eq!(via_contains, expected,
+                "contains({}) = {}, expected {}", bit, via_contains, expected);
+        }
+    }
+
+    /// Last-write-wins: for the same bit, the final operation determines state.
+    #[test]
+    fn prop_vb_last_write_wins(
+        base_bits in prop::collection::vec(0..100u32, 0..20),
+        bit in 0..100u32,
+        final_op in any::<bool>(), // true = insert, false = remove
+    ) {
+        let (mut vb, _truth) = apply_ops(&base_bits, &[]);
+
+        // Random sequence of ops on the same bit
+        vb.insert(bit);
+        vb.remove(bit);
+        vb.insert(bit);
+        vb.remove(bit);
+
+        // Final operation
+        if final_op {
+            vb.insert(bit);
+            prop_assert!(vb.contains(bit), "bit should be present after final insert");
+        } else {
+            vb.remove(bit);
+            prop_assert!(!vb.contains(bit), "bit should be absent after final remove");
+        }
+    }
+}
