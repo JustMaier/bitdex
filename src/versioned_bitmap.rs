@@ -135,6 +135,20 @@ impl VersionedBitmap {
         result
     }
 
+    /// Return the fully fused bitmap: base | sets - clears.
+    /// Used when a standalone bitmap is needed (e.g., single-clause evaluation
+    /// where no candidate set is available for apply_diff).
+    /// When the diff is empty, returns a clone of the base (cheap Arc refcount bump).
+    pub fn fused(&self) -> RoaringBitmap {
+        if self.diff.is_empty() {
+            return self.base.as_ref().clone();
+        }
+        let mut result = self.base.as_ref().clone();
+        result |= &self.diff.sets;
+        result -= &self.diff.clears;
+        result
+    }
+
     /// Access the base bitmap directly. Sort layers always use merged bases.
     pub fn base(&self) -> &Arc<RoaringBitmap> {
         &self.base

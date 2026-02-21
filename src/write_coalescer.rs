@@ -675,14 +675,15 @@ mod tests {
         batch.group_and_sort();
         batch.apply(&mut slots, &mut filters, &mut sorts);
 
-        let bm1 = filters.get_field("status").unwrap().get(1).unwrap();
-        assert!(bm1.contains(10));
-        assert!(bm1.contains(20));
-        assert_eq!(bm1.len(), 2);
+        // Filter diffs are NOT merged by apply — use VersionedBitmap::contains() for logical check
+        let field = filters.get_field("status").unwrap();
+        let vb1 = field.get_versioned(1).unwrap();
+        assert!(vb1.is_dirty(), "filter bitmap should have dirty diff after apply");
+        assert!(vb1.contains(10));
+        assert!(vb1.contains(20));
 
-        let bm2 = filters.get_field("status").unwrap().get(2).unwrap();
-        assert!(bm2.contains(30));
-        assert_eq!(bm2.len(), 1);
+        let vb2 = field.get_versioned(2).unwrap();
+        assert!(vb2.contains(30));
     }
 
     #[test]
@@ -691,10 +692,11 @@ mod tests {
         let mut filters = setup_filter_index();
         let mut sorts = setup_sort_index();
 
-        // Pre-populate
+        // Pre-populate and merge so base has {10, 20, 30}
         filters.get_field_mut("status").unwrap().insert(1, 10);
         filters.get_field_mut("status").unwrap().insert(1, 20);
         filters.get_field_mut("status").unwrap().insert(1, 30);
+        filters.get_field_mut("status").unwrap().merge_dirty();
 
         let mut batch = WriteBatch::new();
         batch.ops.push(MutationOp::FilterRemove {
@@ -711,10 +713,12 @@ mod tests {
         batch.group_and_sort();
         batch.apply(&mut slots, &mut filters, &mut sorts);
 
-        let bm = filters.get_field("status").unwrap().get(1).unwrap();
-        assert!(!bm.contains(10));
-        assert!(bm.contains(20));
-        assert!(!bm.contains(30));
+        // Filter diffs not merged — use logical contains() to check state
+        let vb = filters.get_field("status").unwrap().get_versioned(1).unwrap();
+        assert!(vb.is_dirty());
+        assert!(!vb.contains(10));
+        assert!(vb.contains(20));
+        assert!(!vb.contains(30));
     }
 
     #[test]
@@ -821,10 +825,11 @@ mod tests {
         batch.apply(&mut slots, &mut filters, &mut sorts);
 
         assert!(slots.alive_bitmap().contains(100));
+        // Filter diffs not merged — use logical contains()
         assert!(filters
             .get_field("status")
             .unwrap()
-            .get(1)
+            .get_versioned(1)
             .unwrap()
             .contains(100));
         assert_eq!(
@@ -897,10 +902,11 @@ mod tests {
         assert_eq!(count, 3);
         assert!(slots.alive_bitmap().contains(10));
         assert!(slots.alive_bitmap().contains(20));
+        // Filter diffs not merged — use logical contains()
         assert!(filters
             .get_field("status")
             .unwrap()
-            .get(1)
+            .get_versioned(1)
             .unwrap()
             .contains(10));
     }
@@ -1123,10 +1129,11 @@ mod tests {
         coalescer.flush(&mut slots, &mut filters, &mut sorts);
 
         assert!(slots.alive_bitmap().contains(42));
+        // Filter diffs not merged — use logical contains()
         assert!(filters
             .get_field("status")
             .unwrap()
-            .get(1)
+            .get_versioned(1)
             .unwrap()
             .contains(42));
         // 1 + 4 + 32 + 64 = 101
@@ -1163,12 +1170,77 @@ mod tests {
         coalescer.flush(&mut slots, &mut filters, &mut sorts);
 
         assert!(!slots.alive_bitmap().contains(42));
-        // Stale filter/sort bits remain (by design)
+        // Stale filter/sort bits remain (by design) — use logical contains()
         assert!(filters
             .get_field("status")
             .unwrap()
-            .get(1)
+            .get_versioned(1)
             .unwrap()
             .contains(42));
+    }
+
+    // ---- New tests for diff model behavior ----
+
+    #[test]
+    fn test_apply_filter_diffs_not_merged() {
+        let mut slots = SlotAllocator::new();
+        let mut filters = setup_filter_index();
+        let mut sorts = setup_sort_index();
+
+        let mut batch = WriteBatch::new();
+        batch.ops.push(MutationOp::FilterInsert {
+            field: Arc::from("status"),
+            value: 1,
+            slots: vec![10, 20],
+        });
+
+        batch.group_and_sort();
+        batch.apply(&mut slots, &mut filters, &mut sorts);
+
+        // After apply, filter bitmaps should have dirty diffs (NOT merged)
+        let vb = filters.get_field("status").unwrap().get_versioned(1).unwrap();
+        assert!(vb.is_dirty(), "filter diffs should remain dirty after apply");
+        assert!(vb.base().is_empty(), "base should still be empty");
+        assert!(vb.diff().sets.contains(10));
+        assert!(vb.diff().sets.contains(20));
+    }
+
+    #[test]
+    fn test_apply_sort_diffs_merged() {
+        let mut slots = SlotAllocator::new();
+        let mut filters = setup_filter_index();
+        let mut sorts = setup_sort_index();
+
+        let mut batch = WriteBatch::new();
+        batch.ops.push(MutationOp::SortSet {
+            field: Arc::from("reactionCount"),
+            bit_layer: 0,
+            slots: vec![10],
+        });
+
+        batch.group_and_sort();
+        batch.apply(&mut slots, &mut filters, &mut sorts);
+
+        // Sort diffs MUST be merged eagerly (per architecture-risk-review issue 4)
+        // layer() returns the base bitmap — the debug_assert inside layer() verifies
+        // the diff is empty. If sort diffs weren't merged, layer() would panic.
+        let sf = sorts.get_field("reactionCount").unwrap();
+        assert!(sf.layer(0).unwrap().contains(10));
+    }
+
+    #[test]
+    fn test_apply_alive_merged() {
+        let mut slots = SlotAllocator::new();
+        let mut filters = setup_filter_index();
+        let mut sorts = setup_sort_index();
+
+        let mut batch = WriteBatch::new();
+        batch.ops.push(MutationOp::AliveInsert { slots: vec![10] });
+
+        batch.group_and_sort();
+        batch.apply(&mut slots, &mut filters, &mut sorts);
+
+        // Alive bitmap must be merged eagerly
+        assert!(slots.alive_bitmap().contains(10));
     }
 }

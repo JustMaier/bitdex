@@ -416,14 +416,17 @@ impl<'a> QueryExecutor<'a> {
     pub(crate) fn evaluate_clause(&self, clause: &FilterClause) -> Result<RoaringBitmap> {
         match clause {
             FilterClause::Eq(field, value) => {
-                // Try Tier 1 (snapshot FilterIndex) first
+                // Try Tier 1 (snapshot FilterIndex) first — diff-aware read
                 if let Some(filter_field) = self.filters.get_field(field) {
                     let key = value_to_bitmap_key(value)
                         .ok_or_else(|| BitdexError::InvalidValue {
                             field: field.clone(),
                             reason: "cannot convert to bitmap key".to_string(),
                         })?;
-                    return Ok(filter_field.get(key).cloned().unwrap_or_default());
+                    return Ok(filter_field
+                        .get_versioned(key)
+                        .map(|vb| vb.fused())
+                        .unwrap_or_default());
                 }
                 // Fall back to Tier 2 (moka cache + pending + redb)
                 if let Some(tier2) = &self.tier2 {
@@ -443,13 +446,19 @@ impl<'a> QueryExecutor<'a> {
             }
 
             FilterClause::In(field, values) => {
-                // Try Tier 1 first
+                // Try Tier 1 first — diff-aware union
                 if let Some(filter_field) = self.filters.get_field(field) {
                     let keys: Vec<u64> = values
                         .iter()
                         .filter_map(value_to_bitmap_key)
                         .collect();
-                    return Ok(filter_field.union(&keys));
+                    let mut result = RoaringBitmap::new();
+                    for &key in &keys {
+                        if let Some(vb) = filter_field.get_versioned(key) {
+                            result |= vb.fused();
+                        }
+                    }
+                    return Ok(result);
                 }
                 // Fall back to Tier 2
                 if let Some(tier2) = &self.tier2 {
@@ -583,6 +592,7 @@ impl<'a> QueryExecutor<'a> {
     }
 
     /// Evaluate a range filter by scanning the filter field's bitmaps.
+    /// Uses diff-aware iteration to handle dirty VersionedBitmaps.
     fn range_scan<F>(
         &self,
         field: &str,
@@ -603,9 +613,13 @@ impl<'a> QueryExecutor<'a> {
             })?;
 
         let mut result = RoaringBitmap::new();
-        for (&key, bitmap) in filter_field.iter() {
+        for (&key, vb) in filter_field.iter_versioned() {
             if predicate(key, target) {
-                result |= bitmap;
+                if vb.is_dirty() {
+                    result |= vb.fused();
+                } else {
+                    result |= vb.base().as_ref();
+                }
             }
         }
         Ok(result)
