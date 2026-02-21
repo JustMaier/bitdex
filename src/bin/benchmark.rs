@@ -731,6 +731,7 @@ fn main() {
 
             let rss_before = rss_bytes();
             let engine = create_concurrent_engine(civitai_config(), &bench_dir, &format!("insert_{}", batch_size), args.in_memory_docstore);
+            engine.enter_loading_mode();
             let mut insert_time = Duration::ZERO;
             let mut id_counter = 0u32;
 
@@ -742,6 +743,7 @@ fn main() {
                 engine.put(id, &doc).unwrap();
                 insert_time += put_start.elapsed();
             });
+            engine.exit_loading_mode();
             // Wait for flush thread to apply all batched mutations
             wait_for_flush(&engine, batch_size as u64, 30_000);
             let wall_elapsed = wall_start.elapsed();
@@ -805,6 +807,7 @@ fn main() {
         config.flush_interval_us = args.flush_interval_us;
         println!("  Channel capacity: {}, flush interval: {}us", config.channel_capacity, config.flush_interval_us);
         let engine = Arc::new(create_concurrent_engine(config, &bench_dir, "concurrent_insert", args.in_memory_docstore));
+        engine.enter_loading_mode();
 
         // Split records into chunks for each thread
         let chunk_size = (records.len() + args.threads - 1) / args.threads;
@@ -844,7 +847,8 @@ fn main() {
         let wall_elapsed = wall_start.elapsed();
         let total_count = total_inserted.load(Ordering::Relaxed);
 
-        // Wait for all mutations to flush
+        // Exit loading mode and wait for all mutations to flush
+        engine.exit_loading_mode();
         println!("  Waiting for flush thread to catch up...");
         wait_for_flush(&engine, total_count as u64, 30_000);
         let alive = engine.alive_count();
@@ -890,6 +894,7 @@ fn main() {
     // -----------------------------------------------------------------------
     println!("--- Building full engine for update/query benchmarks ---");
     let engine = create_concurrent_engine(civitai_config(), &bench_dir, "full_engine", args.in_memory_docstore);
+    engine.enter_loading_mode();
     let build_start = Instant::now();
     let mut build_counter = 0u32;
     stream_records(&args.data_path, limit, |rec| {
@@ -897,6 +902,7 @@ fn main() {
         let doc = rec.to_document();
         engine.put(id, &doc).unwrap();
     });
+    engine.exit_loading_mode();
     wait_for_flush(&engine, total_records as u64, 60_000);
     let build_elapsed = build_start.elapsed();
     let rss = rss_bytes();

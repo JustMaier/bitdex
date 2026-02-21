@@ -60,6 +60,7 @@ pub struct ConcurrentEngine {
     tier2_cache: Option<Arc<Tier2Cache>>,
     pending: Arc<parking_lot::Mutex<PendingBuffer>>,
     bound_cache: Arc<parking_lot::Mutex<BoundCacheManager>>,
+    loading_mode: Arc<AtomicBool>,
 }
 
 impl ConcurrentEngine {
@@ -135,6 +136,7 @@ impl ConcurrentEngine {
             config.cache.bound_target_size,
             config.cache.bound_max_size,
         )));
+        let loading_mode = Arc::new(AtomicBool::new(false));
 
         let inner_engine = InnerEngine {
             slots: crate::slot::SlotAllocator::new(),
@@ -183,21 +185,26 @@ impl ConcurrentEngine {
             let flush_pending = Arc::clone(&pending);
             let flush_tier2_cache = tier2_cache.clone();
             let flush_bound_cache = Arc::clone(&bound_cache);
+            let flush_loading_mode = Arc::clone(&loading_mode);
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
                 let max_sleep = Duration::from_micros(flush_interval_us * 10);
                 let mut current_sleep = min_sleep;
                 let mut doc_batch: Vec<(u32, StoredDoc)> = Vec::new();
+                let mut was_loading = false;
+                let mut staging_dirty = false; // tracks unpublished mutations from loading mode
 
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
+                    let is_loading = flush_loading_mode.load(Ordering::Relaxed);
 
                     // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
                     let bitmap_count = coalescer.prepare();
 
                     // Phase 2: Apply mutations to staging (private, no lock needed)
                     if bitmap_count > 0 {
+                        staging_dirty = true;
                         // Extract Tier 2 mutations BEFORE apply (apply would silently
                         // ignore them since Tier 2 fields aren't in FilterIndex,
                         // but we need them for PendingBuffer).
@@ -213,41 +220,46 @@ impl ConcurrentEngine {
                             &mut staging.sorts,
                         );
 
-                        // D3/E3: Live maintenance of bound caches on sort field mutations.
-                        // Uses meta-index for O(1) lookup of relevant bounds instead of
-                        // linear scan. For each mutated slot, check if its new sort value
-                        // qualifies for any matching bound. Bits are only added, never
-                        // removed — bloat control (D4) handles cleanup.
-                        {
-                            let sort_mutations = coalescer.mutated_sort_slots();
-                            if !sort_mutations.is_empty() {
-                                let mut bc = flush_bound_cache.lock();
-                                if !bc.is_empty() {
-                                    for (sort_field, slots) in &sort_mutations {
-                                        // E3: Use meta-index to find matching bounds (O(1) vs linear)
-                                        let matching_keys = bc.bounds_for_sort_field(sort_field);
+                        // In loading mode, skip all maintenance and snapshot publishing.
+                        // This avoids the expensive staging.clone() → Arc::make_mut clone
+                        // cascade that dominates write cost at scale.
+                        if !flush_loading_mode.load(Ordering::Relaxed) {
+                            // D3/E3: Live maintenance of bound caches on sort field mutations.
+                            // Uses meta-index for O(1) lookup of relevant bounds instead of
+                            // linear scan. For each mutated slot, check if its new sort value
+                            // qualifies for any matching bound. Bits are only added, never
+                            // removed — bloat control (D4) handles cleanup.
+                            {
+                                let sort_mutations = coalescer.mutated_sort_slots();
+                                if !sort_mutations.is_empty() {
+                                    let mut bc = flush_bound_cache.lock();
+                                    if !bc.is_empty() {
+                                        for (sort_field, slots) in &sort_mutations {
+                                            // E3: Use meta-index to find matching bounds (O(1) vs linear)
+                                            let matching_keys = bc.bounds_for_sort_field(sort_field);
 
-                                        if matching_keys.is_empty() {
-                                            continue;
-                                        }
+                                            if matching_keys.is_empty() {
+                                                continue;
+                                            }
 
-                                        for &slot in slots {
-                                            let value = staging.sorts
-                                                .get_field(sort_field)
-                                                .map(|f| f.reconstruct_value(slot))
-                                                .unwrap_or(0);
+                                            for &slot in slots {
+                                                let value = staging.sorts
+                                                    .get_field(sort_field)
+                                                    .map(|f| f.reconstruct_value(slot))
+                                                    .unwrap_or(0);
 
-                                            for bound_key in &matching_keys {
-                                                if let Some(entry) = bc.get_mut(bound_key) {
-                                                    if entry.needs_rebuild() {
-                                                        continue;
-                                                    }
-                                                    let qualifies = match bound_key.direction {
-                                                        SortDirection::Desc => value > entry.min_tracked_value(),
-                                                        SortDirection::Asc => value < entry.min_tracked_value(),
-                                                    };
-                                                    if qualifies {
-                                                        entry.add_slot(slot);
+                                                for bound_key in &matching_keys {
+                                                    if let Some(entry) = bc.get_mut(bound_key) {
+                                                        if entry.needs_rebuild() {
+                                                            continue;
+                                                        }
+                                                        let qualifies = match bound_key.direction {
+                                                            SortDirection::Desc => value > entry.min_tracked_value(),
+                                                            SortDirection::Asc => value < entry.min_tracked_value(),
+                                                        };
+                                                        if qualifies {
+                                                            entry.add_slot(slot);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -255,80 +267,100 @@ impl ConcurrentEngine {
                                     }
                                 }
                             }
-                        }
 
-                        // Route Tier 2 mutations to PendingBuffer and invalidate moka cache
-                        if !tier2_mutations.is_empty() {
-                            let mut p = flush_pending.lock();
-                            for (field, value, slots, is_set) in &tier2_mutations {
-                                for &slot in slots {
-                                    if *is_set {
-                                        p.add_set(field, *value, slot);
-                                    } else {
-                                        p.add_clear(field, *value, slot);
+                            // Route Tier 2 mutations to PendingBuffer and invalidate moka cache
+                            if !tier2_mutations.is_empty() {
+                                let mut p = flush_pending.lock();
+                                for (field, value, slots, is_set) in &tier2_mutations {
+                                    for &slot in slots {
+                                        if *is_set {
+                                            p.add_set(field, *value, slot);
+                                        } else {
+                                            p.add_clear(field, *value, slot);
+                                        }
+                                    }
+                                }
+                                drop(p);
+                                // Invalidate moka cache entries that were mutated
+                                if let Some(ref t2c) = flush_tier2_cache {
+                                    for (field, value, _, _) in &tier2_mutations {
+                                        t2c.invalidate(field, *value);
                                     }
                                 }
                             }
-                            drop(p);
-                            // Invalidate moka cache entries that were mutated
-                            if let Some(ref t2c) = flush_tier2_cache {
-                                for (field, value, _, _) in &tier2_mutations {
-                                    t2c.invalidate(field, *value);
-                                }
-                            }
-                        }
 
-                        // Targeted cache invalidation: only invalidate fields that actually changed.
-                        // Sort-only flushes (e.g., reactionCount updates) skip invalidation entirely.
-                        if coalescer.has_alive_mutations() {
-                            // Alive changed — invalidate all filter fields because NotEq/Not
-                            // bake alive into cached results.
-                            let mut c = cache.lock();
-                            for name in &field_names {
-                                c.invalidate_field(name);
-                            }
-                            // Also invalidate all Tier 2 cache entries (alive changed)
-                            if let Some(ref t2c) = flush_tier2_cache {
-                                for field_name in &tier2_fields {
-                                    let arc: Arc<str> = Arc::from(field_name.as_str());
-                                    t2c.invalidate_field(&arc);
-                                }
-                            }
-                        } else {
-                            let changed = coalescer.mutated_filter_fields();
-                            if !changed.is_empty() {
+                            // Targeted cache invalidation: only invalidate fields that actually changed.
+                            // Sort-only flushes (e.g., reactionCount updates) skip invalidation entirely.
+                            if coalescer.has_alive_mutations() {
+                                // Alive changed — invalidate all filter fields because NotEq/Not
+                                // bake alive into cached results.
                                 let mut c = cache.lock();
-                                for name in &changed {
+                                for name in &field_names {
                                     c.invalidate_field(name);
                                 }
+                                // Also invalidate all Tier 2 cache entries (alive changed)
+                                if let Some(ref t2c) = flush_tier2_cache {
+                                    for field_name in &tier2_fields {
+                                        let arc: Arc<str> = Arc::from(field_name.as_str());
+                                        t2c.invalidate_field(&arc);
+                                    }
+                                }
+                            } else {
+                                let changed = coalescer.mutated_filter_fields();
+                                if !changed.is_empty() {
+                                    let mut c = cache.lock();
+                                    for name in &changed {
+                                        c.invalidate_field(name);
+                                    }
+                                }
                             }
-                        }
 
-                        // D3: Invalidate bounds whose filter fields changed.
-                        // Alive mutations affect all bounds (alive is implicit in filter results).
-                        {
-                            let changed_filters = coalescer.mutated_filter_fields();
-                            let has_alive = coalescer.has_alive_mutations();
-                            if has_alive || !changed_filters.is_empty() {
-                                let mut bc = flush_bound_cache.lock();
-                                if !bc.is_empty() {
-                                    if has_alive {
-                                        // Alive changed — mark ALL bounds for rebuild
-                                        for (_, entry) in bc.iter_mut() {
-                                            entry.mark_for_rebuild();
-                                        }
-                                    } else {
-                                        for field_name in &changed_filters {
-                                            bc.invalidate_filter_field(field_name);
+                            // D3: Invalidate bounds whose filter fields changed.
+                            // Alive mutations affect all bounds (alive is implicit in filter results).
+                            {
+                                let changed_filters = coalescer.mutated_filter_fields();
+                                let has_alive = coalescer.has_alive_mutations();
+                                if has_alive || !changed_filters.is_empty() {
+                                    let mut bc = flush_bound_cache.lock();
+                                    if !bc.is_empty() {
+                                        if has_alive {
+                                            // Alive changed — mark ALL bounds for rebuild
+                                            for (_, entry) in bc.iter_mut() {
+                                                entry.mark_for_rebuild();
+                                            }
+                                        } else {
+                                            for field_name in &changed_filters {
+                                                bc.invalidate_filter_field(field_name);
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
-                        inner.store(Arc::new(staging.clone()));
+                            // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
+                            inner.store(Arc::new(staging.clone()));
+                            staging_dirty = false;
+                        }
                     }
+
+                    // Loading mode exit: force-publish if staging has unpublished mutations
+                    if was_loading && !is_loading && staging_dirty {
+                        // Invalidate all caches — they may be stale from the loading period
+                        let mut c = cache.lock();
+                        for name in &field_names {
+                            c.invalidate_field(name);
+                        }
+                        drop(c);
+                        if let Some(ref t2c) = flush_tier2_cache {
+                            for field_name in &tier2_fields {
+                                let arc: Arc<str> = Arc::from(field_name.as_str());
+                                t2c.invalidate_field(&arc);
+                            }
+                        }
+                        inner.store(Arc::new(staging.clone()));
+                        staging_dirty = false;
+                    }
+                    was_loading = is_loading;
 
                     // Phase 3: Drain docstore channel and batch write
                     doc_batch.clear();
@@ -469,6 +501,7 @@ impl ConcurrentEngine {
             tier2_cache,
             pending,
             bound_cache,
+            loading_mode,
         })
     }
 
@@ -977,6 +1010,32 @@ impl ConcurrentEngine {
     /// Clear all bound cache entries (for benchmarking cold vs warm).
     pub fn clear_bound_cache(&self) {
         self.bound_cache.lock().clear();
+    }
+
+    /// Enter loading mode: skip snapshot publishing and maintenance during bulk inserts.
+    ///
+    /// In loading mode, the flush thread still applies mutations to the staging engine
+    /// but skips the expensive `staging.clone()` snapshot publish. This eliminates the
+    /// Arc::make_mut clone cascade that dominates write cost at scale (e.g., cloning
+    /// a 104K-entry userId HashMap every 100μs flush cycle).
+    ///
+    /// Queries during loading mode see stale data (the last published snapshot).
+    /// Call `exit_loading_mode()` to publish the final state and resume normal operation.
+    pub fn enter_loading_mode(&self) {
+        self.loading_mode.store(true, Ordering::Release);
+    }
+
+    /// Exit loading mode: publish the current staging state and resume normal operation.
+    ///
+    /// Invalidates all caches (stale from loading) and triggers a snapshot publish
+    /// on the next flush cycle by briefly pausing to let the flush thread catch up.
+    pub fn exit_loading_mode(&self) {
+        self.loading_mode.store(false, Ordering::Release);
+        // Give the flush thread time to see the flag and do a final publish.
+        // The next flush cycle with bitmap_count > 0 will publish normally.
+        // If no mutations are pending, we need to ensure at least one flush
+        // cycle runs — the existing adaptive sleep ensures this happens within
+        // max_sleep (flush_interval * 10).
     }
 
     /// Get a reference to the config.
