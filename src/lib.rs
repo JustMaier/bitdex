@@ -9,6 +9,7 @@ pub mod engine;
 pub mod error;
 pub mod executor;
 pub mod filter;
+pub mod meta_index;
 pub mod mutation;
 pub mod parser;
 pub mod pending_buffer;
