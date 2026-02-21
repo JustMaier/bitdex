@@ -4,6 +4,7 @@ use std::time::Instant;
 use roaring::RoaringBitmap;
 
 use crate::cache::CacheKey;
+use crate::meta_index::{CacheEntryId, MetaIndex};
 use crate::query::SortDirection;
 
 /// Unique key for a bound: the combination of filter definition + sort specification + tier.
@@ -165,12 +166,20 @@ impl BoundEntry {
     }
 }
 
-/// Manages all bound cache entries.
+/// Manages all bound cache entries with meta-index for O(1) write-path lookups.
 ///
-/// Bounds are keyed by (filter_key, sort_field, direction) and are formed
-/// automatically when the executor completes a sort query.
+/// Bounds are keyed by (filter_key, sort_field, direction, tier) and are formed
+/// automatically when the executor completes a sort query. The embedded MetaIndex
+/// maps filter clause components and sort specifications to entry IDs, replacing
+/// linear scans during write-path maintenance.
 pub struct BoundCacheManager {
     bounds: HashMap<BoundKey, BoundEntry>,
+    /// Maps BoundKey → meta-index entry ID for deregistration.
+    key_to_meta_id: HashMap<BoundKey, CacheEntryId>,
+    /// Maps meta-index entry ID → BoundKey for reverse lookup.
+    meta_id_to_key: HashMap<CacheEntryId, BoundKey>,
+    /// Meta-index for O(1) write-path lookups.
+    meta: MetaIndex,
     /// Default target size for new bounds.
     target_size: usize,
     /// Default max size before rebuild.
@@ -181,6 +190,9 @@ impl BoundCacheManager {
     pub fn new(target_size: usize, max_size: usize) -> Self {
         Self {
             bounds: HashMap::new(),
+            key_to_meta_id: HashMap::new(),
+            meta_id_to_key: HashMap::new(),
+            meta: MetaIndex::new(),
             target_size,
             max_size,
         }
@@ -198,7 +210,8 @@ impl BoundCacheManager {
 
     /// Form a new bound from sort results.
     ///
-    /// If a bound already exists for this key, it is replaced.
+    /// If a bound already exists for this key, it is replaced (and re-registered
+    /// with the meta-index).
     pub fn form_bound<F>(
         &mut self,
         key: BoundKey,
@@ -208,8 +221,24 @@ impl BoundCacheManager {
     where
         F: Fn(u32) -> u32,
     {
+        // Deregister old entry if replacing
+        if let Some(old_meta_id) = self.key_to_meta_id.remove(&key) {
+            self.meta.deregister(old_meta_id);
+            self.meta_id_to_key.remove(&old_meta_id);
+        }
+
         let entry = BoundEntry::new(sorted_slots, self.target_size, self.max_size, value_fn);
         self.bounds.insert(key.clone(), entry);
+
+        // Register with meta-index
+        let meta_id = self.meta.register(
+            &key.filter_key,
+            Some(&key.sort_field),
+            Some(key.direction),
+        );
+        self.key_to_meta_id.insert(key.clone(), meta_id);
+        self.meta_id_to_key.insert(meta_id, key.clone());
+
         self.bounds.get(&key).unwrap()
     }
 
@@ -248,26 +277,58 @@ impl BoundCacheManager {
 
         if let Some(ref key) = lru_key {
             self.bounds.remove(key);
+            if let Some(meta_id) = self.key_to_meta_id.remove(key) {
+                self.meta.deregister(meta_id);
+                self.meta_id_to_key.remove(&meta_id);
+            }
         }
         lru_key
     }
 
     /// Remove a specific bound.
     pub fn remove(&mut self, key: &BoundKey) -> Option<BoundEntry> {
+        if let Some(meta_id) = self.key_to_meta_id.remove(key) {
+            self.meta.deregister(meta_id);
+            self.meta_id_to_key.remove(&meta_id);
+        }
         self.bounds.remove(key)
     }
 
     /// Mark all bounds that reference a given filter field for rebuild.
     ///
+    /// Uses the meta-index for O(1) lookup instead of linear scan.
     /// Called when a filter field is invalidated (e.g., by a write that changes
     /// filter values). Any bound whose filter_key mentions the invalidated field
     /// may now be stale and should be rebuilt on next use.
     pub fn invalidate_filter_field(&mut self, field_name: &str) {
-        for (key, entry) in &mut self.bounds {
-            if key.filter_key.iter().any(|c| c.field == field_name) {
-                entry.mark_for_rebuild();
+        if let Some(entry_ids) = self.meta.entries_for_filter_field(field_name) {
+            let ids: Vec<CacheEntryId> = entry_ids.iter().collect();
+            for meta_id in ids {
+                if let Some(key) = self.meta_id_to_key.get(&meta_id) {
+                    if let Some(entry) = self.bounds.get_mut(key) {
+                        entry.mark_for_rebuild();
+                    }
+                }
             }
         }
+    }
+
+    /// Find all bound keys that sort by a given field (any direction).
+    ///
+    /// Uses the meta-index for O(1) lookup. Returns a Vec of (BoundKey, SortDirection)
+    /// pairs for the caller to process. This replaces the linear iter_mut() scan
+    /// in the D3 flush loop.
+    pub fn bounds_for_sort_field(&self, sort_field: &str) -> Vec<BoundKey> {
+        let entry_ids = self.meta.entries_for_sort_field(sort_field);
+        entry_ids
+            .iter()
+            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+            .collect()
+    }
+
+    /// Access the meta-index directly (for reporting/testing).
+    pub fn meta_index(&self) -> &MetaIndex {
+        &self.meta
     }
 
     /// Default target size for new bounds.

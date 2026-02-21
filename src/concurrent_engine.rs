@@ -213,22 +213,19 @@ impl ConcurrentEngine {
                             &mut staging.sorts,
                         );
 
-                        // D3: Live maintenance of bound caches on sort field mutations.
-                        // For each mutated slot, check if its new sort value qualifies for
-                        // any existing bound (exceeds min_tracked_value). Bits are only added,
-                        // never removed — bloat control (D4) handles cleanup.
+                        // D3/E3: Live maintenance of bound caches on sort field mutations.
+                        // Uses meta-index for O(1) lookup of relevant bounds instead of
+                        // linear scan. For each mutated slot, check if its new sort value
+                        // qualifies for any matching bound. Bits are only added, never
+                        // removed — bloat control (D4) handles cleanup.
                         {
                             let sort_mutations = coalescer.mutated_sort_slots();
                             if !sort_mutations.is_empty() {
                                 let mut bc = flush_bound_cache.lock();
                                 if !bc.is_empty() {
                                     for (sort_field, slots) in &sort_mutations {
-                                        // Collect matching bounds for this sort field
-                                        let matching_keys: Vec<BoundKey> = bc
-                                            .iter_mut()
-                                            .filter(|(k, _)| k.sort_field == *sort_field)
-                                            .map(|(k, _)| k.clone())
-                                            .collect();
+                                        // E3: Use meta-index to find matching bounds (O(1) vs linear)
+                                        let matching_keys = bc.bounds_for_sort_field(sort_field);
 
                                         if matching_keys.is_empty() {
                                             continue;
