@@ -157,9 +157,10 @@ impl ConcurrentEngine {
         };
 
         let pending = Arc::new(parking_lot::Mutex::new(PendingBuffer::new()));
-        let bound_cache = Arc::new(parking_lot::Mutex::new(BoundCacheManager::new(
+        let bound_cache = Arc::new(parking_lot::Mutex::new(BoundCacheManager::with_max_count(
             config.cache.bound_target_size,
             config.cache.bound_max_size,
+            config.cache.bound_max_count,
         )));
         let loading_mode = Arc::new(AtomicBool::new(false));
 
@@ -592,6 +593,12 @@ impl ConcurrentEngine {
                                     }
                                 }
                             }
+                        }
+
+                        // S2.6: Log pending buffer depth after drain
+                        let remaining = merge_pending.lock().depth();
+                        if remaining > 0 {
+                            eprintln!("merge thread: pending buffer depth after drain: {remaining}");
                         }
                     }
                 }
@@ -1073,6 +1080,12 @@ impl ConcurrentEngine {
     /// Get the high-water mark slot counter (lock-free snapshot).
     pub fn slot_counter(&self) -> u32 {
         self.snapshot().slots.slot_counter()
+    }
+
+    /// Get the current pending buffer depth (number of pending entries).
+    /// Useful for monitoring backpressure on Tier 2 writes.
+    pub fn pending_depth(&self) -> usize {
+        self.pending.lock().depth()
     }
 
     /// Report bitmap memory usage broken down by component (lock-free snapshot).

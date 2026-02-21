@@ -132,8 +132,19 @@ impl SlotAllocator {
     }
 
     /// Bulk-insert slots into the alive bitmap's diff layer.
+    /// Also updates the high-water mark (next_slot) for persistence.
     pub fn alive_insert_bulk(&mut self, slots: impl IntoIterator<Item = u32>) {
-        self.alive.insert_bulk(slots);
+        let mut max_seen = self.next_slot.load(Ordering::Relaxed);
+        let slots_vec: Vec<u32> = slots.into_iter().collect();
+        for &slot in &slots_vec {
+            if slot >= max_seen {
+                max_seen = slot + 1;
+            }
+        }
+        if max_seen > self.next_slot.load(Ordering::Relaxed) {
+            self.next_slot.store(max_seen, Ordering::Relaxed);
+        }
+        self.alive.insert_bulk(slots_vec);
     }
 
     /// Remove a single slot from the alive bitmap's diff layer.

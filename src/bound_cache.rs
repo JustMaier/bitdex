@@ -184,6 +184,8 @@ pub struct BoundCacheManager {
     target_size: usize,
     /// Default max size before rebuild.
     max_size: usize,
+    /// Maximum number of bound entries before LRU eviction.
+    max_count: usize,
 }
 
 impl BoundCacheManager {
@@ -195,6 +197,20 @@ impl BoundCacheManager {
             meta: MetaIndex::new(),
             target_size,
             max_size,
+            max_count: 100,
+        }
+    }
+
+    /// Create with explicit max_count for LRU eviction.
+    pub fn with_max_count(target_size: usize, max_size: usize, max_count: usize) -> Self {
+        Self {
+            bounds: HashMap::new(),
+            key_to_meta_id: HashMap::new(),
+            meta_id_to_key: HashMap::new(),
+            meta: MetaIndex::new(),
+            target_size,
+            max_size,
+            max_count,
         }
     }
 
@@ -238,6 +254,11 @@ impl BoundCacheManager {
         );
         self.key_to_meta_id.insert(key.clone(), meta_id);
         self.meta_id_to_key.insert(meta_id, key.clone());
+
+        // D6: Auto-evict LRU bounds if over capacity
+        while self.bounds.len() > self.max_count {
+            self.evict_lru();
+        }
 
         self.bounds.get(&key).unwrap()
     }

@@ -245,6 +245,9 @@ pub struct CacheConfig {
     /// When live maintenance grows a bound beyond this, the next query rebuilds it.
     #[serde(default = "default_bound_max_size")]
     pub bound_max_size: usize,
+    /// Maximum number of bound cache entries before LRU eviction.
+    #[serde(default = "default_bound_max_count")]
+    pub bound_max_count: usize,
 }
 
 fn default_cache_max_entries() -> usize {
@@ -259,6 +262,9 @@ fn default_bound_target_size() -> usize {
 fn default_bound_max_size() -> usize {
     20_000
 }
+fn default_bound_max_count() -> usize {
+    100
+}
 
 impl Default for CacheConfig {
     fn default() -> Self {
@@ -267,6 +273,7 @@ impl Default for CacheConfig {
             decay_rate: default_cache_decay_rate(),
             bound_target_size: default_bound_target_size(),
             bound_max_size: default_bound_max_size(),
+            bound_max_count: default_bound_max_count(),
         }
     }
 }
