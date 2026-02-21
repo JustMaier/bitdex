@@ -68,6 +68,21 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 - **Write path**: Writers compute diffs and send `MutationOp`s to a crossbeam channel. Flush thread drains, batches, applies to staging, publishes new snapshot atomically.
 - **In-flight tracking**: Writers mark slot IDs in an atomic in-flight set before mutation, clear after. Readers post-validate overlapping IDs.
 - **Cache**: Separate `Arc<Mutex<TrieCache>>` with brief locks (lookup ~μs, store ~μs). Targeted invalidation: only filter fields that actually changed are invalidated; sort-only flushes skip cache invalidation entirely.
+- **Loading mode**: `enter_loading_mode()` / `exit_loading_mode()` skips snapshot publishing and all maintenance during bulk inserts. Avoids `Arc::make_mut()` deep-cloning FilterField HashMaps every flush cycle. On exit, force-publishes staging and invalidates all caches.
+
+### Bound Cache
+
+- Pre-filters sort candidates with approximate top-K bitmaps (one per sort field + direction)
+- Tiered bounds: tight bound (top 2K) attempted first, loose bound (top 200K) as fallback
+- Negligible memory: 6 bounds = 2.28 KB at 104M records
+- Lazy refresh: updated during flush cycles when sort fields change
+- Sort queries 2-13x faster at 104M scale
+
+### Meta-Index
+
+- Bitmaps indexing bitmaps: tracks which cache IDs contain each (field, value) pair
+- Enables targeted bound cache invalidation without scanning all bounds
+- Negligible memory: 6 entries = 180 B at 104M records
 
 ### Trie Cache
 
@@ -95,13 +110,16 @@ Slot allocation, alive bitmap, filter bitmaps, sort layer bitmaps, mutation API 
 ### Phase 2: Persistence — PARTIAL
 On-disk document store via redb (commit 8e3c54a). Stores documents keyed by slot ID for upsert diffing. WAL, snapshot serialization, and sidecar snapshot builder are NOT yet implemented.
 
-### Phase 3: Performance — COMPLETE (commits 95df2a5 through 763a008)
+### Phase 3: Performance — COMPLETE (commits 95df2a5 through bdccbe2)
 - Cardinality-based query planning (planner.rs)
 - Trie cache with prefix matching and generation-counter invalidation (cache.rs)
 - ArcSwap lock-free snapshot reads with Arc-per-bitmap CoW (concurrent_engine.rs)
 - Write coalescing via crossbeam channels with batched flush loop (write_coalescer.rs)
 - Targeted cache invalidation — sort-only flushes skip invalidation
 - Arc<str> field name interning for zero-copy mutation ops
+- Loading mode for bulk inserts — skips snapshot publishing to avoid clone cascade (6fb2b78)
+- Bound cache with tiered bounds for sort query acceleration (2-13x at 104M)
+- Meta-index for targeted bound cache invalidation
 - Benchmark harness with 20 query types + contention benchmark, memory reporting
 
 ### Phase 4: Operations
@@ -133,9 +151,10 @@ Postgres WAL consumer, backfill pipeline, shadow mode, end-to-end tests. NOT yet
 | 50M | 2.95 GB | 6.09 GB | 13.5ms |
 | 100M | 6.19 GB | 11.66 GB | 18.7ms |
 | 104.6M | 6.49 GB | 12.14 GB | 21.1ms |
+| 104.6M (bound cache) | 6.51 GB | 14.51 GB | 6.08ms |
 
 tagIds dominates filter memory at 79-80% across all scales.
-Full results: `docs/benchmark-report.md`
+Full results: `docs/benchmark-report.md`, `docs/benchmark-comparison-loading-mode.md`
 
 ### Extrapolation to 150M
 
