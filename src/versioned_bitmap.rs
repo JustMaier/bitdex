@@ -205,6 +205,21 @@ impl VersionedBitmap {
         }
     }
 
+    /// OR a bitmap directly into the base, bypassing the diff layer.
+    ///
+    /// Used by put_bulk() during initial data loading where we know:
+    /// 1. All inserts are fresh (no existing bits to clear)
+    /// 2. The staging copy is private (no readers holding refs)
+    /// 3. We want maximum throughput without diff overhead
+    ///
+    /// This is orders of magnitude faster than insert_bulk() for large bitmaps
+    /// because RoaringBitmap's |= operates on compressed containers directly
+    /// instead of per-bit Arc::make_mut + clears.remove + sets.insert.
+    pub fn or_into_base(&mut self, bitmap: &RoaringBitmap) {
+        let base = Arc::make_mut(&mut self.base);
+        *base |= bitmap;
+    }
+
     /// Replace the diff with a new Arc. Used by the flush thread publish pattern
     /// to swap in a fresh diff after snapshotting the current one.
     pub fn swap_diff(&mut self, new_diff: Arc<BitmapDiff>) {

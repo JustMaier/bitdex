@@ -77,6 +77,16 @@ impl FilterField {
             .insert_bulk(slots);
     }
 
+    /// OR a RoaringBitmap directly into the base for the given value.
+    /// Bypasses the diff layer for maximum bulk-load throughput.
+    /// Creates the VersionedBitmap if it doesn't exist.
+    pub fn or_bitmap(&mut self, value: u64, bitmap: &RoaringBitmap) {
+        self.bitmaps
+            .entry(value)
+            .or_insert_with(VersionedBitmap::new_empty)
+            .or_into_base(bitmap);
+    }
+
     /// Bulk-remove multiple slots from the bitmap for the given value.
     pub fn remove_bulk(&mut self, value: u64, slots: &[u32]) {
         if let Some(vb) = self.bitmaps.get_mut(&value) {

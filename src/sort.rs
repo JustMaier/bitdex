@@ -92,6 +92,14 @@ impl SortField {
         }
     }
 
+    /// OR a RoaringBitmap directly into a bit layer's base.
+    /// Bypasses the diff layer for maximum bulk-load throughput.
+    pub fn or_layer(&mut self, bit: usize, bitmap: &RoaringBitmap) {
+        if let Some(layer) = self.bit_layers.get_mut(bit) {
+            layer.or_into_base(bitmap);
+        }
+    }
+
     /// Bulk-clear a bit layer for multiple slots.
     pub fn clear_layer_bulk(&mut self, bit: usize, slots: &[u32]) {
         if let Some(layer) = self.bit_layers.get_mut(bit) {

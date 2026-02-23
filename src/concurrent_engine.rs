@@ -1356,6 +1356,7 @@ impl ConcurrentEngine {
             return Ok(0);
         }
 
+        let t0 = std::time::Instant::now();
         let num_threads = num_threads.max(1).min(docs.len());
 
         // Phase 1: Parallel decompose — each thread gets a slice of docs,
@@ -1374,7 +1375,6 @@ impl ConcurrentEngine {
             sort_maps: HashMap<(String, usize), RoaringBitmap>,
             alive_bitmap: RoaringBitmap,
             max_slot: u32,
-            doc_writes: Vec<(u32, StoredDoc)>,
             count: usize,
         }
 
@@ -1394,7 +1394,6 @@ impl ConcurrentEngine {
                             sort_maps: HashMap::new(),
                             alive_bitmap: RoaringBitmap::new(),
                             max_slot: 0,
-                            doc_writes: Vec::new(),
                             count: 0,
                         });
                     }
@@ -1407,7 +1406,6 @@ impl ConcurrentEngine {
                             HashMap::with_capacity(256);
                         let mut alive_bitmap = RoaringBitmap::new();
                         let mut max_slot: u32 = 0;
-                        let mut doc_writes: Vec<(u32, StoredDoc)> = Vec::with_capacity(slice.len());
 
                         for &(slot, ref doc) in slice {
                             if slot > max_slot {
@@ -1462,13 +1460,6 @@ impl ConcurrentEngine {
                                 }
                             }
 
-                            // Collect doc writes
-                            doc_writes.push((
-                                slot,
-                                StoredDoc {
-                                    fields: doc.fields.clone(),
-                                },
-                            ));
                         }
 
                         ThreadResult {
@@ -1476,7 +1467,6 @@ impl ConcurrentEngine {
                             sort_maps,
                             alive_bitmap,
                             max_slot,
-                            doc_writes,
                             count: slice.len(),
                         }
                     })
@@ -1485,6 +1475,7 @@ impl ConcurrentEngine {
 
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        let t1 = t0.elapsed();
 
         // Phase 2: Merge thread results into combined maps
         let mut merged_filters: HashMap<(String, u64), RoaringBitmap> = HashMap::new();
@@ -1516,37 +1507,31 @@ impl ConcurrentEngine {
             }
         }
 
+        let t2 = t0.elapsed();
+
         // Phase 3: Apply to staging InnerEngine
         // Take the current snapshot and clone it for mutation
         let snap = self.inner.load_full();
         let mut staging = (*snap).clone();
 
-        // Apply filter bitmaps
+        // Apply filter bitmaps — OR directly into base (bypasses diff layer)
         for ((field_name, value), bitmap) in merged_filters {
             if let Some(field) = staging.filters.get_field_mut(&field_name) {
-                // insert_bulk accepts an iterator of u32 — iterate the roaring bitmap
-                field.insert_bulk(value, bitmap.iter());
+                field.or_bitmap(value, &bitmap);
             }
         }
 
-        // Apply sort layer bitmaps
+        // Apply sort layer bitmaps — OR directly into base
         for ((field_name, bit), bitmap) in merged_sorts {
             if let Some(field) = staging.sorts.get_field_mut(&field_name) {
-                field.set_layer_bulk(bit, bitmap.iter());
+                field.or_layer(bit, &bitmap);
             }
         }
 
-        // Apply alive bitmap
-        staging.slots.alive_insert_bulk(merged_alive.iter());
+        // Apply alive bitmap — OR directly into base
+        staging.slots.alive_or_bitmap(&merged_alive);
 
-        // Merge all diffs so bitmaps are clean for readers
-        for (_name, field) in staging.filters.fields_mut() {
-            field.merge_dirty();
-        }
-        for (_name, field) in staging.sorts.fields_mut() {
-            field.merge_dirty();
-        }
-        staging.slots.merge_alive();
+        let t3 = t0.elapsed();
 
         // Phase 4: Publish snapshot atomically
         self.inner.store(Arc::new(staging));
@@ -1566,14 +1551,43 @@ impl ConcurrentEngine {
             }
         }
 
-        // Phase 6: Persist documents to docstore in batches
-        for result in thread_results {
-            if !result.doc_writes.is_empty() {
-                if let Err(e) = self.docstore.put_batch(&result.doc_writes) {
-                    eprintln!("put_bulk: docstore batch write failed: {e}");
+        let t4 = t0.elapsed();
+
+        // Phase 6: Persist documents to docstore on a background thread.
+        // Bitmaps are already published — queries work immediately.
+        // Docstore writes enable future upsert diffs and document serving.
+        {
+            let docstore = Arc::clone(&self.docstore);
+            thread::spawn(move || {
+                // Build StoredDocs from the original docs and write in 5K batches
+                let batch_size = 5_000;
+                let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
+                for (slot, doc) in docs {
+                    batch.push((slot, StoredDoc { fields: doc.fields }));
+                    if batch.len() >= batch_size {
+                        if let Err(e) = docstore.put_batch(&batch) {
+                            eprintln!("put_bulk: docstore batch write failed: {e}");
+                        }
+                        batch.clear();
+                    }
                 }
-            }
+                if !batch.is_empty() {
+                    if let Err(e) = docstore.put_batch(&batch) {
+                        eprintln!("put_bulk: docstore batch write failed: {e}");
+                    }
+                }
+            });
         }
+
+        let t5 = t0.elapsed();
+
+        eprintln!("put_bulk phases: decompose={:.2}s merge={:.2}s apply={:.2}s publish={:.2}s docstore={:.2}s total={:.2}s",
+            t1.as_secs_f64(),
+            (t2 - t1).as_secs_f64(),
+            (t3 - t2).as_secs_f64(),
+            (t4 - t3).as_secs_f64(),
+            (t5 - t4).as_secs_f64(),
+            t5.as_secs_f64());
 
         Ok(total_count)
     }

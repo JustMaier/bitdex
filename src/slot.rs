@@ -147,6 +147,19 @@ impl SlotAllocator {
         self.alive.insert_bulk(slots_vec);
     }
 
+    /// OR a RoaringBitmap directly into the alive bitmap's base.
+    /// Bypasses the diff layer for maximum bulk-load throughput.
+    /// Also updates the high-water mark (next_slot).
+    pub fn alive_or_bitmap(&mut self, bitmap: &RoaringBitmap) {
+        if let Some(max_slot) = bitmap.max() {
+            let current = self.next_slot.load(Ordering::Relaxed);
+            if max_slot + 1 > current {
+                self.next_slot.store(max_slot + 1, Ordering::Relaxed);
+            }
+        }
+        self.alive.or_into_base(bitmap);
+    }
+
     /// Remove a single slot from the alive bitmap's diff layer.
     pub fn alive_remove_one(&mut self, slot: u32) {
         self.alive.remove(slot);
