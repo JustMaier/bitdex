@@ -1412,7 +1412,9 @@ impl ConcurrentEngine {
         }
     }
 
-    fn spawn_docstore_writer(&self, docs: Vec<(u32, Document)>) -> JoinHandle<()> {
+    /// Persist documents to the docstore on a background thread.
+    /// Returns a JoinHandle to wait for completion. The docs Vec is consumed.
+    pub fn spawn_docstore_writer(&self, docs: Vec<(u32, Document)>) -> JoinHandle<()> {
         let docstore = Arc::clone(&self.docstore);
         thread::spawn(move || {
             let batch_size = 5_000;
@@ -2644,5 +2646,119 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.ids, vec![10, 30, 20]); // 500, 300, 100
+    }
+
+    #[test]
+    fn test_put_bulk_persists_to_docstore() {
+        // Verify that put_bulk() persists docs so subsequent put() upserts can diff correctly.
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        let docs: Vec<(u32, Document)> = vec![
+            (1, make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                ("reactionCount", FieldValue::Single(Value::Integer(100))),
+            ])),
+            (2, make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
+                ("reactionCount", FieldValue::Single(Value::Integer(200))),
+            ])),
+        ];
+
+        let (count, ds_handle) = engine.put_bulk(docs, 2).unwrap();
+        ds_handle.join().unwrap(); // Wait for docstore persistence
+        assert_eq!(count, 2);
+
+        // put_bulk publishes directly — bitmaps visible immediately
+        assert_eq!(engine.alive_count(), 2);
+
+        // Verify initial state: nsfwLevel=1 should match slot 1
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        // Now upsert slot 1 with changed nsfwLevel (1 → 3).
+        // This requires docstore to have the old doc so it can clear the nsfwLevel=1 bitmap bit.
+        let updated = make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(3))),
+            ("reactionCount", FieldValue::Single(Value::Integer(100))),
+        ]);
+        engine.put(1, &updated).unwrap();
+        wait_for_flush(&engine, 2, 5_000);
+
+        // nsfwLevel=1 should now be EMPTY (slot 1 moved to nsfwLevel=3)
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.total_matched, 0, "Stale nsfwLevel=1 bit not cleared — docstore persistence failed");
+
+        // nsfwLevel=3 should match slot 1
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(3))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.ids, vec![1]);
+    }
+
+    #[test]
+    fn test_put_bulk_loading_then_persist() {
+        // Verify that put_bulk_loading + manual docstore persistence works correctly.
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        let docs: Vec<(u32, Document)> = vec![
+            (1, make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                ("reactionCount", FieldValue::Single(Value::Integer(100))),
+            ])),
+            (2, make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
+                ("reactionCount", FieldValue::Single(Value::Integer(200))),
+            ])),
+        ];
+
+        // Use loading mode
+        let mut staging = engine.clone_staging();
+        let count = engine.put_bulk_loading(&mut staging, &docs, 2);
+        assert_eq!(count, 2);
+
+        // Persist docs separately
+        let ds_handle = engine.spawn_docstore_writer(docs);
+        ds_handle.join().unwrap();
+
+        // Publish staging
+        engine.publish_staging(staging);
+
+        // Bitmaps visible immediately after publish
+        assert_eq!(engine.alive_count(), 2);
+
+        // Verify initial state
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        // Upsert slot 1 with changed nsfwLevel
+        let updated = make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(3))),
+            ("reactionCount", FieldValue::Single(Value::Integer(100))),
+        ]);
+        engine.put(1, &updated).unwrap();
+        wait_for_flush(&engine, 2, 5_000);
+
+        // Verify diff worked correctly
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.total_matched, 0, "Stale nsfwLevel=1 bit not cleared — docstore persistence failed");
+
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(3))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.ids, vec![1]);
     }
 }
