@@ -1351,35 +1351,105 @@ impl ConcurrentEngine {
     ///
     /// Documents are persisted to the docstore after bitmap updates.
     /// Returns the number of documents successfully inserted.
-    pub fn put_bulk(&self, docs: Vec<(u32, Document)>, num_threads: usize) -> Result<usize> {
+    /// Bulk-insert documents into the engine with parallel decomposition.
+    ///
+    /// Returns `(count, docstore_handle)` where the handle can be joined to wait
+    /// for background docstore persistence. Bitmaps are published immediately.
+    pub fn put_bulk(&self, docs: Vec<(u32, Document)>, num_threads: usize) -> Result<(usize, JoinHandle<()>)> {
         if docs.is_empty() {
-            return Ok(0);
+            let handle = thread::spawn(|| {});
+            return Ok((0, handle));
         }
 
+        // Clone snapshot and apply
+        let snap = self.inner.load_full();
+        let mut staging = (*snap).clone();
+        let count = Self::put_bulk_into(&self.config, &mut staging, &docs, num_threads);
+
+        // Publish
+        self.inner.store(Arc::new(staging));
+        self.invalidate_all_caches();
+
+        // Background docstore persistence
+        let docstore_handle = self.spawn_docstore_writer(docs);
+
+        Ok((count, docstore_handle))
+    }
+
+    /// Bulk-insert directly into a mutable InnerEngine without cloning or publishing.
+    ///
+    /// This is the "loading mode" variant — avoids the Arc::make_mut deep-clone cascade
+    /// that happens when the published snapshot shares Arc references with the staging copy.
+    /// Use this when loading many chunks sequentially: build up the InnerEngine, then publish once.
+    pub fn put_bulk_loading(&self, staging: &mut InnerEngine, docs: &[(u32, Document)], num_threads: usize) -> usize {
+        Self::put_bulk_into(&self.config, staging, docs, num_threads)
+    }
+
+    /// Publish a staging InnerEngine as the current snapshot and invalidate all caches.
+    pub fn publish_staging(&self, staging: InnerEngine) {
+        self.inner.store(Arc::new(staging));
+        self.invalidate_all_caches();
+    }
+
+    /// Take a clone of the current snapshot for mutation.
+    pub fn clone_staging(&self) -> InnerEngine {
+        let snap = self.inner.load_full();
+        (*snap).clone()
+    }
+
+    fn invalidate_all_caches(&self) {
+        {
+            let mut c = self.cache.lock();
+            for fc in &self.config.filter_fields {
+                c.invalidate_field(&fc.name);
+            }
+        }
+        {
+            let mut bc = self.bound_cache.lock();
+            for (_, entry) in bc.iter_mut() {
+                entry.mark_for_rebuild();
+            }
+        }
+    }
+
+    fn spawn_docstore_writer(&self, docs: Vec<(u32, Document)>) -> JoinHandle<()> {
+        let docstore = Arc::clone(&self.docstore);
+        thread::spawn(move || {
+            let batch_size = 5_000;
+            let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
+            for (slot, doc) in docs {
+                batch.push((slot, StoredDoc { fields: doc.fields }));
+                if batch.len() >= batch_size {
+                    if let Err(e) = docstore.put_batch(&batch) {
+                        eprintln!("put_bulk: docstore batch write failed: {e}");
+                    }
+                    batch.clear();
+                }
+            }
+            if !batch.is_empty() {
+                if let Err(e) = docstore.put_batch(&batch) {
+                    eprintln!("put_bulk: docstore batch write failed: {e}");
+                }
+            }
+        })
+    }
+
+    /// Core decompose + merge + apply logic, shared by put_bulk() and put_bulk_loading().
+    fn put_bulk_into(config: &Config, staging: &mut InnerEngine, docs: &[(u32, Document)], num_threads: usize) -> usize {
         let t0 = std::time::Instant::now();
         let num_threads = num_threads.max(1).min(docs.len());
 
-        // Phase 1: Parallel decompose — each thread gets a slice of docs,
-        // builds thread-local HashMaps of (field_name, value) → RoaringBitmap
-        // for filters, and (field_name, bit_layer) → RoaringBitmap for sort layers.
-        //
-        // We use String keys here since we need to map back to FilterField/SortField
-        // by name. The HashMap overhead is dwarfed by JSON parse in real usage.
-
-        // Collect field configs for workers
-        let filter_configs: Vec<_> = self.config.filter_fields.clone();
-        let sort_configs: Vec<_> = self.config.sort_fields.clone();
+        let filter_configs: Vec<_> = config.filter_fields.clone();
+        let sort_configs: Vec<_> = config.sort_fields.clone();
 
         struct ThreadResult {
             filter_maps: HashMap<(String, u64), RoaringBitmap>,
             sort_maps: HashMap<(String, usize), RoaringBitmap>,
             alive_bitmap: RoaringBitmap,
-            max_slot: u32,
             count: usize,
         }
 
         let chunk_size = (docs.len() + num_threads - 1) / num_threads;
-        let docs_ref = &docs;
         let filter_configs_ref = &filter_configs;
         let sort_configs_ref = &sort_configs;
 
@@ -1387,33 +1457,27 @@ impl ConcurrentEngine {
             let handles: Vec<_> = (0..num_threads)
                 .map(|t| {
                     let start = t * chunk_size;
-                    let end = (start + chunk_size).min(docs_ref.len());
+                    let end = (start + chunk_size).min(docs.len());
                     if start >= end {
                         return s.spawn(move || ThreadResult {
                             filter_maps: HashMap::new(),
                             sort_maps: HashMap::new(),
                             alive_bitmap: RoaringBitmap::new(),
-                            max_slot: 0,
                             count: 0,
                         });
                     }
 
                     s.spawn(move || {
-                        let slice = &docs_ref[start..end];
+                        let slice = &docs[start..end];
                         let mut filter_maps: HashMap<(String, u64), RoaringBitmap> =
                             HashMap::with_capacity(65_000);
                         let mut sort_maps: HashMap<(String, usize), RoaringBitmap> =
                             HashMap::with_capacity(256);
                         let mut alive_bitmap = RoaringBitmap::new();
-                        let mut max_slot: u32 = 0;
 
                         for &(slot, ref doc) in slice {
-                            if slot > max_slot {
-                                max_slot = slot;
-                            }
                             alive_bitmap.insert(slot);
 
-                            // Decompose filter fields
                             for fc in filter_configs_ref {
                                 if let Some(fv) = doc.fields.get(&fc.name) {
                                     match fv {
@@ -1439,7 +1503,6 @@ impl ConcurrentEngine {
                                 }
                             }
 
-                            // Decompose sort fields into bit layers
                             for sc in sort_configs_ref {
                                 if let Some(fv) = doc.fields.get(&sc.name) {
                                     if let crate::mutation::FieldValue::Single(
@@ -1459,14 +1522,12 @@ impl ConcurrentEngine {
                                     }
                                 }
                             }
-
                         }
 
                         ThreadResult {
                             filter_maps,
                             sort_maps,
                             alive_bitmap,
-                            max_slot,
                             count: slice.len(),
                         }
                     })
@@ -1477,18 +1538,14 @@ impl ConcurrentEngine {
         });
         let t1 = t0.elapsed();
 
-        // Phase 2: Merge thread results into combined maps
+        // Phase 2: Merge thread results
         let mut merged_filters: HashMap<(String, u64), RoaringBitmap> = HashMap::new();
         let mut merged_sorts: HashMap<(String, usize), RoaringBitmap> = HashMap::new();
         let mut merged_alive = RoaringBitmap::new();
-        let mut global_max_slot: u32 = 0;
         let mut total_count: usize = 0;
 
         for result in &thread_results {
             total_count += result.count;
-            if result.max_slot > global_max_slot {
-                global_max_slot = result.max_slot;
-            }
             merged_alive |= &result.alive_bitmap;
         }
 
@@ -1506,90 +1563,33 @@ impl ConcurrentEngine {
                     .or_insert_with(|| bm.clone());
             }
         }
+        // Drop thread results to free memory before apply phase
+        drop(thread_results);
 
         let t2 = t0.elapsed();
 
-        // Phase 3: Apply to staging InnerEngine
-        // Take the current snapshot and clone it for mutation
-        let snap = self.inner.load_full();
-        let mut staging = (*snap).clone();
-
-        // Apply filter bitmaps — OR directly into base (bypasses diff layer)
+        // Phase 3: Apply to staging — OR directly into base (bypasses diff layer)
         for ((field_name, value), bitmap) in merged_filters {
             if let Some(field) = staging.filters.get_field_mut(&field_name) {
                 field.or_bitmap(value, &bitmap);
             }
         }
-
-        // Apply sort layer bitmaps — OR directly into base
         for ((field_name, bit), bitmap) in merged_sorts {
             if let Some(field) = staging.sorts.get_field_mut(&field_name) {
                 field.or_layer(bit, &bitmap);
             }
         }
-
-        // Apply alive bitmap — OR directly into base
         staging.slots.alive_or_bitmap(&merged_alive);
 
         let t3 = t0.elapsed();
 
-        // Phase 4: Publish snapshot atomically
-        self.inner.store(Arc::new(staging));
-
-        // Phase 5: Invalidate all caches (bulk load changes everything)
-        {
-            let mut c = self.cache.lock();
-            for fc in &self.config.filter_fields {
-                c.invalidate_field(&fc.name);
-            }
-        }
-        // Invalidate bound cache
-        {
-            let mut bc = self.bound_cache.lock();
-            for (_, entry) in bc.iter_mut() {
-                entry.mark_for_rebuild();
-            }
-        }
-
-        let t4 = t0.elapsed();
-
-        // Phase 6: Persist documents to docstore on a background thread.
-        // Bitmaps are already published — queries work immediately.
-        // Docstore writes enable future upsert diffs and document serving.
-        {
-            let docstore = Arc::clone(&self.docstore);
-            thread::spawn(move || {
-                // Build StoredDocs from the original docs and write in 5K batches
-                let batch_size = 5_000;
-                let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
-                for (slot, doc) in docs {
-                    batch.push((slot, StoredDoc { fields: doc.fields }));
-                    if batch.len() >= batch_size {
-                        if let Err(e) = docstore.put_batch(&batch) {
-                            eprintln!("put_bulk: docstore batch write failed: {e}");
-                        }
-                        batch.clear();
-                    }
-                }
-                if !batch.is_empty() {
-                    if let Err(e) = docstore.put_batch(&batch) {
-                        eprintln!("put_bulk: docstore batch write failed: {e}");
-                    }
-                }
-            });
-        }
-
-        let t5 = t0.elapsed();
-
-        eprintln!("put_bulk phases: decompose={:.2}s merge={:.2}s apply={:.2}s publish={:.2}s docstore={:.2}s total={:.2}s",
+        eprintln!("put_bulk phases: decompose={:.2}s merge={:.2}s apply={:.2}s total={:.2}s",
             t1.as_secs_f64(),
             (t2 - t1).as_secs_f64(),
             (t3 - t2).as_secs_f64(),
-            (t4 - t3).as_secs_f64(),
-            (t5 - t4).as_secs_f64(),
-            t5.as_secs_f64());
+            t3.as_secs_f64());
 
-        Ok(total_count)
+        total_count
     }
 
     /// Shutdown the flush and merge threads gracefully.
@@ -2486,7 +2486,8 @@ mod tests {
             })
             .collect();
 
-        let count = engine.put_bulk(docs, 4).unwrap();
+        let (count, ds_handle) = engine.put_bulk(docs, 4).unwrap();
+        ds_handle.join().unwrap();
         assert_eq!(count, 100);
         assert_eq!(engine.alive_count(), 100);
 
@@ -2550,7 +2551,8 @@ mod tests {
             ),
         ];
 
-        engine.put_bulk(docs, 2).unwrap();
+        let (_, ds_handle) = engine.put_bulk(docs, 2).unwrap();
+        ds_handle.join().unwrap();
 
         let result = engine
             .query(
@@ -2590,7 +2592,8 @@ mod tests {
             })
             .collect();
 
-        let count = engine.put_bulk(docs, 1).unwrap();
+        let (count, ds_handle) = engine.put_bulk(docs, 1).unwrap();
+        ds_handle.join().unwrap();
         assert_eq!(count, 10);
         assert_eq!(engine.alive_count(), 10);
     }
@@ -2623,7 +2626,8 @@ mod tests {
             ),
         ];
 
-        engine.put_bulk(docs, 2).unwrap();
+        let (_, ds_handle) = engine.put_bulk(docs, 2).unwrap();
+        ds_handle.join().unwrap();
 
         let sort = SortClause {
             field: "reactionCount".to_string(),

@@ -894,24 +894,83 @@ fn main() {
     if should_run(&args.stages, "bulk") {
         println!("--- Phase 2c: Bulk Insert Benchmark (put_bulk, {} threads) ---", args.threads);
 
-        let load_start = Instant::now();
-        let records = load_records(&args.data_path, total_records, args.remap_ids);
-        let load_elapsed = load_start.elapsed();
-        println!("  Loaded {} records into memory in {:.2}s", records.len(), load_elapsed.as_secs_f64());
+        // Process in chunks to avoid OOM at large scales.
+        // Each chunk loads N records, calls put_bulk(), then frees the chunk.
+        let chunk_size = 5_000_000.min(total_records);
 
         let rss_before = rss_bytes();
         let engine = create_concurrent_engine(civitai_config(), &bench_dir, "bulk_insert", args.in_memory_docstore);
 
         let wall_start = Instant::now();
-        let count = engine.put_bulk(records, args.threads).unwrap();
+        let mut total_inserted: usize = 0;
+        let mut chunks_processed: usize = 0;
+        let mut id_counter: u32 = 0;
+
+        // Use loading mode: accumulate into a private staging InnerEngine
+        // without publishing intermediate snapshots. This avoids the
+        // Arc::make_mut deep-clone cascade that happens when the published
+        // snapshot shares Arc references with the staging copy.
+        let mut staging = engine.clone_staging();
+
+        // Stream records in chunks
+        let file = File::open(&args.data_path).expect("Failed to open data file");
+        let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        let mut chunk: Vec<(u32, bitdex_v2::mutation::Document)> = Vec::with_capacity(chunk_size);
+
+        for line_result in reader.lines() {
+            if total_inserted + chunk.len() >= total_records { break; }
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.is_empty() { continue; }
+            match serde_json::from_str::<NdjsonRecord>(&line) {
+                Ok(rec) => {
+                    let id = if args.remap_ids { let v = id_counter; id_counter += 1; v } else { rec.id as u32 };
+                    chunk.push((id, rec.to_document()));
+                    if chunk.len() >= chunk_size {
+                        let chunk_start = Instant::now();
+                        let count = engine.put_bulk_loading(&mut staging, &chunk, args.threads);
+                        let chunk_elapsed = chunk_start.elapsed();
+                        total_inserted += count;
+                        chunks_processed += 1;
+                        let rate = count as f64 / chunk_elapsed.as_secs_f64();
+                        let alive = staging.slots.alive_count();
+                        println!("  chunk {}: {} records in {:.2}s ({:.0}/s)  alive: {}",
+                            chunks_processed, count, chunk_elapsed.as_secs_f64(), rate, alive);
+                        chunk = Vec::with_capacity(chunk_size);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        // Process remaining records
+        if !chunk.is_empty() {
+            let chunk_start = Instant::now();
+            let count = engine.put_bulk_loading(&mut staging, &chunk, args.threads);
+            let chunk_elapsed = chunk_start.elapsed();
+            total_inserted += count;
+            chunks_processed += 1;
+            let rate = count as f64 / chunk_elapsed.as_secs_f64();
+            let alive = staging.slots.alive_count();
+            println!("  chunk {}: {} records in {:.2}s ({:.0}/s)  alive: {}",
+                chunks_processed, count, chunk_elapsed.as_secs_f64(), rate, alive);
+        }
+
+        // Publish the fully-built staging as the live snapshot
+        let publish_start = Instant::now();
+        engine.publish_staging(staging);
+        let publish_elapsed = publish_start.elapsed();
+        println!("  publish: {:.2}s  alive: {}", publish_elapsed.as_secs_f64(), engine.alive_count());
+
         let wall_elapsed = wall_start.elapsed();
         let rss_after = rss_bytes();
         let rss_delta = rss_after.saturating_sub(rss_before);
 
-        let bulk_rate = count as f64 / wall_elapsed.as_secs_f64();
+        let bulk_rate = total_inserted as f64 / wall_elapsed.as_secs_f64();
 
-        println!("  [{:>12}] put_bulk: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
-            format!("{}", count),
+        println!("  [{:>12}] put_bulk total: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
+            format!("{}", total_inserted),
             wall_elapsed.as_secs_f64(),
             bulk_rate,
             format_bytes(rss_after),
@@ -923,8 +982,8 @@ fn main() {
         print_bitmap_memory(&engine);
 
         report.insert_benchmarks.push(InsertBenchmark {
-            batch_label: format!("bulk_{}", count),
-            record_count: count,
+            batch_label: format!("bulk_{}", total_inserted),
+            record_count: total_inserted,
             insert_ms: wall_elapsed.as_secs_f64() * 1000.0,
             wall_ms: wall_elapsed.as_secs_f64() * 1000.0,
             insert_rate_per_sec: bulk_rate,
@@ -934,7 +993,7 @@ fn main() {
         });
 
         report.memory_snapshots.push(MemorySnapshot {
-            stage: format!("bulk_insert_{}", count),
+            stage: format!("bulk_insert_{}", total_inserted),
             rss_bytes: rss_after,
             rss_human: format_bytes(rss_after),
             alive_count: engine.alive_count(),
