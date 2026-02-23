@@ -414,7 +414,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 }
 
 /// Convert a Value to a u64 bitmap key for filter indexing.
-fn value_to_bitmap_key(val: &Value) -> Option<u64> {
+pub fn value_to_bitmap_key(val: &Value) -> Option<u64> {
     match val {
         Value::Bool(b) => Some(if *b { 1 } else { 0 }),
         Value::Integer(v) => Some(*v as u64),

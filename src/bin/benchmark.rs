@@ -889,6 +889,60 @@ fn main() {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 2c: Bulk insert benchmark (put_bulk — parallel decompose + direct bitmap build)
+    // -----------------------------------------------------------------------
+    if should_run(&args.stages, "bulk") {
+        println!("--- Phase 2c: Bulk Insert Benchmark (put_bulk, {} threads) ---", args.threads);
+
+        let load_start = Instant::now();
+        let records = load_records(&args.data_path, total_records, args.remap_ids);
+        let load_elapsed = load_start.elapsed();
+        println!("  Loaded {} records into memory in {:.2}s", records.len(), load_elapsed.as_secs_f64());
+
+        let rss_before = rss_bytes();
+        let engine = create_concurrent_engine(civitai_config(), &bench_dir, "bulk_insert", args.in_memory_docstore);
+
+        let wall_start = Instant::now();
+        let count = engine.put_bulk(records, args.threads).unwrap();
+        let wall_elapsed = wall_start.elapsed();
+        let rss_after = rss_bytes();
+        let rss_delta = rss_after.saturating_sub(rss_before);
+
+        let bulk_rate = count as f64 / wall_elapsed.as_secs_f64();
+
+        println!("  [{:>12}] put_bulk: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
+            format!("{}", count),
+            wall_elapsed.as_secs_f64(),
+            bulk_rate,
+            format_bytes(rss_after),
+            format_bytes(rss_delta),
+            engine.alive_count()
+        );
+
+        // Bitmap memory breakdown
+        print_bitmap_memory(&engine);
+
+        report.insert_benchmarks.push(InsertBenchmark {
+            batch_label: format!("bulk_{}", count),
+            record_count: count,
+            insert_ms: wall_elapsed.as_secs_f64() * 1000.0,
+            wall_ms: wall_elapsed.as_secs_f64() * 1000.0,
+            insert_rate_per_sec: bulk_rate,
+            rss_before_bytes: rss_before,
+            rss_after_bytes: rss_after,
+            rss_delta_bytes: rss_delta,
+        });
+
+        report.memory_snapshots.push(MemorySnapshot {
+            stage: format!("bulk_insert_{}", count),
+            rss_bytes: rss_after,
+            rss_human: format_bytes(rss_after),
+            alive_count: engine.alive_count(),
+        });
+        println!();
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 3: Build the full engine (streaming from file)
     // Uses ConcurrentEngine for batched docstore writes.
     // -----------------------------------------------------------------------

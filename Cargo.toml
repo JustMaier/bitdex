@@ -32,6 +32,9 @@ bincode = "1"
 # Tier 2 bitmap cache
 moka = { version = "0.12", features = ["sync"] }
 
+# Parallel sort / iteration
+rayon = "1"
+
 # RNG (used by benchmark binary)
 rand = "0.8"
 
