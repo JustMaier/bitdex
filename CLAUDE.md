@@ -96,8 +96,33 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 ## Reference Materials
 
-- **Full Project Brief & Development Guide**: `docs/in/prepared-prompt.md` — Contains complete architecture, API specs, config schemas, testing strategy, development phases, and team structure
-- **Design Conversation**: `docs/in/Claude-Bitdex.md` — Full brainstorming conversation showing the evolution from OpenSearch to the bitmap-only architecture. Read this to understand WHY decisions were made.
+### Design Conversations (read these to understand WHY decisions were made)
+
+- **Original Architecture**: `docs/in/Claude-Bitdex.md` — Full brainstorming conversation showing the evolution from OpenSearch to the bitmap-only architecture. Covers the core "bitmaps all the way down" philosophy, slot model, sort layer design, and why we rejected Vecs/skip lists/B-trees.
+- **Continued Design (Persistence + Bulk Loading)**: `docs/in/claude-bitdex-continued-1.md` — Continuation covering bulk loading pipeline design, put_bulk() architecture, decompose/apply worker pools, accumulator buffers, sharded doc persistence, and performance targets.
+- **Parallelization Strategy**: `docs/in/new-parallelization-strat.md` — Justin's design notes on the dual-endpoint write pipeline (put vs put_bulk), decomposition pools, accumulator buffers, size-based promotion, and doc persistence batching.
+- **Workers vs Threads**: `docs/in/Claude-Workers vs threads in Rust.md` — Discussion of Rust concurrency patterns relevant to the worker pool design.
+
+### Architecture & Design Docs
+
+- **ArcSwap + Redb Reconciliation**: `docs/design-arcswap-redb-reconciliation.md` — How the ArcSwap snapshot architecture and redb persistence layer work together. Two-tier storage (Tier 1 in-memory, Tier 2 moka-over-redb), startup sequence, and memory budget analysis.
+- **Performance & Persistence Roadmap**: `docs/roadmap-performance-and-persistence.md` — Full implementation roadmap (Prereq→A→B→C→D→E phases) with detailed task breakdowns for bitmap persistence, sort-by-slot, time handling, bound caches, and meta-index.
+- **Architecture Risk Review**: `docs/architecture-risk-review.md` — Risk analysis of architectural decisions and mitigations.
+- **Backpressure Design**: `docs/design-backpressure-implementation.md` — Backpressure and auto-throttle design for the write pipeline.
+
+### Specifications & Benchmarks
+
+- **Full Project Brief & Development Guide**: `docs/in/prepared-prompt.md` — Contains complete architecture, API specs, config schemas, testing strategy, development phases, and team structure. This is the authoritative specification.
+- **Benchmark Report**: `docs/benchmark-report.md` — 5M/50M/100M/104.6M scaling analysis with memory and query latency breakdowns.
+- **Loading Mode Comparison**: `docs/benchmark-comparison-loading-mode.md` — Before/after comparison showing loading mode fix impact.
+- **Write Regression Analysis**: `docs/write-regression-loading-mode.md` — Root cause analysis of the ArcSwap clone cascade write regression and the loading mode fix.
+
+### Phase Audits
+
+- `docs/audit/prereq-audit.md` through `docs/audit/phase-e-audit.md` — Post-implementation audits for each roadmap phase. `docs/audit/synthesis.md` has the cross-phase summary.
+
+### External References
+
 - **V1 Codebase**: `C:\Dev\Repos\open-source\bitdex\` — Reference for reusable code (filter bitmaps, WAL consumer, server scaffolding). DO NOT bring over Vecs, skip lists, sorted arrays, forward maps, or reverse indexes.
 
 ---

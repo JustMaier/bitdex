@@ -1238,6 +1238,109 @@ impl ConcurrentEngine {
         // max_sleep (flush_interval * 10).
     }
 
+    /// Save a full snapshot of the current published state to the configured BitmapStore.
+    ///
+    /// Captures the current ArcSwap snapshot (what readers see) and writes all
+    /// filter bitmaps, alive bitmap, sort layer bitmaps, and slot counter in a
+    /// single atomic redb transaction via `write_full_snapshot()`.
+    ///
+    /// This is intended for persisting state after bulk loading is complete.
+    /// For incremental persistence during normal operation, the merge thread
+    /// handles that automatically.
+    ///
+    /// Returns an error if no bitmap_store is configured.
+    pub fn save_snapshot(&self) -> Result<()> {
+        let store = self.bitmap_store.as_ref().ok_or_else(|| {
+            crate::error::BitdexError::Config(
+                "no bitmap_path configured; cannot save snapshot".to_string(),
+            )
+        })?;
+        Self::write_snapshot_to_store(store, &self.inner, &self.config)
+    }
+
+    /// Save a full snapshot of the current published state to a BitmapStore at a custom path.
+    ///
+    /// Creates a new BitmapStore at the given path and writes the complete engine
+    /// state. Useful for benchmarks that want to save to a specific location,
+    /// or for creating point-in-time backups separate from the live store.
+    pub fn save_snapshot_to(&self, path: &Path) -> Result<()> {
+        let store = BitmapStore::new(path)?;
+        Self::write_snapshot_to_store(&store, &self.inner, &self.config)
+    }
+
+    /// Internal: extract all state from the current published snapshot and write it
+    /// to the given BitmapStore in a single atomic transaction.
+    fn write_snapshot_to_store(
+        store: &BitmapStore,
+        inner: &ArcSwap<InnerEngine>,
+        config: &Config,
+    ) -> Result<()> {
+        // Load the current published snapshot (lock-free).
+        // load_full() returns Arc<InnerEngine>; we need an owned mutable copy
+        // to compact diffs before persisting.
+        let snap: Arc<InnerEngine> = inner.load_full();
+        let mut compacted: InnerEngine = (*snap).clone();
+
+        // Compact filter diffs so we persist clean bases
+        for (_name, field) in compacted.filters.fields_mut() {
+            field.merge_dirty();
+        }
+        // Merge alive diffs
+        compacted.slots.merge_alive();
+
+        // Collect filter bitmap entries
+        let mut filter_entries: Vec<(String, u64, RoaringBitmap)> = Vec::new();
+        for (name, field) in compacted.filters.fields() {
+            for (&value, vb) in field.iter_versioned() {
+                filter_entries.push((
+                    name.clone(),
+                    value,
+                    vb.base().as_ref().clone(),
+                ));
+            }
+        }
+
+        // Collect sort layer bases
+        let mut sort_data: Vec<(String, Vec<RoaringBitmap>)> = Vec::new();
+        for sc in &config.sort_fields {
+            if let Some(sf) = compacted.sorts.get_field(&sc.name) {
+                let bases: Vec<RoaringBitmap> = sf
+                    .layer_bases()
+                    .iter()
+                    .map(|b| (*b).clone())
+                    .collect();
+                sort_data.push((sc.name.clone(), bases));
+            }
+        }
+
+        // Build references for write_full_snapshot
+        let filter_refs: Vec<(&str, u64, &RoaringBitmap)> = filter_entries
+            .iter()
+            .map(|(f, v, b)| (f.as_str(), *v, b))
+            .collect();
+        let alive = compacted.slots.alive_bitmap().clone();
+        let slot_counter = compacted.slots.slot_counter();
+
+        // Sort layer refs: owned Vec<&BM> must outlive the slice refs
+        let sort_owned_refs: Vec<(String, Vec<&RoaringBitmap>)> = sort_data
+            .iter()
+            .map(|(name, layers)| {
+                (name.clone(), layers.iter().collect::<Vec<&RoaringBitmap>>())
+            })
+            .collect();
+        let sort_slice_refs: Vec<(&str, &[&RoaringBitmap])> = sort_owned_refs
+            .iter()
+            .map(|(name, refs)| (name.as_str(), refs.as_slice()))
+            .collect();
+
+        store.write_full_snapshot(
+            &filter_refs,
+            &alive,
+            &sort_slice_refs,
+            slot_counter,
+        )
+    }
+
     /// Get a reference to the config.
     pub fn config(&self) -> &Config {
         &self.config
@@ -2760,5 +2863,407 @@ mod tests {
             None, 10,
         ).unwrap();
         assert_eq!(result.ids, vec![1]);
+    }
+
+    // ---- Snapshot save/restore tests ----
+
+    fn test_config_with_bitmap_path(bitmap_path: std::path::PathBuf) -> Config {
+        Config {
+            filter_fields: vec![
+                FilterFieldConfig {
+                    name: "nsfwLevel".to_string(),
+                    field_type: FilterFieldType::SingleValue,
+                    storage: crate::config::StorageMode::default(),
+                    behaviors: None,
+                },
+                FilterFieldConfig {
+                    name: "tagIds".to_string(),
+                    field_type: FilterFieldType::MultiValue,
+                    storage: crate::config::StorageMode::default(),
+                    behaviors: None,
+                },
+                FilterFieldConfig {
+                    name: "onSite".to_string(),
+                    field_type: FilterFieldType::Boolean,
+                    storage: crate::config::StorageMode::default(),
+                    behaviors: None,
+                },
+            ],
+            sort_fields: vec![SortFieldConfig {
+                name: "reactionCount".to_string(),
+                source_type: "uint32".to_string(),
+                encoding: "linear".to_string(),
+                bits: 32,
+            }],
+            max_page_size: 100,
+            flush_interval_us: 50,
+            channel_capacity: 10_000,
+            storage: crate::config::StorageConfig {
+                bitmap_path: Some(bitmap_path),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_save_snapshot_no_bitmap_store_returns_error() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+        let result = engine.save_snapshot();
+        assert!(result.is_err(), "save_snapshot should fail without bitmap_path");
+    }
+
+    #[test]
+    fn test_save_snapshot_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps.redb");
+        let docstore_path = dir.path().join("docstore.redb");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        // Phase 1: Create engine, insert data, save snapshot
+        {
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            engine
+                .put(
+                    1,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("tagIds", FieldValue::Multi(vec![Value::Integer(100), Value::Integer(200)])),
+                        ("onSite", FieldValue::Single(Value::Bool(true))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(500))),
+                    ]),
+                )
+                .unwrap();
+            engine
+                .put(
+                    2,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
+                        ("tagIds", FieldValue::Multi(vec![Value::Integer(200), Value::Integer(300)])),
+                        ("onSite", FieldValue::Single(Value::Bool(false))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(100))),
+                    ]),
+                )
+                .unwrap();
+            engine
+                .put(
+                    3,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("tagIds", FieldValue::Multi(vec![Value::Integer(100)])),
+                        ("onSite", FieldValue::Single(Value::Bool(true))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(300))),
+                    ]),
+                )
+                .unwrap();
+
+            // Shutdown to ensure all mutations are flushed and published
+            engine.shutdown();
+
+            // Verify data is visible before saving
+            assert_eq!(engine.alive_count(), 3);
+
+            // Save the snapshot
+            engine.save_snapshot().unwrap();
+        }
+
+        // Phase 2: Create a NEW engine from the same config+paths and verify restoration
+        {
+            let engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            // Verify alive count restored
+            assert_eq!(
+                engine.alive_count(),
+                3,
+                "alive count should be restored from snapshot"
+            );
+
+            // Verify slot counter restored
+            assert_eq!(
+                engine.slot_counter(),
+                4,
+                "slot counter should be restored (next_slot = max_id + 1)"
+            );
+
+            // Verify filter queries work
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                    None,
+                    100,
+                )
+                .unwrap();
+            let mut ids = result.ids.clone();
+            ids.sort();
+            assert_eq!(ids, vec![1, 3], "nsfwLevel=1 should match docs 1 and 3");
+
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(2))],
+                    None,
+                    100,
+                )
+                .unwrap();
+            assert_eq!(result.ids, vec![2], "nsfwLevel=2 should match doc 2");
+
+            // Verify multi-value filter
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("tagIds".to_string(), Value::Integer(200))],
+                    None,
+                    100,
+                )
+                .unwrap();
+            assert_eq!(
+                result.total_matched, 2,
+                "tagIds=200 should match docs 1 and 2"
+            );
+
+            // Verify boolean filter
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("onSite".to_string(), Value::Bool(true))],
+                    None,
+                    100,
+                )
+                .unwrap();
+            let mut ids = result.ids.clone();
+            ids.sort();
+            assert_eq!(ids, vec![1, 3], "onSite=true should match docs 1 and 3");
+
+            // Verify sort works correctly (descending reactionCount)
+            let sort = SortClause {
+                field: "reactionCount".to_string(),
+                direction: SortDirection::Desc,
+            };
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                    Some(&sort),
+                    10,
+                )
+                .unwrap();
+            assert_eq!(
+                result.ids,
+                vec![1, 3],
+                "sort desc should return 500 (doc 1) before 300 (doc 3)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_save_snapshot_to_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom_bitmap_path = dir.path().join("custom_bitmaps.redb");
+
+        // Create engine without bitmap_path (in-memory only)
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(5))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(42))),
+                ]),
+            )
+            .unwrap();
+        engine
+            .put(
+                2,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(5))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(99))),
+                ]),
+            )
+            .unwrap();
+
+        engine.shutdown();
+        assert_eq!(engine.alive_count(), 2);
+
+        // Save to custom path
+        engine.save_snapshot_to(&custom_bitmap_path).unwrap();
+
+        // Verify the file was created and contains the data
+        let store = crate::bitmap_store::BitmapStore::new(&custom_bitmap_path).unwrap();
+        let alive = store.load_alive().unwrap().unwrap();
+        assert_eq!(alive.len(), 2, "alive bitmap should have 2 entries");
+        assert!(alive.contains(1));
+        assert!(alive.contains(2));
+
+        let counter = store.load_slot_counter().unwrap().unwrap();
+        assert!(counter >= 3, "slot counter should be at least 3");
+
+        let nsfw = store.load_field("nsfwLevel").unwrap();
+        assert!(nsfw.contains_key(&5), "nsfwLevel=5 should exist");
+        assert_eq!(nsfw[&5].len(), 2, "nsfwLevel=5 should have 2 entries");
+
+        let sort_layers = store.load_sort_layers("reactionCount", 32).unwrap();
+        assert!(sort_layers.is_some(), "sort layers should be persisted");
+    }
+
+    #[test]
+    fn test_save_snapshot_empty_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps.redb");
+        let docstore_path = dir.path().join("docstore.redb");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        // Save snapshot of empty engine
+        {
+            let engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+            engine.save_snapshot().unwrap();
+        }
+
+        // Restore from empty snapshot
+        {
+            let engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+            assert_eq!(engine.alive_count(), 0, "empty snapshot should restore to 0 alive");
+            assert_eq!(engine.slot_counter(), 0, "empty snapshot should restore counter to 0");
+        }
+    }
+
+    #[test]
+    fn test_save_snapshot_after_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps.redb");
+        let docstore_path = dir.path().join("docstore.redb");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        // Insert 3 docs, delete 1, then save and restore
+        {
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            for i in 1..=3u32 {
+                engine
+                    .put(
+                        i,
+                        &make_doc(vec![
+                            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                            ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 10))),
+                        ]),
+                    )
+                    .unwrap();
+            }
+
+            wait_for_flush(&engine, 3, 500);
+
+            // Delete doc 2
+            engine.delete(2).unwrap();
+            wait_for_flush(&engine, 2, 500);
+
+            engine.shutdown();
+            engine.save_snapshot().unwrap();
+        }
+
+        // Restore and verify
+        {
+            let engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            assert_eq!(engine.alive_count(), 2, "should have 2 alive after delete");
+
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                    None,
+                    100,
+                )
+                .unwrap();
+            let mut ids = result.ids.clone();
+            ids.sort();
+            assert_eq!(ids, vec![1, 3], "deleted doc 2 should not appear");
+        }
+    }
+
+    #[test]
+    fn test_save_snapshot_preserves_sort_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps.redb");
+        let docstore_path = dir.path().join("docstore.redb");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        // Insert docs with specific sort values
+        {
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            engine
+                .put(
+                    1,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(100))),
+                    ]),
+                )
+                .unwrap();
+            engine
+                .put(
+                    2,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(500))),
+                    ]),
+                )
+                .unwrap();
+            engine
+                .put(
+                    3,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(300))),
+                    ]),
+                )
+                .unwrap();
+
+            engine.shutdown();
+            engine.save_snapshot().unwrap();
+        }
+
+        // Restore and verify sort order is preserved
+        {
+            let engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            let sort = SortClause {
+                field: "reactionCount".to_string(),
+                direction: SortDirection::Desc,
+            };
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                    Some(&sort),
+                    10,
+                )
+                .unwrap();
+            assert_eq!(
+                result.ids,
+                vec![2, 3, 1],
+                "descending sort should be 500, 300, 100 after restore"
+            );
+
+            let sort_asc = SortClause {
+                field: "reactionCount".to_string(),
+                direction: SortDirection::Asc,
+            };
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                    Some(&sort_asc),
+                    10,
+                )
+                .unwrap();
+            assert_eq!(
+                result.ids,
+                vec![1, 3, 2],
+                "ascending sort should be 100, 300, 500 after restore"
+            );
+        }
     }
 }
