@@ -891,6 +891,8 @@ fn main() {
     // -----------------------------------------------------------------------
     // Phase 2c: Bulk insert benchmark (put_bulk — parallel decompose + direct bitmap build)
     // -----------------------------------------------------------------------
+    let mut bulk_engine: Option<ConcurrentEngine> = None;
+
     if should_run(&args.stages, "bulk") {
         println!("--- Phase 2c: Bulk Insert Benchmark (put_bulk, {} threads) ---", args.threads);
 
@@ -999,40 +1001,61 @@ fn main() {
             alive_count: engine.alive_count(),
         });
         println!();
+
+        // Keep the bulk engine for query/update phases if those stages are also requested
+        bulk_engine = Some(engine);
     }
 
     // -----------------------------------------------------------------------
     // Phase 3: Build the full engine (streaming from file)
-    // Uses ConcurrentEngine for batched docstore writes.
+    // If bulk was already run, reuse that engine instead of rebuilding.
     // -----------------------------------------------------------------------
-    println!("--- Building full engine for update/query benchmarks ---");
-    let engine = create_concurrent_engine(civitai_config(), &bench_dir, "full_engine", args.in_memory_docstore);
-    engine.enter_loading_mode();
-    let build_start = Instant::now();
-    let mut build_counter = 0u32;
-    stream_records(&args.data_path, limit, |rec| {
-        let id = if args.remap_ids { let v = build_counter; build_counter += 1; v } else { rec.id as u32 };
-        let doc = rec.to_document();
-        engine.put(id, &doc).unwrap();
-    });
-    engine.exit_loading_mode();
-    wait_for_flush(&engine, total_records as u64, 60_000);
-    let build_elapsed = build_start.elapsed();
-    let rss = rss_bytes();
-    println!("  Loaded {} records in {:.2}s", total_records, build_elapsed.as_secs_f64());
-    println!("  Alive: {}", engine.alive_count());
-    println!("  RSS: {}", format_bytes(rss));
-    println!();
+    let engine = if let Some(be) = bulk_engine {
+        println!("--- Reusing bulk-loaded engine for update/query benchmarks ---");
+        println!("  Alive: {}", be.alive_count());
+        println!("  RSS: {}", format_bytes(rss_bytes()));
+        println!();
 
-    report.memory_snapshots.push(MemorySnapshot {
-        stage: "full_engine".into(),
-        rss_bytes: rss,
-        rss_human: format_bytes(rss),
-        alive_count: engine.alive_count(),
-    });
+        report.memory_snapshots.push(MemorySnapshot {
+            stage: "full_engine (from bulk)".into(),
+            rss_bytes: rss_bytes(),
+            rss_human: format_bytes(rss_bytes()),
+            alive_count: be.alive_count(),
+        });
 
-    // Bitmap memory breakdown (excludes redb, allocator, channels — pure Bitdex)
-    print_bitmap_memory(&engine);
+        print_bitmap_memory(&be);
+        be
+    } else {
+        println!("--- Building full engine for update/query benchmarks ---");
+        let engine = create_concurrent_engine(civitai_config(), &bench_dir, "full_engine", args.in_memory_docstore);
+        engine.enter_loading_mode();
+        let build_start = Instant::now();
+        let mut build_counter = 0u32;
+        stream_records(&args.data_path, limit, |rec| {
+            let id = if args.remap_ids { let v = build_counter; build_counter += 1; v } else { rec.id as u32 };
+            let doc = rec.to_document();
+            engine.put(id, &doc).unwrap();
+        });
+        engine.exit_loading_mode();
+        wait_for_flush(&engine, total_records as u64, 60_000);
+        let build_elapsed = build_start.elapsed();
+        let rss = rss_bytes();
+        println!("  Loaded {} records in {:.2}s", total_records, build_elapsed.as_secs_f64());
+        println!("  Alive: {}", engine.alive_count());
+        println!("  RSS: {}", format_bytes(rss));
+        println!();
+
+        report.memory_snapshots.push(MemorySnapshot {
+            stage: "full_engine".into(),
+            rss_bytes: rss,
+            rss_human: format_bytes(rss),
+            alive_count: engine.alive_count(),
+        });
+
+        // Bitmap memory breakdown (excludes redb, allocator, channels — pure Bitdex)
+        print_bitmap_memory(&engine);
+        engine
+    };
 
     // -----------------------------------------------------------------------
     // Phase 4: Update/re-insert benchmark (re-reads file from top)
