@@ -24,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
+use rayon::prelude::*;
 
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
@@ -152,6 +153,15 @@ fn type_to_int(t: &str) -> i64 {
         "audio" => 3,
         _ => 0,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Byte utilities
+// ---------------------------------------------------------------------------
+
+/// Find the last newline in a byte slice (equivalent to memrchr for '\n').
+fn memrchr_newline(data: &[u8]) -> Option<usize> {
+    data.iter().rposition(|&b| b == b'\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -679,21 +689,35 @@ fn main() {
 
     // -----------------------------------------------------------------------
     // Phase 1: Count records (quick scan, no full parse into memory)
+    // Skip if only running bulk/persist/restore/query — the bulk path streams
+    // in chunks and doesn't need an upfront count.
     // -----------------------------------------------------------------------
-    println!("--- Phase 1: Counting records ---");
-    let count_start = Instant::now();
-    let total_records = count_records(&args.data_path, limit);
-    let count_elapsed = count_start.elapsed();
-    println!("  {} records in {:.2}s", total_records, count_elapsed.as_secs_f64());
-    println!("  RSS after count: {}", format_bytes(rss_bytes()));
-    println!();
+    let bulk_only_stages = ["bulk", "persist", "restore", "query"];
+    let needs_count = args.stages.iter().any(|s| {
+        s == "all" || !bulk_only_stages.contains(&s.as_str())
+    });
+    let (total_records, count_time_ms) = if needs_count {
+        println!("--- Phase 1: Counting records ---");
+        let count_start = Instant::now();
+        let count = count_records(&args.data_path, limit);
+        let count_elapsed = count_start.elapsed();
+        println!("  {} records in {:.2}s", count, count_elapsed.as_secs_f64());
+        println!("  RSS after count: {}", format_bytes(rss_bytes()));
+        println!();
+        (count, count_elapsed.as_secs_f64() * 1000.0)
+    } else {
+        // For bulk-only: use limit or a large sentinel (chunked streaming handles the actual limit)
+        println!("--- Skipping record count (bulk-only mode) ---");
+        println!();
+        (limit, 0.0)
+    };
 
     let mut report = BenchmarkReport {
         dataset: DatasetInfo {
             path: args.data_path.display().to_string(),
             total_records,
             records_loaded: total_records,
-            parse_time_ms: count_elapsed.as_secs_f64() * 1000.0,
+            parse_time_ms: count_time_ms,
         },
         insert_benchmarks: Vec::new(),
         update_benchmark: None,
@@ -919,50 +943,158 @@ fn main() {
         // snapshot shares Arc references with the staging copy.
         let mut staging = engine.clone_staging();
 
-        // Stream records in chunks
-        let file = File::open(&args.data_path).expect("Failed to open data file");
-        let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-        let mut chunk: Vec<(u32, bitdex_v2::mutation::Document)> = Vec::with_capacity(chunk_size);
+        // Pipelined bulk loading with parallel parsing:
+        //
+        // 1. Reader thread reads raw lines in small batches (read_batch_size)
+        //    and sends them to a channel (bounded, depth=2 for backpressure).
+        // 2. Main thread receives line batches, parallel-parses with rayon,
+        //    accumulates parsed docs into a bitmap chunk (chunk_size).
+        // 3. When bitmap chunk is full, calls put_bulk_loading.
+        //
+        // This overlaps I/O with parsing with bitmap building.
+        let remap_ids = args.remap_ids;
+        let num_threads = args.threads;
+        let read_batch_size = 500_000; // smaller read batches for better pipelining
 
-        for line_result in reader.lines() {
-            if total_inserted + chunk.len() >= total_records { break; }
-            let line = match line_result {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            if line.is_empty() { continue; }
-            match serde_json::from_str::<NdjsonRecord>(&line) {
-                Ok(rec) => {
-                    let id = if args.remap_ids { let v = id_counter; id_counter += 1; v } else { rec.id as u32 };
-                    chunk.push((id, rec.to_document()));
-                    if chunk.len() >= chunk_size {
-                        let chunk_start = Instant::now();
-                        let count = engine.put_bulk_loading(&mut staging, &chunk, args.threads);
-                        let chunk_elapsed = chunk_start.elapsed();
-                        total_inserted += count;
-                        chunks_processed += 1;
-                        let rate = count as f64 / chunk_elapsed.as_secs_f64();
-                        let alive = staging.slots.alive_count();
-                        println!("  chunk {}: {} records in {:.2}s ({:.0}/s)  alive: {}",
-                            chunks_processed, count, chunk_elapsed.as_secs_f64(), rate, alive);
-                        chunk = Vec::with_capacity(chunk_size);
+        // Pipelined bulk loading:
+        // 1. Reader thread reads large byte blocks (~300 MB each, ~500K lines)
+        //    and sends complete-line buffers as Vec<u8>.
+        // 2. Main thread receives byte buffers, splits lines + parses JSON in
+        //    parallel with rayon, accumulates docs into bitmap chunks.
+        // 3. When chunk is full, calls put_bulk_loading.
+        //
+        // All CPU work (newline splitting, JSON parsing, document construction)
+        // happens in rayon on the main thread, while the reader thread does
+        // pure I/O. This maximizes parallelism.
+        let data_path = args.data_path.clone();
+        let target_batch_bytes = read_batch_size * 600; // ~600 bytes/line × 500K lines ≈ 300 MB
+        let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+
+        let reader_handle = thread::spawn(move || {
+            use std::io::Read;
+            let file = File::open(&data_path).expect("Failed to open data file");
+            let mut reader = BufReader::with_capacity(16 * 1024 * 1024, file);
+            let mut leftover = Vec::<u8>::new();
+            let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB read buffer
+            let mut accum = Vec::<u8>::with_capacity(target_batch_bytes + 4 * 1024 * 1024);
+            let mut blocks_sent: usize = 0;
+
+            loop {
+                let bytes_read = reader.read(&mut buf).unwrap_or(0);
+                if bytes_read == 0 {
+                    // EOF — flush leftover + accumulator
+                    if !leftover.is_empty() {
+                        accum.extend_from_slice(&leftover);
+                        leftover.clear();
+                    }
+                    if !accum.is_empty() {
+                        let _ = block_tx.send(accum);
+                        blocks_sent += 1;
+                    }
+                    break;
+                }
+
+                accum.extend_from_slice(&buf[..bytes_read]);
+
+                // Once we have enough data, find the last newline and split
+                if accum.len() >= target_batch_bytes {
+                    match memrchr_newline(&accum) {
+                        Some(last_nl) => {
+                            // Everything up to (including) last newline is a complete batch
+                            let remainder = accum[last_nl + 1..].to_vec();
+                            accum.truncate(last_nl + 1);
+
+                            // Prepend any leftover from previous split
+                            if !leftover.is_empty() {
+                                let mut combined = std::mem::take(&mut leftover);
+                                combined.append(&mut accum);
+                                accum = combined;
+                            }
+
+                            let batch = std::mem::replace(&mut accum, Vec::with_capacity(target_batch_bytes + 4 * 1024 * 1024));
+                            leftover = remainder;
+
+                            if block_tx.send(batch).is_err() { break; }
+                            blocks_sent += 1;
+                        }
+                        None => {
+                            // No newline in accumulated data — keep accumulating
+                        }
                     }
                 }
-                Err(_) => continue,
+            }
+            blocks_sent
+        });
+
+        // Main thread: receive byte blocks, parallel-parse with rayon, accumulate into bitmap chunks
+        let mut doc_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
+        let mut parse_time_accum = Duration::ZERO;
+
+        while let Ok(raw_block) = block_rx.recv() {
+            let parse_start = Instant::now();
+            let base_id = id_counter;
+
+            // Safety: NDJSON is valid UTF-8
+            let block_str = unsafe { std::str::from_utf8_unchecked(&raw_block) };
+
+            // Split into lines and parallel-parse with rayon
+            let lines: Vec<&str> = block_str.split('\n')
+                .map(|l| l.trim_end_matches('\r'))
+                .filter(|l| !l.is_empty())
+                .collect();
+            let line_count = lines.len() as u32;
+
+            let mut parsed: Vec<(u32, Document)> = lines.into_par_iter()
+                .enumerate()
+                .filter_map(|(i, line)| {
+                    serde_json::from_str::<NdjsonRecord>(line).ok().map(|rec| {
+                        let id = if remap_ids { base_id + i as u32 } else { rec.id as u32 };
+                        (id, rec.to_document())
+                    })
+                })
+                .collect();
+            let parse_elapsed = parse_start.elapsed();
+            parse_time_accum += parse_elapsed;
+            id_counter += line_count;
+
+            doc_chunk.append(&mut parsed);
+
+            // When we have enough docs, run bitmap building
+            if doc_chunk.len() >= chunk_size {
+                let bitmap_start = Instant::now();
+                let count = engine.put_bulk_loading(&mut staging, &doc_chunk, num_threads);
+                let bitmap_elapsed = bitmap_start.elapsed();
+
+                total_inserted += count;
+                chunks_processed += 1;
+                let alive = staging.slots.alive_count();
+                let rate = count as f64 / (parse_time_accum + bitmap_elapsed).as_secs_f64();
+                println!("  chunk {}: {} records  parse={:.2}s bitmap={:.2}s ({:.0}/s)  alive: {}",
+                    chunks_processed, count,
+                    parse_time_accum.as_secs_f64(), bitmap_elapsed.as_secs_f64(),
+                    rate, alive);
+                doc_chunk = Vec::with_capacity(chunk_size);
+                parse_time_accum = Duration::ZERO;
             }
         }
-        // Process remaining records
-        if !chunk.is_empty() {
-            let chunk_start = Instant::now();
-            let count = engine.put_bulk_loading(&mut staging, &chunk, args.threads);
-            let chunk_elapsed = chunk_start.elapsed();
+
+        // Process remaining docs
+        if !doc_chunk.is_empty() {
+            let bitmap_start = Instant::now();
+            let count = engine.put_bulk_loading(&mut staging, &doc_chunk, num_threads);
+            let bitmap_elapsed = bitmap_start.elapsed();
+
             total_inserted += count;
             chunks_processed += 1;
-            let rate = count as f64 / chunk_elapsed.as_secs_f64();
             let alive = staging.slots.alive_count();
-            println!("  chunk {}: {} records in {:.2}s ({:.0}/s)  alive: {}",
-                chunks_processed, count, chunk_elapsed.as_secs_f64(), rate, alive);
+            let rate = count as f64 / (parse_time_accum + bitmap_elapsed).as_secs_f64();
+            println!("  chunk {}: {} records  parse={:.2}s bitmap={:.2}s ({:.0}/s)  alive: {}",
+                chunks_processed, count,
+                parse_time_accum.as_secs_f64(), bitmap_elapsed.as_secs_f64(),
+                rate, alive);
         }
+
+        reader_handle.join().unwrap();
 
         // Publish the fully-built staging as the live snapshot
         let publish_start = Instant::now();
