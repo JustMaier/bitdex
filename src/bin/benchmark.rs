@@ -10,7 +10,7 @@
 //!   --data <PATH>     Path to images.ndjson (default: auto-detect)
 //!   --limit <N>       Max records to load (default: all)
 //!   --json            Output machine-readable JSON report
-//!   --stages <LIST>   Comma-separated stages to run: insert,update,query,concurrent,mixed,contention,all (default: all)
+//!   --stages <LIST>   Comma-separated stages to run: insert,bulk,persist,restore,update,query,concurrent,mixed,contention,all (default: all)
 //!   --threads <N>     Number of threads for concurrent benchmarks (default: 4)
 //!   --in-memory-docstore  Use in-memory docstore instead of on-disk (default: on-disk)
 
@@ -661,14 +661,19 @@ fn main() {
         .parent()
         .expect("exe has no parent dir")
         .join("bitdex-bench-data");
-    if !args.in_memory_docstore {
-        if bench_dir.exists() {
+    let needs_bench_dir = !args.in_memory_docstore
+        || should_run(&args.stages, "persist")
+        || should_run(&args.stages, "restore");
+    if needs_bench_dir {
+        if bench_dir.exists() && !should_run(&args.stages, "restore") {
+            // Don't delete bench_dir if we're restoring from it
             std::fs::remove_dir_all(&bench_dir).ok();
         }
-        std::fs::create_dir_all(&bench_dir).unwrap();
-        println!("Docstore dir: {}", bench_dir.display());
+        std::fs::create_dir_all(&bench_dir).ok();
+        println!("Bench dir: {}", bench_dir.display());
         println!();
     }
+    let persist_path = bench_dir.join("bitmaps.redb");
 
     let limit = args.limit.unwrap_or(usize::MAX);
 
@@ -1010,7 +1015,7 @@ fn main() {
     // Phase 3: Build the full engine (streaming from file)
     // If bulk was already run, reuse that engine instead of rebuilding.
     // -----------------------------------------------------------------------
-    let engine = if let Some(be) = bulk_engine {
+    let mut engine = if let Some(be) = bulk_engine {
         println!("--- Reusing bulk-loaded engine for update/query benchmarks ---");
         println!("  Alive: {}", be.alive_count());
         println!("  RSS: {}", format_bytes(rss_bytes()));
@@ -1056,6 +1061,67 @@ fn main() {
         print_bitmap_memory(&engine);
         engine
     };
+
+    // -----------------------------------------------------------------------
+    // Phase: Persist — save engine bitmap snapshot to disk
+    // -----------------------------------------------------------------------
+    if should_run(&args.stages, "persist") {
+        println!("--- Phase: Persist (save bitmap snapshot) ---");
+        let alive_before = engine.alive_count();
+        let persist_start = Instant::now();
+        engine.save_snapshot_to(&persist_path).unwrap();
+        let persist_elapsed = persist_start.elapsed();
+
+        let file_size = std::fs::metadata(&persist_path).map(|m| m.len()).unwrap_or(0);
+        println!("  Saved {} alive in {:.2}s (bitmaps.redb: {})",
+            alive_before, persist_elapsed.as_secs_f64(), format_bytes(file_size));
+        println!("  RSS: {}", format_bytes(rss_bytes()));
+        println!();
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase: Restore — drop engine, rebuild from bitmap snapshot
+    // -----------------------------------------------------------------------
+    if should_run(&args.stages, "restore") {
+        println!("--- Phase: Restore (load from bitmap snapshot) ---");
+
+        if !persist_path.exists() {
+            eprintln!("  ERROR: no bitmaps.redb found at {}. Run with 'persist' stage first.", persist_path.display());
+        } else {
+            let rss_before = rss_bytes();
+
+            // Create a new engine with bitmap_path pointing to the snapshot
+            let mut restore_config = civitai_config();
+            restore_config.storage.bitmap_path = Some(persist_path.clone());
+
+            let restore_start = Instant::now();
+            let restored = if args.in_memory_docstore {
+                ConcurrentEngine::new(restore_config).unwrap()
+            } else {
+                let db_path = bench_dir.join("restored_docstore.redb");
+                ConcurrentEngine::new_with_path(restore_config, &db_path).unwrap()
+            };
+            let restore_elapsed = restore_start.elapsed();
+
+            // Replace the old engine (implicitly drops it)
+            engine = restored;
+
+            let rss_restored = rss_bytes();
+            println!("  Restored {} alive in {:.2}s (was {} RSS before)",
+                engine.alive_count(), restore_elapsed.as_secs_f64(), format_bytes(rss_before));
+            println!("  RSS: {}", format_bytes(rss_restored));
+            println!();
+
+            report.memory_snapshots.push(MemorySnapshot {
+                stage: "restored_engine".into(),
+                rss_bytes: rss_restored,
+                rss_human: format_bytes(rss_restored),
+                alive_count: engine.alive_count(),
+            });
+
+            print_bitmap_memory(&engine);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Phase 4: Update/re-insert benchmark (re-reads file from top)
@@ -2059,8 +2125,9 @@ fn main() {
         println!("JSON report written to: {}", out_path.display());
     }
 
-    // Clean up on-disk docstore
-    if !args.in_memory_docstore && bench_dir.exists() {
+    // Clean up on-disk data (drop engine first to release file handles)
+    drop(engine);
+    if needs_bench_dir && bench_dir.exists() {
         std::fs::remove_dir_all(&bench_dir).ok();
     }
 
