@@ -35,6 +35,9 @@ moka = { version = "0.12", features = ["sync"] }
 # Parallel sort / iteration
 rayon = "1"
 
+# Allocator (handles concurrent allocation much better than Windows CRT)
+rpmalloc = "0.2"
+
 # RNG (used by benchmark binary)
 rand = "0.8"
 

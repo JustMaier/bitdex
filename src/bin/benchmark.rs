@@ -14,6 +14,12 @@
 //!   --threads <N>     Number of threads for concurrent benchmarks (default: 4)
 //!   --in-memory-docstore  Use in-memory docstore instead of on-disk (default: on-disk)
 
+// Use rpmalloc for better concurrent allocation performance.
+// The default Windows CRT allocator fragments under heavy parallel load,
+// causing parse times to degrade 5x+ as bitmap memory grows to 6+ GB.
+#[global_allocator]
+static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -1034,8 +1040,7 @@ fn main() {
             let parse_start = Instant::now();
             let base_id = id_counter;
 
-            // Safety: NDJSON is valid UTF-8
-            let block_str = unsafe { std::str::from_utf8_unchecked(&raw_block) };
+            let block_str = std::str::from_utf8(&raw_block).expect("NDJSON block is not valid UTF-8");
 
             // Split into lines and parallel-parse with rayon
             let lines: Vec<&str> = block_str.split('\n')
