@@ -818,15 +818,15 @@ impl ConcurrentEngine {
             }
         };
 
-        let (filter_bitmap, use_simple_sort) =
+        let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, filters)?;
 
         // D5: Narrow filter bitmap with bound cache for sort queries
         let (effective_bitmap, use_simple, cache_key) =
-            self.apply_bound(&executor, filter_bitmap, use_simple_sort, sort, filters, None);
+            self.apply_bound(&executor, &filter_arc, use_simple_sort, sort, filters, None);
 
         let mut result =
-            executor.execute_from_bitmap(effective_bitmap, sort, limit, None, use_simple)?;
+            executor.execute_from_bitmap(&effective_bitmap, sort, limit, None, use_simple)?;
 
         // D2: Form or update bound from sort results
         self.update_bound_from_results(&snap, sort, &cache_key, &result.ids, None);
@@ -869,13 +869,13 @@ impl ConcurrentEngine {
             }
         };
 
-        let (filter_bitmap, use_simple_sort) =
+        let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, &query.filters)?;
 
         // D5: Narrow filter bitmap with bound cache for sort queries
         let (effective_bitmap, use_simple, cache_key) = self.apply_bound(
             &executor,
-            filter_bitmap,
+            &filter_arc,
             use_simple_sort,
             query.sort.as_ref(),
             &query.filters,
@@ -883,7 +883,7 @@ impl ConcurrentEngine {
         );
 
         let mut result = executor.execute_from_bitmap(
-            effective_bitmap,
+            &effective_bitmap,
             query.sort.as_ref(),
             query.limit,
             query.cursor.as_ref(),
@@ -912,38 +912,41 @@ impl ConcurrentEngine {
         &self,
         executor: &QueryExecutor,
         filters: &[FilterClause],
-    ) -> Result<(roaring::RoaringBitmap, bool)> {
+    ) -> Result<(Arc<roaring::RoaringBitmap>, bool)> {
         let plan = planner::plan_query(filters, executor.filter_index(), executor.slot_allocator());
         let cache_key = cache::canonicalize(&plan.ordered_clauses);
 
         let filter_bitmap = if let Some(ref key) = cache_key {
             // Brief lock: cache lookup only
             let lookup = { self.cache.lock().lookup(key) };
-            // Lock released — CacheLookup owns its bitmaps
+            // Lock released — CacheLookup owns its Arc bitmaps
 
             match lookup {
-                CacheLookup::ExactHit(bitmap) => bitmap,
-                CacheLookup::PrefixHit { mut bitmap, matched_prefix_len } => {
-                    // Compute remaining clauses (no lock held)
+                CacheLookup::ExactHit(arc) => arc,
+                CacheLookup::PrefixHit { bitmap: prefix_arc, matched_prefix_len } => {
+                    // Start from prefix bitmap, compute remaining clauses (no lock held)
+                    let mut bitmap = (*prefix_arc).clone();
                     for clause in &plan.ordered_clauses[matched_prefix_len..] {
                         let clause_bm = executor.evaluate_clause(clause)?;
                         bitmap &= &clause_bm;
                     }
                     // Brief lock: store result
-                    self.cache.lock().store(key, bitmap.clone());
-                    bitmap
+                    let arc = Arc::new(bitmap);
+                    self.cache.lock().store(key, arc.clone());
+                    arc
                 }
                 CacheLookup::Miss => {
                     // Full computation (no lock held)
                     let bitmap = executor.compute_filters(&plan.ordered_clauses)?;
                     // Brief lock: store result
-                    self.cache.lock().store(key, bitmap.clone());
-                    bitmap
+                    let arc = Arc::new(bitmap);
+                    self.cache.lock().store(key, arc.clone());
+                    arc
                 }
             }
         } else {
             // Uncacheable query — compute without cache
-            executor.compute_filters(&plan.ordered_clauses)?
+            Arc::new(executor.compute_filters(&plan.ordered_clauses)?)
         };
 
         Ok((filter_bitmap, plan.use_simple_sort))
@@ -992,19 +995,19 @@ impl ConcurrentEngine {
     fn apply_bound(
         &self,
         _executor: &QueryExecutor,
-        filter_bitmap: roaring::RoaringBitmap,
+        filter_bitmap: &roaring::RoaringBitmap,
         use_simple_sort: bool,
         sort: Option<&SortClause>,
         filters: &[FilterClause],
         cursor: Option<&crate::query::CursorPosition>,
     ) -> (roaring::RoaringBitmap, bool, Option<CacheKey>) {
         let Some(sort_clause) = sort else {
-            return (filter_bitmap, use_simple_sort, None);
+            return (filter_bitmap.clone(), use_simple_sort, None);
         };
 
         let cache_key = cache::canonicalize(filters);
         let Some(ref filter_key) = cache_key else {
-            return (filter_bitmap, use_simple_sort, None);
+            return (filter_bitmap.clone(), use_simple_sort, None);
         };
 
         let bound_key = BoundKey {
@@ -1045,7 +1048,7 @@ impl ConcurrentEngine {
                     }
 
                     entry.touch();
-                    let narrowed = &filter_bitmap & entry.bitmap();
+                    let narrowed = filter_bitmap & entry.bitmap();
                     return (narrowed, false, cache_key);
                 }
             }
@@ -1062,13 +1065,13 @@ impl ConcurrentEngine {
             sort_clause.direction,
         ) {
             entry.touch();
-            let narrowed = &filter_bitmap & entry.bitmap();
+            let narrowed = filter_bitmap & entry.bitmap();
             return (narrowed, false, cache_key);
         }
 
         drop(bc);
 
-        (filter_bitmap, use_simple_sort, cache_key)
+        (filter_bitmap.clone(), use_simple_sort, cache_key)
     }
 
     /// D2/D6: Form or update a bound from sort query results.

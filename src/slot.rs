@@ -32,6 +32,11 @@ pub struct SlotAllocator {
     /// Slots waiting for their scheduled activation time.
     /// Key: unix timestamp (seconds), Value: list of slots to activate.
     deferred: BTreeMap<u64, Vec<u32>>,
+
+    /// True when no deletes have ever occurred (conservative: never reset to true).
+    /// When true, the alive AND can be skipped entirely in queries since every
+    /// allocated slot is alive.
+    all_alive: bool,
 }
 
 impl Clone for SlotAllocator {
@@ -41,6 +46,7 @@ impl Clone for SlotAllocator {
             alive: self.alive.clone(),
             clean: Arc::clone(&self.clean),
             deferred: self.deferred.clone(),
+            all_alive: self.all_alive,
         }
     }
 }
@@ -52,16 +58,19 @@ impl SlotAllocator {
             alive: VersionedBitmap::new_empty(),
             clean: Arc::new(RoaringBitmap::new()),
             deferred: BTreeMap::new(),
+            all_alive: true,
         }
     }
 
     /// Restore from a known state (e.g., after snapshot load).
+    /// Conservative: assumes deletes may have occurred (all_alive = false).
     pub fn from_state(next_slot: u32, alive: RoaringBitmap, clean: RoaringBitmap) -> Self {
         Self {
             next_slot: AtomicU32::new(next_slot),
             alive: VersionedBitmap::new(alive),
             clean: Arc::new(clean),
             deferred: BTreeMap::new(),
+            all_alive: false,
         }
     }
 
@@ -110,6 +119,7 @@ impl SlotAllocator {
             return Err(BitdexError::SlotNotFound(slot));
         }
         self.alive.remove(slot);
+        self.all_alive = false;
         Ok(())
     }
 
@@ -123,6 +133,13 @@ impl SlotAllocator {
     /// was previously used and may have stale filter/sort bits that need clearing.
     pub fn was_ever_allocated(&self, slot: u32) -> bool {
         slot < self.next_slot.load(Ordering::Relaxed)
+    }
+
+    /// Returns true when no deletes have ever occurred, meaning the alive bitmap
+    /// equals the full set of allocated slots. When true, queries can skip the
+    /// alive AND entirely (saves 0.5-2ms at 104M scale).
+    pub fn all_slots_alive(&self) -> bool {
+        self.all_alive
     }
 
     /// Get a reference to the alive bitmap's base. This is ANDed into every query.
@@ -163,6 +180,7 @@ impl SlotAllocator {
     /// Remove a single slot from the alive bitmap's diff layer.
     pub fn alive_remove_one(&mut self, slot: u32) {
         self.alive.remove(slot);
+        self.all_alive = false;
     }
 
     /// Merge the alive bitmap's diff into its base.

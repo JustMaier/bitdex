@@ -18,6 +18,7 @@
 // approximate top-N sort window?" (approximate, maintained incrementally from writes).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use roaring::RoaringBitmap;
@@ -204,8 +205,8 @@ pub fn canonicalize_with_buckets(
 
 /// A cached entry in the trie.
 struct CacheEntry {
-    /// The cached filter result bitmap.
-    bitmap: RoaringBitmap,
+    /// The cached filter result bitmap (Arc-wrapped to avoid deep clones on lookup).
+    bitmap: Arc<RoaringBitmap>,
     /// Hit count with exponential decay.
     hit_score: f64,
     /// Last access time.
@@ -240,12 +241,12 @@ impl TrieNode {
 
 /// Result of a cache lookup.
 pub enum CacheLookup {
-    /// Exact match with valid bitmap.
-    ExactHit(RoaringBitmap),
+    /// Exact match with valid bitmap (Arc clone — ~1ns, no deep copy).
+    ExactHit(Arc<RoaringBitmap>),
     /// Prefix match: cached bitmap for a prefix of the query.
     /// The second element contains the remaining (uncached) filter clauses.
     PrefixHit {
-        bitmap: RoaringBitmap,
+        bitmap: Arc<RoaringBitmap>,
         matched_prefix_len: usize,
     },
     /// No cache match.
@@ -300,7 +301,7 @@ impl TrieCache {
         }
 
         let mut node = &mut self.root;
-        let mut best_prefix_bitmap: Option<RoaringBitmap> = None;
+        let mut best_prefix_bitmap: Option<Arc<RoaringBitmap>> = None;
         let mut best_prefix_len = 0;
 
         for (i, clause_key) in key.iter().enumerate() {
@@ -337,7 +338,7 @@ impl TrieCache {
     }
 
     /// Store a result bitmap in the cache under the given key.
-    pub fn store(&mut self, key: &CacheKey, bitmap: RoaringBitmap) {
+    pub fn store(&mut self, key: &CacheKey, bitmap: Arc<RoaringBitmap>) {
         if key.is_empty() {
             return;
         }
@@ -523,12 +524,12 @@ mod tests {
         FilterClause::Eq(field.to_string(), Value::Integer(value))
     }
 
-    fn make_bitmap(slots: &[u32]) -> RoaringBitmap {
+    fn make_bitmap(slots: &[u32]) -> Arc<RoaringBitmap> {
         let mut bm = RoaringBitmap::new();
         for &s in slots {
             bm.insert(s);
         }
-        bm
+        Arc::new(bm)
     }
 
     #[test]

@@ -173,39 +173,45 @@ impl<'a> QueryExecutor<'a> {
             cache::canonicalize(&plan.ordered_clauses)
         };
 
-        let filter_bitmap = if let Some(ref key) = cache_key {
+        let filter_arc = if let Some(ref key) = cache_key {
             match cache.lookup(key) {
-                CacheLookup::ExactHit(cached_bitmap) => {
-                    // Cache hit -- use cached bitmap directly
-                    cached_bitmap
+                CacheLookup::ExactHit(cached_arc) => {
+                    // Cache hit — Arc clone (~1ns), no deep copy
+                    cached_arc
                 }
-                CacheLookup::PrefixHit { bitmap: prefix_bitmap, matched_prefix_len } => {
-                    // Partial cache hit -- compute remaining clauses against cached prefix
+                CacheLookup::PrefixHit { bitmap: prefix_arc, matched_prefix_len } => {
+                    // Partial cache hit — compute remaining clauses against cached prefix
                     let remaining = &plan.ordered_clauses[matched_prefix_len..];
-                    let mut result = prefix_bitmap;
+                    let mut result = (*prefix_arc).clone();
                     for clause in remaining {
                         let clause_bitmap = self.evaluate_clause(clause)?;
                         result &= &clause_bitmap;
                     }
                     // Store the full result in cache
-                    cache.store(key, result.clone());
-                    result
+                    let arc = Arc::new(result);
+                    cache.store(key, arc.clone());
+                    arc
                 }
                 CacheLookup::Miss => {
-                    // Full miss -- compute from scratch
+                    // Full miss — compute from scratch
                     let result = self.compute_filters(&plan.ordered_clauses)?;
-                    cache.store(key, result.clone());
-                    result
+                    let arc = Arc::new(result);
+                    cache.store(key, arc.clone());
+                    arc
                 }
             }
         } else {
-            // Uncacheable query (contains compound clauses) -- compute without cache
-            self.compute_filters(&plan.ordered_clauses)?
+            // Uncacheable query (contains compound clauses) — compute without cache
+            Arc::new(self.compute_filters(&plan.ordered_clauses)?)
         };
 
-        // Step 3: AND with alive bitmap (implicit in every query)
-        let alive = self.slots.alive_bitmap();
-        let candidates = &filter_bitmap & alive;
+        // Step 3: AND with alive bitmap — skip when no deletes have occurred
+        let candidates: std::borrow::Cow<RoaringBitmap> = if self.slots.all_slots_alive() {
+            std::borrow::Cow::Borrowed(&filter_arc)
+        } else {
+            let alive = self.slots.alive_bitmap();
+            std::borrow::Cow::Owned(filter_arc.as_ref() & alive)
+        };
 
         let total_matched = candidates.len();
 
@@ -359,7 +365,7 @@ impl<'a> QueryExecutor<'a> {
     /// Used when the caller handles cache interaction separately.
     pub fn execute_from_bitmap(
         &self,
-        filter_bitmap: RoaringBitmap,
+        filter_bitmap: &RoaringBitmap,
         sort: Option<&SortClause>,
         limit: usize,
         cursor: Option<&crate::query::CursorPosition>,
@@ -367,9 +373,13 @@ impl<'a> QueryExecutor<'a> {
     ) -> Result<QueryResult> {
         let limit = limit.min(self.max_page_size);
 
-        // AND with alive bitmap
-        let alive = self.slots.alive_bitmap();
-        let candidates = &filter_bitmap & alive;
+        // AND with alive bitmap — skip when no deletes have occurred (all slots alive)
+        let candidates: std::borrow::Cow<RoaringBitmap> = if self.slots.all_slots_alive() {
+            std::borrow::Cow::Borrowed(filter_bitmap)
+        } else {
+            let alive = self.slots.alive_bitmap();
+            std::borrow::Cow::Owned(filter_bitmap & alive)
+        };
         let total_matched = candidates.len();
 
         // Sort and paginate
@@ -646,40 +656,44 @@ impl<'a> QueryExecutor<'a> {
         cursor: Option<&crate::query::CursorPosition>,
         ascending: bool,
     ) -> (Vec<i64>, Option<crate::query::CursorPosition>) {
-        let effective = if let Some(cursor) = cursor {
+        if let Some(cursor) = cursor {
+            // Cursor path: clone and narrow
             let mut narrowed = candidates.clone();
             if ascending {
-                // Remove slots <= cursor_slot_id (want strictly greater for asc)
                 narrowed.remove_range(0..=cursor.slot_id);
             } else {
-                // Remove slots >= cursor_slot_id (want strictly less for desc)
                 narrowed.remove_range(cursor.slot_id..=u32::MAX);
             }
-            narrowed
+            if narrowed.is_empty() {
+                return (Vec::new(), None);
+            }
+            let ids: Vec<i64> = if ascending {
+                narrowed.iter().take(limit).map(|s| s as i64).collect()
+            } else {
+                narrowed.iter().rev().take(limit).map(|s| s as i64).collect()
+            };
+            let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
+                sort_value: 0,
+                slot_id: last_id as u32,
+            });
+            (ids, next_cursor)
         } else {
-            candidates.clone()
-        };
-
-        if effective.is_empty() {
-            return (Vec::new(), None);
+            // No cursor: iterate candidates directly (no clone needed)
+            if candidates.is_empty() {
+                return (Vec::new(), None);
+            }
+            let ids: Vec<i64> = if ascending {
+                candidates.iter().take(limit).map(|s| s as i64).collect()
+            } else {
+                // O(limit) via DoubleEndedIterator instead of O(N) skip
+                candidates.iter().rev().take(limit).map(|s| s as i64).collect()
+            };
+            let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
+                sort_value: 0,
+                slot_id: last_id as u32,
+            });
+            (ids, next_cursor)
         }
-
-        let ids: Vec<i64> = if ascending {
-            // Take first `limit` slots (lowest slot IDs = oldest)
-            effective.iter().take(limit).map(|s| s as i64).collect()
-        } else {
-            // Take last `limit` slots (highest slot IDs = newest), reverse
-            let total = effective.len() as usize;
-            let skip = total.saturating_sub(limit);
-            let slots: Vec<u32> = effective.iter().skip(skip).collect();
-            slots.iter().rev().map(|&s| s as i64).collect()
-        };
-
-        let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
-            sort_value: 0,
-            slot_id: last_id as u32,
-        });
-        (ids, next_cursor)
     }
 
     /// Sort candidates using bitmap sort layer traversal.
