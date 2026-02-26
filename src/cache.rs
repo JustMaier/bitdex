@@ -24,6 +24,7 @@ use std::time::Instant;
 use roaring::RoaringBitmap;
 
 use crate::config::CacheConfig;
+use crate::meta_index::{CacheEntryId, MetaIndex};
 use crate::query::{FilterClause, Value};
 
 /// A single canonicalized filter clause key component.
@@ -214,6 +215,8 @@ struct CacheEntry {
     /// Generation counters at the time this entry was cached.
     /// Maps field name -> generation at cache time.
     field_generations: HashMap<String, u64>,
+    /// Meta-index entry ID for this cache entry (used for live updates).
+    meta_id: Option<CacheEntryId>,
 }
 
 /// A trie node in the cache.
@@ -280,6 +283,10 @@ pub struct TrieCache {
     config: CacheConfig,
     /// Total number of cached entries.
     entry_count: usize,
+    /// Meta-index for O(1) lookup of cache entries by clause during live updates.
+    meta: MetaIndex,
+    /// Reverse map: meta_id → cache key path (for live update traversal).
+    id_to_key: HashMap<CacheEntryId, CacheKey>,
 }
 
 impl TrieCache {
@@ -289,6 +296,8 @@ impl TrieCache {
             field_generations: HashMap::new(),
             config,
             entry_count: 0,
+            meta: MetaIndex::new(),
+            id_to_key: HashMap::new(),
         }
     }
 
@@ -350,6 +359,17 @@ impl TrieCache {
 
         let field_gens = self.current_field_generations(key);
 
+        // Register with meta-index for live update lookups.
+        // Only register Eq clauses (NotEq/In fall back to invalidation).
+        let should_register = key.iter().all(|c| c.op == "eq");
+        let meta_id = if should_register {
+            let id = self.meta.register(key, None, None);
+            self.id_to_key.insert(id, key.clone());
+            Some(id)
+        } else {
+            None
+        };
+
         let mut node = &mut self.root;
         for clause_key in key {
             node = node
@@ -358,12 +378,21 @@ impl TrieCache {
                 .or_insert_with(TrieNode::new);
         }
 
+        // Deregister old entry's meta-id if replacing
+        if let Some(old_entry) = &node.entry {
+            if let Some(old_id) = old_entry.meta_id {
+                self.meta.deregister(old_id);
+                self.id_to_key.remove(&old_id);
+            }
+        }
+
         let was_none = node.entry.is_none();
         node.entry = Some(CacheEntry {
             bitmap,
             hit_score: 1.0,
             last_access: Instant::now(),
             field_generations: field_gens,
+            meta_id,
         });
 
         if was_none {
@@ -383,11 +412,67 @@ impl TrieCache {
         self.field_generations.get(field).copied().unwrap_or(0)
     }
 
+    /// Access the meta-index (for live update clause lookups).
+    pub fn meta(&self) -> &MetaIndex {
+        &self.meta
+    }
+
+    /// Live-update a cache entry by its meta-index ID.
+    ///
+    /// Inserts or removes a slot from the entry's bitmap. Uses Arc::make_mut()
+    /// which only deep-clones if refcount > 1 (typically = 1 during flush since
+    /// readers hold the previous snapshot's Arc).
+    pub fn update_entry_by_id(&mut self, id: CacheEntryId, slot: u32, is_insert: bool) {
+        let Some(key) = self.id_to_key.get(&id).cloned() else { return };
+        // Traverse trie to find the entry
+        let mut node = &mut self.root;
+        for clause_key in &key {
+            node = match node.children.get_mut(clause_key) {
+                Some(child) => child,
+                None => return,
+            };
+        }
+        let Some(entry) = &mut node.entry else { return };
+        // Verify the entry is still valid (not stale from generation mismatch)
+        if !is_entry_valid(&self.field_generations, &entry.field_generations) {
+            return;
+        }
+        let bm = Arc::make_mut(&mut entry.bitmap);
+        if is_insert {
+            bm.insert(slot);
+        } else {
+            bm.remove(slot);
+        }
+    }
+
+    /// Advance a live-updated entry's stored generation for a field to match the
+    /// current generation. Called after live-updating an entry so that subsequent
+    /// generation bumps (for non-Eq invalidation) don't falsely invalidate it.
+    pub fn refresh_entry_generation(&mut self, id: CacheEntryId, field: &str) {
+        let Some(key) = self.id_to_key.get(&id).cloned() else { return };
+        let mut node = &mut self.root;
+        for clause_key in &key {
+            node = match node.children.get_mut(clause_key) {
+                Some(child) => child,
+                None => return,
+            };
+        }
+        if let Some(entry) = &mut node.entry {
+            let current_gen = self.field_generations.get(field).copied().unwrap_or(0);
+            entry.field_generations.insert(field.to_string(), current_gen);
+        }
+    }
+
     /// Run the promotion/demotion cycle.
     /// Applies decay to all hit scores and evicts entries below a threshold.
     pub fn maintenance_cycle(&mut self) {
         let decay_rate = self.config.decay_rate;
-        Self::decay_node(&mut self.root, decay_rate, &mut self.entry_count);
+        let mut evicted_meta_ids = Vec::new();
+        Self::decay_node(&mut self.root, decay_rate, &mut self.entry_count, &mut evicted_meta_ids);
+        for id in evicted_meta_ids {
+            self.meta.deregister(id);
+            self.id_to_key.remove(&id);
+        }
     }
 
     /// Get the number of cached entries.
@@ -422,6 +507,8 @@ impl TrieCache {
     pub fn clear(&mut self) {
         self.root = TrieNode::new();
         self.entry_count = 0;
+        self.meta = MetaIndex::new();
+        self.id_to_key.clear();
     }
 
     /// Get the current field generations for the fields referenced in a cache key.
@@ -477,17 +564,23 @@ impl TrieCache {
                 None => return,
             };
         }
-        if node.entry.is_some() {
-            node.entry = None;
+        if let Some(entry) = node.entry.take() {
+            if let Some(id) = entry.meta_id {
+                self.meta.deregister(id);
+                self.id_to_key.remove(&id);
+            }
             self.entry_count -= 1;
         }
     }
 
     /// Recursively decay hit scores and remove entries with near-zero scores.
-    fn decay_node(node: &mut TrieNode, decay_rate: f64, entry_count: &mut usize) {
+    fn decay_node(node: &mut TrieNode, decay_rate: f64, entry_count: &mut usize, evicted_meta_ids: &mut Vec<CacheEntryId>) {
         if let Some(entry) = &mut node.entry {
             entry.hit_score *= decay_rate;
             if entry.hit_score < 0.01 {
+                if let Some(id) = entry.meta_id {
+                    evicted_meta_ids.push(id);
+                }
                 node.entry = None;
                 *entry_count -= 1;
             }
@@ -496,7 +589,7 @@ impl TrieCache {
         // Process children, collecting empty ones to clean up
         let mut empty_children = Vec::new();
         for (key, child) in node.children.iter_mut() {
-            Self::decay_node(child, decay_rate, entry_count);
+            Self::decay_node(child, decay_rate, entry_count, evicted_meta_ids);
             if child.entry.is_none() && child.children.is_empty() {
                 empty_children.push(key.clone());
             }
@@ -1091,5 +1184,171 @@ mod tests {
         let key_plain = canonicalize(&clauses).unwrap();
         let key_buckets = canonicalize_with_buckets(&clauses, None, 0).unwrap();
         assert_eq!(key_plain, key_buckets);
+    }
+
+    // === Live update tests ===
+
+    #[test]
+    fn test_live_update_insert_slot() {
+        let mut cache = TrieCache::new(make_config(100));
+        let clauses = vec![eq_clause("nsfwLevel", 1)];
+        let key = canonicalize(&clauses).unwrap();
+
+        // Store a bitmap with slots [10, 20, 30]
+        cache.store(&key, make_bitmap(&[10, 20, 30]));
+
+        // The entry should have a meta_id since it's all Eq clauses
+        let meta_ids: Vec<u32> = cache.meta().entries_for_clause("nsfwLevel", "eq", "1")
+            .map(|bm| bm.iter().collect())
+            .unwrap_or_default();
+        assert_eq!(meta_ids.len(), 1);
+
+        // Live-update: insert slot 40
+        cache.update_entry_by_id(meta_ids[0], 40, true);
+
+        // Verify the entry now contains slot 40
+        match cache.lookup(&key) {
+            CacheLookup::ExactHit(bm) => {
+                assert!(bm.contains(10));
+                assert!(bm.contains(40));
+                assert_eq!(bm.len(), 4);
+            }
+            _ => panic!("Expected exact hit"),
+        }
+    }
+
+    #[test]
+    fn test_live_update_remove_slot() {
+        let mut cache = TrieCache::new(make_config(100));
+        let clauses = vec![eq_clause("nsfwLevel", 1)];
+        let key = canonicalize(&clauses).unwrap();
+
+        cache.store(&key, make_bitmap(&[10, 20, 30]));
+
+        let meta_ids: Vec<u32> = cache.meta().entries_for_clause("nsfwLevel", "eq", "1")
+            .map(|bm| bm.iter().collect())
+            .unwrap_or_default();
+
+        // Live-update: remove slot 20
+        cache.update_entry_by_id(meta_ids[0], 20, false);
+
+        match cache.lookup(&key) {
+            CacheLookup::ExactHit(bm) => {
+                assert!(bm.contains(10));
+                assert!(!bm.contains(20));
+                assert!(bm.contains(30));
+                assert_eq!(bm.len(), 2);
+            }
+            _ => panic!("Expected exact hit"),
+        }
+    }
+
+    #[test]
+    fn test_live_update_survives_generation_bump_with_refresh() {
+        let mut cache = TrieCache::new(make_config(100));
+        let clauses = vec![eq_clause("nsfwLevel", 1)];
+        let key = canonicalize(&clauses).unwrap();
+
+        cache.store(&key, make_bitmap(&[10, 20]));
+
+        let meta_ids: Vec<u32> = cache.meta().entries_for_clause("nsfwLevel", "eq", "1")
+            .map(|bm| bm.iter().collect())
+            .unwrap_or_default();
+        let id = meta_ids[0];
+
+        // Live-update
+        cache.update_entry_by_id(id, 30, true);
+
+        // Bump generation (simulates non-Eq invalidation)
+        cache.invalidate_field("nsfwLevel");
+
+        // Refresh the entry's generation
+        cache.refresh_entry_generation(id, "nsfwLevel");
+
+        // Entry should still be valid
+        match cache.lookup(&key) {
+            CacheLookup::ExactHit(bm) => {
+                assert_eq!(bm.len(), 3);
+                assert!(bm.contains(30));
+            }
+            _ => panic!("Expected exact hit after refresh"),
+        }
+    }
+
+    #[test]
+    fn test_non_eq_entry_not_registered_in_meta() {
+        let mut cache = TrieCache::new(make_config(100));
+        // NotEq clause — should NOT be registered in meta-index
+        let clauses = vec![FilterClause::NotEq("nsfwLevel".to_string(), Value::Integer(28))];
+        let key = canonicalize(&clauses).unwrap();
+
+        cache.store(&key, make_bitmap(&[10, 20]));
+
+        // Meta-index should have no entries for "neq"
+        assert!(cache.meta().entries_for_clause("nsfwLevel", "neq", "28").is_none());
+        assert_eq!(cache.meta().entry_count(), 0);
+    }
+
+    #[test]
+    fn test_meta_deregister_on_eviction() {
+        let mut cache = TrieCache::new(make_config(2)); // max 2 entries
+        let key1 = canonicalize(&[eq_clause("nsfwLevel", 1)]).unwrap();
+        let key2 = canonicalize(&[eq_clause("nsfwLevel", 2)]).unwrap();
+        let key3 = canonicalize(&[eq_clause("userId", 42)]).unwrap();
+
+        cache.store(&key1, make_bitmap(&[10]));
+        cache.store(&key2, make_bitmap(&[20]));
+        assert_eq!(cache.meta().entry_count(), 2);
+
+        // Storing a third entry triggers LRU eviction
+        cache.store(&key3, make_bitmap(&[30]));
+        assert_eq!(cache.len(), 2);
+        // Meta-index should also have exactly 2 entries
+        assert_eq!(cache.meta().entry_count(), 2);
+    }
+
+    #[test]
+    fn test_meta_deregister_on_decay() {
+        let mut cache = TrieCache::new(CacheConfig {
+            max_entries: 100,
+            decay_rate: 0.001, // aggressive decay — entries die quickly
+            ..Default::default()
+        });
+        let key = canonicalize(&[eq_clause("nsfwLevel", 1)]).unwrap();
+        cache.store(&key, make_bitmap(&[10]));
+        assert_eq!(cache.meta().entry_count(), 1);
+
+        // Run maintenance to decay the entry below threshold
+        cache.maintenance_cycle();
+        cache.maintenance_cycle();
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.meta().entry_count(), 0);
+    }
+
+    #[test]
+    fn test_live_update_stale_entry_skipped() {
+        let mut cache = TrieCache::new(make_config(100));
+        let clauses = vec![eq_clause("nsfwLevel", 1)];
+        let key = canonicalize(&clauses).unwrap();
+
+        cache.store(&key, make_bitmap(&[10, 20]));
+
+        let meta_ids: Vec<u32> = cache.meta().entries_for_clause("nsfwLevel", "eq", "1")
+            .map(|bm| bm.iter().collect())
+            .unwrap_or_default();
+        let id = meta_ids[0];
+
+        // Bump generation WITHOUT refresh — entry is now stale
+        cache.invalidate_field("nsfwLevel");
+
+        // Live-update should be skipped (entry is stale)
+        cache.update_entry_by_id(id, 30, true);
+
+        // Lookup should miss (stale generation)
+        match cache.lookup(&key) {
+            CacheLookup::Miss => {} // correct — stale entry discarded
+            _ => panic!("Expected miss for stale entry"),
+        }
     }
 }

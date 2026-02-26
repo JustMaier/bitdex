@@ -48,9 +48,9 @@ pub enum MutationOp {
 
 /// Key for grouping filter operations by target bitmap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FilterGroupKey {
-    field: Arc<str>,
-    value: u64,
+pub struct FilterGroupKey {
+    pub field: Arc<str>,
+    pub value: u64,
 }
 
 /// Key for grouping sort operations by target bit layer.
@@ -471,6 +471,25 @@ impl WriteCoalescer {
     /// Used by D3 live bound maintenance.
     pub fn mutated_sort_slots(&self) -> HashMap<&str, HashSet<u32>> {
         self.batch.mutated_sort_slots()
+    }
+
+    /// Returns the alive insert slots from the prepared batch.
+    /// Used for slot-based bound live maintenance: new slots are monotonically
+    /// increasing and always qualify for descending slot bounds.
+    pub fn alive_inserts(&self) -> &[u32] {
+        &self.batch.alive_inserts
+    }
+
+    /// Returns the filter insert entries from the prepared batch.
+    /// Used by trie cache live updates to insert mutated slots into matching entries.
+    pub fn filter_insert_entries(&self) -> &HashMap<FilterGroupKey, Vec<u32>> {
+        &self.batch.filter_inserts
+    }
+
+    /// Returns the filter remove entries from the prepared batch.
+    /// Used by trie cache live updates to remove mutated slots from matching entries.
+    pub fn filter_remove_entries(&self) -> &HashMap<FilterGroupKey, Vec<u32>> {
+        &self.batch.filter_removes
     }
 }
 

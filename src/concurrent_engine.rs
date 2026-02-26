@@ -332,6 +332,28 @@ impl ConcurrentEngine {
                                 }
                             }
 
+                            // Live maintenance for slot-based bounds: newly-alive slots
+                            // are monotonically increasing and always qualify for Desc bounds.
+                            {
+                                let alive_inserts = coalescer.alive_inserts();
+                                if !alive_inserts.is_empty() {
+                                    let mut bc = flush_bound_cache.lock();
+                                    let slot_bound_keys = bc.bounds_for_sort_field("__slot__");
+                                    for bound_key in &slot_bound_keys {
+                                        if let Some(entry) = bc.get_mut(bound_key) {
+                                            if !entry.needs_rebuild() {
+                                                for &slot in alive_inserts {
+                                                    // New slots are always > min_tracked for Desc
+                                                    if slot > entry.min_tracked_value() {
+                                                        entry.add_slot(slot);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // Route Tier 2 mutations to PendingBuffer and invalidate moka cache
                             if !tier2_mutations.is_empty() {
                                 let mut p = flush_pending.lock();
@@ -353,11 +375,10 @@ impl ConcurrentEngine {
                                 }
                             }
 
-                            // Targeted cache invalidation: only invalidate fields that actually changed.
-                            // Sort-only flushes (e.g., reactionCount updates) skip invalidation entirely.
+                            // Cache maintenance: live updates for Eq entries, invalidation for the rest.
                             if coalescer.has_alive_mutations() {
                                 // Alive changed — invalidate all filter fields because NotEq/Not
-                                // bake alive into cached results.
+                                // bake alive into cached results. Live update can't fix this.
                                 let mut c = cache.lock();
                                 for name in &field_names {
                                     c.invalidate_field(name);
@@ -370,11 +391,54 @@ impl ConcurrentEngine {
                                     }
                                 }
                             } else {
+                                // Live update: insert/remove mutated slots into matching Eq cache entries.
+                                // Non-Eq entries (NotEq, In) are not registered in the meta-index and
+                                // fall back to field-level generation-counter invalidation.
                                 let changed = coalescer.mutated_filter_fields();
                                 if !changed.is_empty() {
                                     let mut c = cache.lock();
+
+                                    // Collect all live-updated (entry_id, field) pairs for generation refresh
+                                    let mut live_updated: Vec<(u32, String)> = Vec::new();
+
+                                    // Live-update Eq cache entries with inserted slots
+                                    for (filter_key, inserted_slots) in coalescer.filter_insert_entries() {
+                                        let value_repr = filter_key.value.to_string();
+                                        let ids: Vec<u32> = c.meta().entries_for_clause(&filter_key.field, "eq", &value_repr)
+                                            .map(|bm| bm.iter().collect())
+                                            .unwrap_or_default();
+                                        for id in &ids {
+                                            for &slot in inserted_slots {
+                                                c.update_entry_by_id(*id, slot, true);
+                                            }
+                                            live_updated.push((*id, filter_key.field.to_string()));
+                                        }
+                                    }
+
+                                    // Live-update Eq cache entries with removed slots
+                                    for (filter_key, removed_slots) in coalescer.filter_remove_entries() {
+                                        let value_repr = filter_key.value.to_string();
+                                        let ids: Vec<u32> = c.meta().entries_for_clause(&filter_key.field, "eq", &value_repr)
+                                            .map(|bm| bm.iter().collect())
+                                            .unwrap_or_default();
+                                        for id in &ids {
+                                            for &slot in removed_slots {
+                                                c.update_entry_by_id(*id, slot, false);
+                                            }
+                                            live_updated.push((*id, filter_key.field.to_string()));
+                                        }
+                                    }
+
+                                    // Invalidate all changed fields (bumps generation counter).
+                                    // This invalidates non-Eq entries (NotEq, In, range).
                                     for name in &changed {
                                         c.invalidate_field(name);
+                                    }
+
+                                    // Refresh generations on live-updated Eq entries so the
+                                    // generation bump doesn't falsely invalidate them.
+                                    for (id, field) in &live_updated {
+                                        c.refresh_entry_generation(*id, field);
                                     }
                                 }
                             }
@@ -821,15 +885,30 @@ impl ConcurrentEngine {
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, filters)?;
 
-        // D5: Narrow filter bitmap with bound cache for sort queries
+        // D5: Narrow filter bitmap with bound cache.
+        // Synthesize implicit "__slot__" sort for filter-only queries so they
+        // benefit from slot-based bounds (newest-first = sort by slot desc).
+        let implicit_sort;
+        let bound_sort = match sort {
+            Some(s) => Some(s),
+            None => {
+                implicit_sort = SortClause {
+                    field: "__slot__".to_string(),
+                    direction: SortDirection::Desc,
+                };
+                Some(&implicit_sort)
+            }
+        };
         let (effective_bitmap, use_simple, cache_key) =
-            self.apply_bound(&executor, &filter_arc, use_simple_sort, sort, filters, None);
+            self.apply_bound(&executor, &filter_arc, use_simple_sort, bound_sort, filters, None);
 
+        // Execute with ORIGINAL sort (None for filter-only) — bound narrows candidates,
+        // but slot-order pagination is used for filter-only queries.
         let mut result =
             executor.execute_from_bitmap(&effective_bitmap, sort, limit, None, use_simple)?;
 
-        // D2: Form or update bound from sort results
-        self.update_bound_from_results(&snap, sort, &cache_key, &result.ids, None);
+        // D2: Form or update bound from results (slot-based for filter-only)
+        self.update_bound_from_results(&snap, bound_sort, &cache_key, &result.ids, None);
 
         // Post-validation against in-flight writes
         self.post_validate(&mut result, filters, &executor)?;
@@ -872,16 +951,29 @@ impl ConcurrentEngine {
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, &query.filters)?;
 
-        // D5: Narrow filter bitmap with bound cache for sort queries
+        // D5: Narrow filter bitmap with bound cache.
+        // Synthesize implicit "__slot__" sort for filter-only queries.
+        let implicit_sort;
+        let bound_sort = match query.sort.as_ref() {
+            Some(s) => Some(s),
+            None => {
+                implicit_sort = SortClause {
+                    field: "__slot__".to_string(),
+                    direction: SortDirection::Desc,
+                };
+                Some(&implicit_sort)
+            }
+        };
         let (effective_bitmap, use_simple, cache_key) = self.apply_bound(
             &executor,
             &filter_arc,
             use_simple_sort,
-            query.sort.as_ref(),
+            bound_sort,
             &query.filters,
             query.cursor.as_ref(),
         );
 
+        // Execute with ORIGINAL sort — bound narrows candidates only.
         let mut result = executor.execute_from_bitmap(
             &effective_bitmap,
             query.sort.as_ref(),
@@ -890,10 +982,10 @@ impl ConcurrentEngine {
             use_simple,
         )?;
 
-        // D2/D6: Form or update bound from sort results (with cursor for tiered bounds)
+        // D2/D6: Form or update bound from results (with cursor for tiered bounds)
         self.update_bound_from_results(
             &snap,
-            query.sort.as_ref(),
+            bound_sort,
             &cache_key,
             &result.ids,
             query.cursor.as_ref(),
@@ -1076,6 +1168,7 @@ impl ConcurrentEngine {
 
     /// D2/D6: Form or update a bound from sort query results.
     /// With cursor awareness: if a cursor was past tier 0's range, form a tiered bound.
+    /// Supports "__slot__" pseudo-sort where sort value = slot ID.
     fn update_bound_from_results(
         &self,
         snap: &Guard<Arc<InnerEngine>>,
@@ -1088,13 +1181,18 @@ impl ConcurrentEngine {
         let Some(ref filter_key) = cache_key else { return };
         if result_ids.is_empty() { return; }
 
-        let sort_field = match snap.sorts.get_field(&sort_clause.field) {
-            Some(f) => f,
-            None => return,
+        // Determine value function: slot-based or sort-field-based
+        let is_slot_sort = sort_clause.field == "__slot__";
+        let sort_field = if is_slot_sort {
+            None
+        } else {
+            match snap.sorts.get_field(&sort_clause.field) {
+                Some(f) => Some(f),
+                None => return,
+            }
         };
 
         // D6: Determine which tier to form/update.
-        // If there's a cursor, check which tier the cursor falls past.
         let tier = if let Some(c) = cursor {
             let cursor_val = c.sort_value as u32;
             let mut t = 0u32;
@@ -1113,7 +1211,7 @@ impl ConcurrentEngine {
                     };
                     if past {
                         t += 1;
-                        if t >= 4 { break; } // cap tiers
+                        if t >= 4 { break; }
                         continue;
                     }
                 }
@@ -1134,13 +1232,22 @@ impl ConcurrentEngine {
 
         let sorted_slots: Vec<u32> = result_ids.iter().map(|&id| id as u32).collect();
 
+        // Value function: for __slot__ sort, value = slot ID itself
+        let value_fn = |slot: u32| -> u32 {
+            if is_slot_sort {
+                slot
+            } else {
+                sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+            }
+        };
+
         let mut bc = self.bound_cache.lock();
         if let Some(entry) = bc.get_mut(&bound_key) {
             if entry.needs_rebuild() {
-                entry.rebuild(&sorted_slots, |slot| sort_field.reconstruct_value(slot));
+                entry.rebuild(&sorted_slots, &value_fn);
             }
         } else {
-            bc.form_bound(bound_key, &sorted_slots, |slot| sort_field.reconstruct_value(slot));
+            bc.form_bound(bound_key, &sorted_slots, &value_fn);
         }
     }
 
@@ -3268,5 +3375,164 @@ mod tests {
                 "ascending sort should be 100, 300, 500 after restore"
             );
         }
+    }
+
+    // === Slot-based bound tests ===
+
+    #[test]
+    fn test_filter_only_query_forms_slot_bound() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert documents
+        for i in 1..=20u32 {
+            engine.put(
+                i,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 10))),
+                ]),
+            ).unwrap();
+        }
+        wait_for_flush(&engine, 20, 500);
+
+        // Run a filter-only query — should form a __slot__ bound
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            10,
+        ).unwrap();
+
+        // Results should be in descending slot order (newest first)
+        assert_eq!(result.ids.len(), 10);
+        assert_eq!(result.ids[0], 20);
+        assert_eq!(result.ids[9], 11);
+
+        // Second query should benefit from the bound (correctness check)
+        let result2 = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            10,
+        ).unwrap();
+        assert_eq!(result.ids, result2.ids);
+    }
+
+    #[test]
+    fn test_filter_only_cursor_has_sort_value() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        for i in 1..=30u32 {
+            engine.put(
+                i,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
+                ]),
+            ).unwrap();
+        }
+        wait_for_flush(&engine, 30, 500);
+
+        // First page
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            10,
+        ).unwrap();
+        assert_eq!(result.ids.len(), 10);
+        assert_eq!(result.ids[0], 30);
+
+        // Cursor should have sort_value = last slot ID
+        let cursor = result.cursor.as_ref().expect("should have cursor");
+        assert_eq!(cursor.slot_id as i64, result.ids[9]);
+        assert_eq!(cursor.sort_value, result.ids[9] as u64, "sort_value should equal slot ID");
+    }
+
+    #[test]
+    fn test_slot_bound_live_maintenance_on_insert() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert initial docs
+        for i in 1..=10u32 {
+            engine.put(
+                i,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
+                ]),
+            ).unwrap();
+        }
+        wait_for_flush(&engine, 10, 500);
+
+        // Form a slot bound via filter-only query
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            10,
+        ).unwrap();
+        assert_eq!(result.ids[0], 10);
+
+        // Insert a new doc — slot 11 should be live-maintained into the bound
+        engine.put(
+            11,
+            &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                ("reactionCount", FieldValue::Single(Value::Integer(110))),
+            ]),
+        ).unwrap();
+        wait_for_flush(&engine, 11, 500);
+
+        // Next query should see the new doc at the top
+        let result2 = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            10,
+        ).unwrap();
+        assert_eq!(result2.ids[0], 11, "Newly inserted doc should be first (highest slot)");
+        assert_eq!(result2.ids.len(), 10);
+    }
+
+    // === Trie cache live update tests ===
+
+    #[test]
+    fn test_cache_live_update_on_insert() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert docs so cache has data
+        for i in 1..=5u32 {
+            engine.put(
+                i,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 100))),
+                ]),
+            ).unwrap();
+        }
+        wait_for_flush(&engine, 5, 500);
+
+        // Warm the cache with a query
+        let r1 = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            100,
+        ).unwrap();
+        assert_eq!(r1.total_matched, 5);
+
+        // Insert another nsfwLevel=1 doc
+        engine.put(
+            6,
+            &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                ("reactionCount", FieldValue::Single(Value::Integer(600))),
+            ]),
+        ).unwrap();
+        wait_for_flush(&engine, 6, 500);
+
+        // Query again — cache should be live-updated, not cold
+        let r2 = engine.query(
+            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            None,
+            100,
+        ).unwrap();
+        assert_eq!(r2.total_matched, 6, "live-updated cache should include new doc");
+        assert!(r2.ids.contains(&6), "new doc should be in results");
     }
 }

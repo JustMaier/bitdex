@@ -673,7 +673,8 @@ impl<'a> QueryExecutor<'a> {
                 narrowed.iter().rev().take(limit).map(|s| s as i64).collect()
             };
             let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
-                sort_value: 0,
+                // Set sort_value = slot ID so apply_bound cursor-past-bound works for slot bounds
+                sort_value: last_id as u64,
                 slot_id: last_id as u32,
             });
             (ids, next_cursor)
@@ -689,7 +690,8 @@ impl<'a> QueryExecutor<'a> {
                 candidates.iter().rev().take(limit).map(|s| s as i64).collect()
             };
             let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
-                sort_value: 0,
+                // Set sort_value = slot ID so apply_bound cursor-past-bound works for slot bounds
+                sort_value: last_id as u64,
                 slot_id: last_id as u32,
             });
             (ids, next_cursor)

@@ -284,6 +284,18 @@ impl MetaIndex {
         result
     }
 
+    /// Find all entry IDs that reference a specific clause (field+op+value).
+    ///
+    /// Used by trie cache live updates: when (field, eq, value) is mutated, find
+    /// all cache entries whose filter key includes that exact clause.
+    pub fn entries_for_clause(&self, field: &str, op: &str, value_repr: &str) -> Option<&RoaringBitmap> {
+        self.clause_bitmaps.get(&ClauseKey {
+            field: field.to_string(),
+            op: op.to_string(),
+            value_repr: value_repr.to_string(),
+        })
+    }
+
     /// Number of registered entries.
     pub fn entry_count(&self) -> usize {
         self.registrations.len()
