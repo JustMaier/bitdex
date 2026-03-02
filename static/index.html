@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BitDex V2</title>
+<style>
+  :root {
+    --bg: #0a0e14; --surface: #12171f; --surface-2: #1a2030; --border: #252d3a;
+    --text: #e2e8f0; --text-dim: #64748b; --text-muted: #475569;
+    --accent: #3b82f6; --accent-hover: #60a5fa; --accent-glow: rgba(59,130,246,0.15);
+    --success: #22c55e; --error: #ef4444; --orange: #f59e0b;
+    --card-bg: #151c28; --card-hover: #1c2536;
+    --header-h: 48px; --filter-h: auto;
+    --radius: 8px; --radius-lg: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+    overflow-y: scroll;
+  }
+
+  /* ── Fixed Header ── */
+  .header {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(12px);
+  }
+  .header-bar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 0 20px; height: var(--header-h);
+  }
+  .logo { font-size: 15px; font-weight: 700; letter-spacing: -0.5px; white-space: nowrap; }
+  .logo span { color: var(--accent); }
+  .stats-row {
+    display: flex; gap: 16px; font-size: 12px; color: var(--text-dim);
+    font-variant-numeric: tabular-nums; flex: 1; justify-content: flex-start;
+    overflow: hidden;
+  }
+  .stat-item b { color: var(--text); font-weight: 600; }
+  .stat-item .timing { color: var(--success); font-weight: 700; }
+  .stat-item .matched { color: var(--orange); font-weight: 600; }
+  .header-actions { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+  .toggle-btn {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text-dim); font-size: 12px; padding: 4px 10px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .toggle-btn:hover { border-color: var(--accent); color: var(--text); }
+  .toggle-btn.active { background: var(--accent-glow); border-color: var(--accent); color: var(--accent); }
+
+  /* ── Filter Panel ── */
+  .filter-panel {
+    position: fixed; top: var(--header-h); left: 0; right: 0; z-index: 90;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    overflow: hidden; transition: max-height 0.3s ease, padding 0.3s ease;
+    max-height: 300px; padding: 12px 20px;
+  }
+  .filter-panel.collapsed { max-height: 0; padding: 0 20px; }
+  .filter-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px;
+  }
+  .field {
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .field label {
+    font-size: 10px; font-weight: 600; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .field select, .field input {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 5px 8px; font-size: 12px; outline: none;
+    transition: border-color 0.15s;
+  }
+  .field select:focus, .field input:focus { border-color: var(--accent); }
+  .field input::placeholder { color: var(--text-muted); }
+
+  .sort-row {
+    display: flex; gap: 8px; margin-top: 8px; align-items: end; flex-wrap: wrap;
+  }
+  .sort-row .field { min-width: 140px; }
+
+  /* ── Content Area ── */
+  .content {
+    padding-top: calc(var(--header-h) + 12px);
+    min-height: 100vh;
+    transition: padding-top 0.3s ease;
+  }
+  .content.filters-open { padding-top: calc(var(--header-h) + 160px); }
+
+  /* ── Image Grid ── */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px;
+    padding: 8px 16px;
+  }
+  .card {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius);
+    overflow: hidden; cursor: pointer; transition: all 0.2s;
+    position: relative;
+  }
+  .card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+  .card-img {
+    width: 100%; aspect-ratio: 1; object-fit: cover;
+    background: var(--surface-2); display: block;
+  }
+  .card-img.placeholder {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 32px; color: var(--text-muted); aspect-ratio: 1;
+  }
+  .card-meta {
+    padding: 6px 8px; font-size: 11px; color: var(--text-dim);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .card-meta .reactions { color: var(--orange); font-weight: 600; }
+  .card-meta .slot-id { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .card-badge {
+    position: absolute; top: 6px; right: 6px;
+    background: rgba(0,0,0,0.7); border-radius: 4px;
+    padding: 2px 6px; font-size: 10px; color: var(--text-dim);
+    backdrop-filter: blur(4px);
+  }
+  .card-dims {
+    position: absolute; top: 6px; left: 6px;
+    background: rgba(0,0,0,0.7); border-radius: 4px;
+    padding: 2px 6px; font-size: 10px; color: var(--text-dim);
+    backdrop-filter: blur(4px);
+  }
+
+  /* ── Detail Modal ── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,0.8); backdrop-filter: blur(4px);
+    align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+    max-width: 900px; width: 95vw; max-height: 90vh; overflow-y: auto;
+    display: flex; flex-direction: column;
+  }
+  .modal-img { width: 100%; max-height: 60vh; object-fit: contain; background: var(--bg); }
+  .modal-body { padding: 16px; }
+  .modal-body h3 { font-size: 14px; margin-bottom: 8px; }
+  .modal-fields {
+    display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+    font-size: 12px;
+  }
+  .modal-fields dt { color: var(--text-dim); font-weight: 500; }
+  .modal-fields dd { color: var(--text); word-break: break-all; }
+  .modal-close {
+    position: absolute; top: 12px; right: 12px;
+    background: rgba(0,0,0,0.6); border: none; border-radius: 50%;
+    width: 32px; height: 32px; color: #fff; font-size: 18px; cursor: pointer;
+  }
+
+  /* ── Raw JSON Toggle ── */
+  .raw-panel {
+    display: none; padding: 8px 16px;
+  }
+  .raw-panel.open { display: block; }
+  .raw-panel textarea {
+    width: 100%; min-height: 100px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px; padding: 8px; resize: vertical; outline: none;
+  }
+  .raw-panel textarea:focus { border-color: var(--accent); }
+  .raw-actions { display: flex; gap: 8px; margin-top: 6px; }
+  .raw-actions button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 4px 14px; font-size: 12px; cursor: pointer;
+  }
+
+  /* ── Loading / Scroll sentinel ── */
+  .scroll-sentinel { height: 1px; }
+  .load-more-indicator {
+    text-align: center; padding: 20px; color: var(--text-dim); font-size: 13px;
+  }
+  .error-toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--error); color: #fff; padding: 8px 20px; border-radius: 8px;
+    font-size: 13px; z-index: 300; display: none;
+  }
+  .error-toast.show { display: block; }
+
+  /* ── Spinner ── */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner {
+    width: 20px; height: 20px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin 0.6s linear infinite; display: inline-block;
+  }
+
+  /* ── Empty state ── */
+  .empty-state {
+    text-align: center; padding: 60px 20px; color: var(--text-dim);
+  }
+  .empty-state .big { font-size: 48px; margin-bottom: 12px; }
+  .empty-state p { font-size: 14px; }
+</style>
+</head>
+<body>
+
+<!-- Fixed Header -->
+<div class="header">
+  <div class="header-bar">
+    <div class="logo">Bit<span>Dex</span> V2</div>
+    <div class="stats-row">
+      <span class="stat-item">Records: <b id="stat-alive">--</b></span>
+      <span class="stat-item" id="query-stats" style="display:none">
+        <span class="timing" id="stat-time">--</span> &middot;
+        <span class="matched" id="stat-matched">--</span> matched &middot;
+        <span id="stat-returned">--</span> shown
+      </span>
+    </div>
+    <div class="header-actions">
+      <button class="toggle-btn active" id="btn-filters" onclick="toggleFilters()">Filters</button>
+      <button class="toggle-btn" id="btn-raw" onclick="toggleRaw()">JSON</button>
+    </div>
+  </div>
+</div>
+
+<!-- Filter Panel -->
+<div class="filter-panel" id="filter-panel">
+  <div class="filter-grid">
+    <div class="field">
+      <label>NSFW Level</label>
+      <select id="f-nsfwLevel">
+        <option value="">Any</option>
+        <option value="1" selected>1 - None</option>
+        <option value="2">2 - Soft</option>
+        <option value="4">4 - Mature</option>
+        <option value="8">8 - X</option>
+        <option value="16">16 - Blocked</option>
+        <option value="32">32 - Max</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Type</label>
+      <select id="f-type">
+        <option value="">Any</option>
+        <option value="1">Image</option>
+        <option value="2">Video</option>
+        <option value="3">Audio</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Tag IDs</label>
+      <input type="text" id="f-tagIds" placeholder="1234, 5678">
+    </div>
+    <div class="field">
+      <label>User ID</label>
+      <input type="text" id="f-userId" placeholder="42069">
+    </div>
+    <div class="field">
+      <label>Model Versions</label>
+      <input type="text" id="f-modelVersionIds" placeholder="100, 200">
+    </div>
+    <div class="field">
+      <label>Has Meta</label>
+      <select id="f-hasMeta"><option value="">Any</option><option value="true">Yes</option><option value="false">No</option></select>
+    </div>
+    <div class="field">
+      <label>On Site</label>
+      <select id="f-onSite"><option value="">Any</option><option value="true">Yes</option><option value="false">No</option></select>
+    </div>
+    <div class="field">
+      <label>POI</label>
+      <select id="f-poi"><option value="">Any</option><option value="true">Yes</option><option value="false">No</option></select>
+    </div>
+    <div class="field">
+      <label>Minor</label>
+      <select id="f-minor"><option value="">Any</option><option value="true">Yes</option><option value="false">No</option></select>
+    </div>
+  </div>
+  <div class="sort-row">
+    <div class="field">
+      <label>Sort By</label>
+      <select id="sort-field">
+        <option value="">Newest (slot order)</option>
+        <option value="reactionCount" selected>Reactions</option>
+        <option value="sortAt">Date</option>
+        <option value="commentCount">Comments</option>
+        <option value="collectedCount">Collections</option>
+        <option value="id">ID</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Direction</label>
+      <select id="sort-dir">
+        <option value="Desc" selected>Desc</option>
+        <option value="Asc">Asc</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Page Size</label>
+      <input type="number" id="limit" value="40" min="1" max="200" style="width:70px">
+    </div>
+  </div>
+</div>
+
+<!-- Raw JSON -->
+<div class="raw-panel" id="raw-panel">
+  <textarea id="raw-query" spellcheck="false"></textarea>
+  <div class="raw-actions">
+    <button onclick="runRawQuery()">Run JSON Query</button>
+  </div>
+</div>
+
+<!-- Main Content -->
+<div class="content filters-open" id="content">
+  <div class="grid" id="grid"></div>
+  <div class="load-more-indicator" id="load-indicator" style="display:none">
+    <span class="spinner"></span> Loading more...
+  </div>
+  <div class="scroll-sentinel" id="scroll-sentinel"></div>
+  <div class="empty-state" id="empty-state">
+    <div class="big">&#x1F50D;</div>
+    <p>Adjust filters above to explore the dataset</p>
+  </div>
+</div>
+
+<!-- Detail Modal -->
+<div class="modal-overlay" id="modal" onclick="if(event.target===this)closeModal()">
+  <div class="modal" style="position:relative">
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <img class="modal-img" id="modal-img" src="" alt="">
+    <div class="modal-body">
+      <dl class="modal-fields" id="modal-fields"></dl>
+    </div>
+  </div>
+</div>
+
+<!-- Error Toast -->
+<div class="error-toast" id="error-toast"></div>
+
+<script>
+const API = '';
+const IMG_BASE = 'https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA';
+
+// State
+let currentCursor = null;
+let isLoading = false;
+let hasMore = true;
+let totalShown = 0;
+let totalMatched = 0;
+let lastQueryTime = 0;
+let debounceTimer = null;
+let filtersVisible = true;
+let currentQueryId = 0; // monotonic query version to discard stale responses
+
+// ── Civitai image URL from GUID ──
+function imgUrl(guid, width = 400) {
+  if (!guid) return null;
+  return `${IMG_BASE}/${guid}/width=${width}/image.jpeg`;
+}
+
+// ── Build Query JSON from UI controls ──
+function buildQuery(cursor) {
+  const filters = [];
+
+  const nsfw = document.getElementById('f-nsfwLevel').value;
+  if (nsfw) filters.push({ Eq: ['nsfwLevel', { Integer: parseInt(nsfw) }] });
+
+  const type_ = document.getElementById('f-type').value;
+  if (type_) filters.push({ Eq: ['type', { Integer: parseInt(type_) }] });
+
+  const tagIds = document.getElementById('f-tagIds').value.trim();
+  if (tagIds) {
+    const ids = tagIds.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
+    if (ids.length === 1) filters.push({ Eq: ['tagIds', { Integer: ids[0] }] });
+    else if (ids.length > 1) filters.push({ In: ['tagIds', ids.map(v => ({ Integer: v }))] });
+  }
+
+  const userId = document.getElementById('f-userId').value.trim();
+  if (userId && !isNaN(parseInt(userId))) filters.push({ Eq: ['userId', { Integer: parseInt(userId) }] });
+
+  const mvIds = document.getElementById('f-modelVersionIds').value.trim();
+  if (mvIds) {
+    const ids = mvIds.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
+    if (ids.length === 1) filters.push({ Eq: ['modelVersionIds', { Integer: ids[0] }] });
+    else if (ids.length > 1) filters.push({ In: ['modelVersionIds', ids.map(v => ({ Integer: v }))] });
+  }
+
+  for (const field of ['hasMeta', 'onSite', 'poi', 'minor']) {
+    const val = document.getElementById('f-' + field).value;
+    if (val) filters.push({ Eq: [field, { Bool: val === 'true' }] });
+  }
+
+  const sortField = document.getElementById('sort-field').value;
+  const sortDir = document.getElementById('sort-dir').value;
+  const limit = parseInt(document.getElementById('limit').value) || 40;
+
+  const query = { filters, limit };
+  if (sortField) query.sort = { field: sortField, direction: sortDir };
+  if (cursor) query.cursor = cursor;
+  return query;
+}
+
+// ── Stats ──
+async function fetchStats() {
+  try {
+    const r = await fetch(API + '/api/stats');
+    const d = await r.json();
+    document.getElementById('stat-alive').textContent = Number(d.alive_count).toLocaleString();
+  } catch(e) {}
+}
+
+function updateQueryStats(elapsedUs, matched, shown) {
+  const el = document.getElementById('query-stats');
+  el.style.display = '';
+  let timeStr;
+  if (elapsedUs < 1000) timeStr = elapsedUs + '\u00B5s';
+  else if (elapsedUs < 1000000) timeStr = (elapsedUs / 1000).toFixed(1) + 'ms';
+  else timeStr = (elapsedUs / 1000000).toFixed(2) + 's';
+  document.getElementById('stat-time').textContent = timeStr;
+  document.getElementById('stat-matched').textContent = Number(matched).toLocaleString();
+  document.getElementById('stat-returned').textContent = Number(shown).toLocaleString();
+}
+
+// ── Query Execution ──
+async function executeQuery(query, append = false) {
+  if (isLoading) return;
+  isLoading = true;
+
+  const qid = ++currentQueryId;
+
+  if (!append) {
+    document.getElementById('grid').innerHTML = '';
+    totalShown = 0;
+    currentCursor = null;
+    hasMore = true;
+    document.getElementById('empty-state').style.display = 'none';
+  }
+  document.getElementById('load-indicator').style.display = '';
+
+  try {
+    const r = await fetch(API + '/api/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(query),
+    });
+    const d = await r.json();
+
+    // Discard stale responses
+    if (qid !== currentQueryId) { isLoading = false; return; }
+
+    if (d.error) {
+      showError(d.error);
+      isLoading = false;
+      document.getElementById('load-indicator').style.display = 'none';
+      return;
+    }
+
+    totalMatched = d.total_matched;
+    lastQueryTime = d.elapsed_us;
+    currentCursor = d.cursor || null;
+    hasMore = !!d.cursor && d.ids.length > 0;
+
+    if (d.ids.length > 0) {
+      // Batch fetch documents for all IDs
+      await renderCards(d.ids, append);
+      totalShown += d.ids.length;
+    }
+
+    updateQueryStats(d.elapsed_us, d.total_matched, totalShown);
+
+    if (!append && d.ids.length === 0) {
+      document.getElementById('empty-state').style.display = '';
+      document.getElementById('empty-state').innerHTML = '<div class="big">&#x1F4ED;</div><p>No results match your filters</p>';
+    }
+  } catch(e) {
+    if (qid === currentQueryId) showError('Network error: ' + e.message);
+  }
+
+  isLoading = false;
+  document.getElementById('load-indicator').style.display = 'none';
+}
+
+// ── Render Image Cards ──
+async function renderCards(slotIds, append) {
+  const grid = document.getElementById('grid');
+
+  // Batch fetch docs
+  let docs = {};
+  try {
+    const r = await fetch(API + '/api/documents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slot_ids: slotIds }),
+    });
+    const d = await r.json();
+    if (d.documents) {
+      for (const doc of d.documents) {
+        docs[doc.slot_id] = doc.fields;
+      }
+    }
+  } catch(e) {
+    // Fall back to rendering without doc details
+  }
+
+  const frag = document.createDocumentFragment();
+
+  for (const slotId of slotIds) {
+    const fields = docs[slotId];
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.onclick = () => openModal(slotId, fields);
+
+    // Extract field values
+    const url = extractField(fields, 'url');
+    const reactions = extractField(fields, 'reactionCount');
+    const width = extractField(fields, 'width');
+    const height = extractField(fields, 'height');
+    const nsfw = extractField(fields, 'nsfwLevel');
+    const baseModel = extractField(fields, 'baseModel');
+
+    const thumbUrl = imgUrl(url, 400);
+
+    if (thumbUrl) {
+      const img = document.createElement('img');
+      img.className = 'card-img';
+      img.loading = 'lazy';
+      img.src = thumbUrl;
+      img.alt = `Image ${slotId}`;
+      img.onerror = function() { this.style.display = 'none'; };
+      card.appendChild(img);
+    } else {
+      const ph = document.createElement('div');
+      ph.className = 'card-img placeholder';
+      ph.textContent = '\u{1F5BC}';
+      card.appendChild(ph);
+    }
+
+    // Dimension badge
+    if (width && height) {
+      const badge = document.createElement('div');
+      badge.className = 'card-dims';
+      badge.textContent = `${width}\u00D7${height}`;
+      card.appendChild(badge);
+    }
+
+    // Model badge
+    if (baseModel && baseModel !== '') {
+      const badge = document.createElement('div');
+      badge.className = 'card-badge';
+      badge.textContent = baseModel;
+      card.appendChild(badge);
+    }
+
+    // Meta row
+    const meta = document.createElement('div');
+    meta.className = 'card-meta';
+    meta.innerHTML = `<span class="reactions">${reactions != null ? '\u2764 ' + Number(reactions).toLocaleString() : ''}</span>` +
+                     `<span class="slot-id">#${slotId}</span>`;
+    card.appendChild(meta);
+
+    frag.appendChild(card);
+  }
+
+  grid.appendChild(frag);
+}
+
+// ── Extract a field value from the docstore format ──
+function extractField(fields, name) {
+  if (!fields || !fields[name]) return null;
+  const v = fields[name];
+  // FieldValue::Single(Value::Integer(x)) → { "Single": { "Integer": x } }
+  // FieldValue::Single(Value::String(x)) → { "Single": { "String": x } }
+  // FieldValue::Single(Value::Bool(x)) → { "Single": { "Bool": x } }
+  if (v.Single) {
+    if (v.Single.Integer !== undefined) return v.Single.Integer;
+    if (v.Single.String !== undefined) return v.Single.String;
+    if (v.Single.Bool !== undefined) return v.Single.Bool;
+    if (v.Single.Float !== undefined) return v.Single.Float;
+    return v.Single;
+  }
+  if (v.Multi) {
+    return v.Multi.map(item => {
+      if (item.Integer !== undefined) return item.Integer;
+      if (item.String !== undefined) return item.String;
+      return item;
+    });
+  }
+  return v;
+}
+
+// ── Detail Modal ──
+function openModal(slotId, fields) {
+  const modal = document.getElementById('modal');
+  const img = document.getElementById('modal-img');
+  const dl = document.getElementById('modal-fields');
+
+  const url = extractField(fields, 'url');
+  const bigUrl = imgUrl(url, 1200);
+  img.src = bigUrl || '';
+  img.style.display = bigUrl ? '' : 'none';
+
+  // Build field list
+  dl.innerHTML = '';
+  if (fields) {
+    const order = ['id', 'url', 'baseModel', 'nsfwLevel', 'type', 'width', 'height',
+                   'reactionCount', 'commentCount', 'collectedCount', 'userId', 'postId',
+                   'hasMeta', 'onSite', 'hash', 'availability', 'tagIds', 'modelVersionIds',
+                   'toolIds', 'techniqueIds', 'sortAt', 'poi', 'minor'];
+    const shown = new Set();
+    for (const key of order) {
+      if (fields[key]) {
+        shown.add(key);
+        addModalField(dl, key, extractField(fields, key));
+      }
+    }
+    // Show remaining fields
+    for (const key of Object.keys(fields)) {
+      if (!shown.has(key)) addModalField(dl, key, extractField(fields, key));
+    }
+  }
+
+  // Add slot ID
+  const dt = document.createElement('dt'); dt.textContent = 'slot_id';
+  const dd = document.createElement('dd'); dd.textContent = slotId;
+  dl.prepend(dd); dl.prepend(dt);
+
+  modal.classList.add('open');
+}
+
+function addModalField(dl, key, value) {
+  const dt = document.createElement('dt'); dt.textContent = key;
+  const dd = document.createElement('dd');
+  if (Array.isArray(value)) {
+    dd.textContent = value.length > 20 ? `[${value.length} items] ${value.slice(0, 20).join(', ')}...` : value.join(', ');
+  } else {
+    dd.textContent = String(value);
+  }
+  dl.appendChild(dt);
+  dl.appendChild(dd);
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('open');
+}
+
+// ── Toggle Controls ──
+function toggleFilters() {
+  const panel = document.getElementById('filter-panel');
+  const btn = document.getElementById('btn-filters');
+  const content = document.getElementById('content');
+  filtersVisible = !filtersVisible;
+  panel.classList.toggle('collapsed', !filtersVisible);
+  content.classList.toggle('filters-open', filtersVisible);
+  btn.classList.toggle('active', filtersVisible);
+}
+
+function toggleRaw() {
+  const panel = document.getElementById('raw-panel');
+  const btn = document.getElementById('btn-raw');
+  panel.classList.toggle('open');
+  btn.classList.toggle('active');
+  if (panel.classList.contains('open')) {
+    document.getElementById('raw-query').value = JSON.stringify(buildQuery(null), null, 2);
+  }
+}
+
+async function runRawQuery() {
+  try {
+    const query = JSON.parse(document.getElementById('raw-query').value);
+    currentQueryId++;
+    await executeQuery(query, false);
+  } catch(e) { showError('Invalid JSON: ' + e.message); }
+}
+
+// ── Error Toast ──
+function showError(msg) {
+  const el = document.getElementById('error-toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 5000);
+}
+
+// ── Live Query (debounced) ──
+function onFilterChange() {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    const query = buildQuery(null);
+    // Update raw JSON if open
+    const rawPanel = document.getElementById('raw-panel');
+    if (rawPanel.classList.contains('open')) {
+      document.getElementById('raw-query').value = JSON.stringify(query, null, 2);
+    }
+    executeQuery(query, false);
+  }, 200);
+}
+
+// Attach live-update listeners to all filter controls
+function attachListeners() {
+  const ids = ['f-nsfwLevel', 'f-type', 'f-tagIds', 'f-userId', 'f-modelVersionIds',
+               'f-hasMeta', 'f-onSite', 'f-poi', 'f-minor', 'sort-field', 'sort-dir', 'limit'];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el.tagName === 'SELECT') {
+      el.addEventListener('change', onFilterChange);
+    } else {
+      el.addEventListener('input', onFilterChange);
+    }
+  }
+}
+
+// ── Infinite Scroll ──
+function setupInfiniteScroll() {
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting && !isLoading && hasMore && currentCursor) {
+        const query = buildQuery(currentCursor);
+        executeQuery(query, true);
+      }
+    }
+  }, { rootMargin: '400px' });
+
+  observer.observe(document.getElementById('scroll-sentinel'));
+}
+
+// ── Keyboard shortcuts ──
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+});
+
+// ── Init ──
+fetchStats();
+attachListeners();
+setupInfiniteScroll();
+
+// Run initial query after a short delay to let the page render
+setTimeout(() => onFilterChange(), 100);
+</script>
+
+</body>
+</html>

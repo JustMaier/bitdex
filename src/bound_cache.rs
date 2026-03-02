@@ -104,6 +104,11 @@ impl BoundEntry {
         self.bitmap.len()
     }
 
+    /// Target size for this bound.
+    pub fn target_size(&self) -> usize {
+        self.target_size
+    }
+
     /// Whether this bound has grown beyond max_size and needs a fresh rebuild.
     pub fn needs_rebuild(&self) -> bool {
         self.needs_rebuild

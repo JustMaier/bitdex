@@ -64,6 +64,7 @@ pub struct ConcurrentEngine {
     pending: Arc<parking_lot::Mutex<PendingBuffer>>,
     bound_cache: Arc<parking_lot::Mutex<BoundCacheManager>>,
     loading_mode: Arc<AtomicBool>,
+    dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
 }
 
@@ -220,6 +221,10 @@ impl ConcurrentEngine {
             .map(|f| f.name.clone())
             .collect();
 
+        // Shared dirty flag: flush thread sets when mutations applied, merge thread
+        // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
+        let dirty_flag = Arc::new(AtomicBool::new(false));
+
         let flush_handle = {
             let inner = Arc::clone(&inner);
             let cache = Arc::clone(&cache);
@@ -232,6 +237,7 @@ impl ConcurrentEngine {
             let flush_tier2_cache = tier2_cache.clone();
             let flush_bound_cache = Arc::clone(&bound_cache);
             let flush_loading_mode = Arc::clone(&loading_mode);
+            let flush_dirty_flag = Arc::clone(&dirty_flag);
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
@@ -255,6 +261,7 @@ impl ConcurrentEngine {
                     // Phase 2: Apply mutations to staging (private, no lock needed)
                     if bitmap_count > 0 {
                         staging_dirty = true;
+                        flush_dirty_flag.store(true, Ordering::Release);
                         // Extract Tier 2 mutations BEFORE apply (apply would silently
                         // ignore them since Tier 2 fields aren't in FilterIndex,
                         // but we need them for PendingBuffer).
@@ -527,6 +534,7 @@ impl ConcurrentEngine {
                 // Final flush on shutdown
                 let count = coalescer.prepare();
                 if count > 0 {
+                    flush_dirty_flag.store(true, Ordering::Release);
                     // Extract Tier 2 mutations before final apply
                     let tier2_mutations = if !tier2_fields.is_empty() {
                         coalescer.take_tier2_mutations(&tier2_fields)
@@ -586,6 +594,7 @@ impl ConcurrentEngine {
             let merge_pending = Arc::clone(&pending);
             let merge_bitmap_store = bitmap_store.clone();
             let merge_tier2_cache = tier2_cache.clone();
+            let merge_dirty_flag = Arc::clone(&dirty_flag);
             let pending_drain_cap = config.storage.pending_drain_cap;
             let sort_field_configs: Vec<crate::config::SortFieldConfig> =
                 config.sort_fields.clone();
@@ -596,6 +605,9 @@ impl ConcurrentEngine {
                     thread::sleep(sleep_duration);
 
                     // S2.2: Snapshot, compact Tier 1 filter diffs, persist to redb
+                    // Only write if bitmaps have changed since last snapshot.
+                    let needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
+                    if needs_write {
                     if let Some(ref store) = merge_bitmap_store {
                         // Take a snapshot and compact filter diffs
                         let snap = merge_inner.load_full();
@@ -699,6 +711,7 @@ impl ConcurrentEngine {
                             eprintln!("merge thread: pending buffer depth after drain: {remaining}");
                         }
                     }
+                    } // needs_write
                 }
             })
         };
@@ -720,6 +733,7 @@ impl ConcurrentEngine {
             pending,
             bound_cache,
             loading_mode,
+            dirty_since_snapshot: Arc::clone(&dirty_flag),
             time_buckets,
         })
     }
@@ -1111,18 +1125,31 @@ impl ConcurrentEngine {
 
         let mut bc = self.bound_cache.lock();
 
-        // D6: Try tier 0 first, then escalate to higher tiers if cursor is past bound
+        // D6: Try tier 0 first, then escalate to higher tiers if cursor is past bound.
+        // When cursor is provided and all tiers are exhausted, skip bound entirely —
+        // bound cache is a first-page acceleration, not a correctness requirement.
         let max_tiers = 4u32; // cap to avoid unbounded tier growth
         let mut try_key = bound_key;
+        let mut skip_all_bounds = false;
         for _tier in 0..max_tiers {
             if let Some(entry) = bc.lookup_mut(&try_key) {
                 if !entry.needs_rebuild() {
+                    // Skip bound if it's too small to be meaningful — a bound
+                    // with fewer entries than half target_size hasn't been fully
+                    // populated yet (only seeded from a small result set).
+                    // Using it would incorrectly narrow total_matched and break
+                    // pagination/infinite scroll.
+                    if entry.bitmap().len() < entry.target_size() as u64 / 2 {
+                        skip_all_bounds = true;
+                        break;
+                    }
+
                     // Check if cursor is past this tier's range
                     let cursor_past = if let Some(c) = cursor {
                         let cursor_val = c.sort_value as u32;
                         match sort_clause.direction {
-                            SortDirection::Desc => cursor_val < entry.min_tracked_value(),
-                            SortDirection::Asc => cursor_val > entry.min_tracked_value(),
+                            SortDirection::Desc => cursor_val <= entry.min_tracked_value(),
+                            SortDirection::Asc => cursor_val >= entry.min_tracked_value(),
                         }
                     } else {
                         false
@@ -1144,21 +1171,36 @@ impl ConcurrentEngine {
                     return (narrowed, false, cache_key);
                 }
             }
-            break; // No bound at this tier, try superset matching
+            // No bound at this tier — if we got here because cursor was past
+            // previous tiers, skip all bounds to avoid 0-result pages.
+            if cursor.is_some() && try_key.tier > 0 {
+                skip_all_bounds = true;
+            }
+            break;
+        }
+        // If cursor exhausted all available tiers, it's past all bounds.
+        if cursor.is_some() && try_key.tier >= max_tiers {
+            skip_all_bounds = true;
         }
 
         // E4/S4.2: Superset matching — find a bound whose filter clauses are a
         // subset of this query's. A bound for {nsfwLevel=1} can narrow a query
         // for {nsfwLevel=1, onSite=true}. The bound bitmap is still ANDed with
         // the full filter result, so correctness is preserved.
-        if let Some(entry) = bc.find_superset_bound(
-            filter_key,
-            &sort_clause.field,
-            sort_clause.direction,
-        ) {
-            entry.touch();
-            let narrowed = filter_bitmap & entry.bitmap();
-            return (narrowed, false, cache_key);
+        // Skip when bounds are unusable (too small, cursor exhausted tiers).
+        if !skip_all_bounds {
+            if let Some(entry) = bc.find_superset_bound(
+                filter_key,
+                &sort_clause.field,
+                sort_clause.direction,
+            ) {
+                // Also skip superset bounds that are too small
+                if entry.bitmap().len() >= entry.target_size() as u64 / 2 {
+                    entry.touch();
+                    let narrowed = filter_bitmap & entry.bitmap();
+                    return (narrowed, false, cache_key);
+                }
+            }
         }
 
         drop(bc);
@@ -1264,6 +1306,11 @@ impl ConcurrentEngine {
     /// Get the high-water mark slot counter (lock-free snapshot).
     pub fn slot_counter(&self) -> u32 {
         self.snapshot().slots.slot_counter()
+    }
+
+    /// Retrieve a stored document by slot ID from the docstore.
+    pub fn get_document(&self, slot_id: u32) -> Result<Option<StoredDoc>> {
+        self.docstore.get(slot_id)
     }
 
     /// Get the current pending buffer depth (number of pending entries).
@@ -1601,6 +1648,7 @@ impl ConcurrentEngine {
     /// Publish a staging InnerEngine as the current snapshot and invalidate all caches.
     pub fn publish_staging(&self, staging: InnerEngine) {
         self.inner.store(Arc::new(staging));
+        self.dirty_since_snapshot.store(true, Ordering::Release);
         self.invalidate_all_caches();
     }
 
@@ -1647,6 +1695,28 @@ impl ConcurrentEngine {
                 }
             }
         })
+    }
+
+    /// Write documents to the docstore synchronously (inline, no background thread).
+    /// Used during bulk loading to bound memory — docs are written immediately and freed
+    /// after the next bitmap chunk flush instead of lingering in a background thread.
+    pub fn write_docs_to_docstore(&self, docs: &[(u32, Document)]) {
+        let batch_size = 10_000;
+        let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
+        for (slot, doc) in docs {
+            batch.push((*slot, StoredDoc { fields: doc.fields.clone() }));
+            if batch.len() >= batch_size {
+                if let Err(e) = self.docstore.put_batch(&batch) {
+                    eprintln!("write_docs_to_docstore: batch write failed: {e}");
+                }
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            if let Err(e) = self.docstore.put_batch(&batch) {
+                eprintln!("write_docs_to_docstore: batch write failed: {e}");
+            }
+        }
     }
 
     /// Core decompose + merge + apply logic, shared by put_bulk() and put_bulk_loading().

@@ -1,1 +1,5 @@
 /target
+/.browser
+/server_docstore.redb
+/server_bitmaps.redb
+/benchmark_*.txt
