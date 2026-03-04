@@ -393,19 +393,19 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
             ],

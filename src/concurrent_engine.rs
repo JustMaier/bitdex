@@ -9,19 +9,17 @@ use arc_swap::{ArcSwap, Guard};
 use crossbeam_channel::{Receiver, Sender};
 use roaring::RoaringBitmap;
 
-use crate::bitmap_store::BitmapStore;
+use crate::bitmap_fs::BitmapFs;
 use crate::bound_cache::{BoundCacheManager, BoundKey};
 use crate::cache::{self, CacheLookup, CacheKey, TrieCache};
 use crate::concurrency::InFlightTracker;
-use crate::config::{Config, StorageMode};
+use crate::config::Config;
 use crate::docstore::{DocStore, StoredDoc};
 use crate::error::Result;
-use crate::executor::{QueryExecutor, Tier2Resolver};
+use crate::executor::QueryExecutor;
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, Document, FieldRegistry, PatchPayload};
-use crate::pending_buffer::PendingBuffer;
 use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
-use crate::tier2_cache::Tier2Cache;
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
@@ -59,9 +57,7 @@ pub struct ConcurrentEngine {
     shutdown: Arc<AtomicBool>,
     flush_handle: Option<JoinHandle<()>>,
     merge_handle: Option<JoinHandle<()>>,
-    bitmap_store: Option<Arc<BitmapStore>>,
-    tier2_cache: Option<Arc<Tier2Cache>>,
-    pending: Arc<parking_lot::Mutex<PendingBuffer>>,
+    bitmap_store: Option<Arc<BitmapFs>>,
     bound_cache: Arc<parking_lot::Mutex<BoundCacheManager>>,
     loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
@@ -87,12 +83,9 @@ impl ConcurrentEngine {
         let mut filters = crate::filter::FilterIndex::new();
         let mut sorts = crate::sort::SortIndex::new();
 
-        // Only add Tier 1 (Snapshot) fields to the in-memory FilterIndex.
-        // Tier 2 (Cached) fields are resolved via moka cache + redb on demand.
+        // All fields are in-memory (no tier 2 distinction).
         for fc in &config.filter_fields {
-            if fc.storage == StorageMode::Snapshot {
-                filters.add_field(fc.clone());
-            }
+            filters.add_field(fc.clone());
         }
         for sc in &config.sort_fields {
             sorts.add_field(sc.clone());
@@ -101,23 +94,22 @@ impl ConcurrentEngine {
         let field_registry = FieldRegistry::from_config(&config);
         let cache = Arc::new(parking_lot::Mutex::new(TrieCache::new(config.cache.clone())));
 
-        // Open bitmap store if configured
+        // Open filesystem bitmap store if configured
         let bitmap_store = if let Some(ref path) = config.storage.bitmap_path {
-            Some(Arc::new(BitmapStore::new(path)?))
+            Some(Arc::new(BitmapFs::new(path)?))
         } else {
             None
         };
 
-        // Load Tier 1 filter bitmaps from redb on startup (A8)
+        // Load filter bitmaps from filesystem on startup
         if let Some(ref store) = bitmap_store {
-            let tier1_names: Vec<&str> = config
+            let field_names: Vec<&str> = config
                 .filter_fields
                 .iter()
-                .filter(|f| f.storage == StorageMode::Snapshot)
                 .map(|f| f.name.as_str())
                 .collect();
-            if !tier1_names.is_empty() {
-                let loaded = store.load_all_fields(&tier1_names)?;
+            if !field_names.is_empty() {
+                let loaded = store.load_all_fields(&field_names)?;
                 for (field_name, bitmaps) in loaded {
                     if !bitmaps.is_empty() {
                         if let Some(field) = filters.get_field_mut(&field_name) {
@@ -128,7 +120,7 @@ impl ConcurrentEngine {
             }
         }
 
-        // S2.3: Load alive, sort layers, and slot counter from redb on startup
+        // Load alive, sort layers, and slot counter from filesystem on startup
         let mut slots = crate::slot::SlotAllocator::new();
         if let Some(ref store) = bitmap_store {
             let alive = store.load_alive()?;
@@ -151,16 +143,6 @@ impl ConcurrentEngine {
                 }
             }
         }
-
-        // Initialize Tier 2 cache if any fields are Cached
-        let has_tier2 = config.filter_fields.iter().any(|f| f.storage == StorageMode::Cached);
-        let tier2_cache = if has_tier2 {
-            Some(Arc::new(Tier2Cache::new(config.storage.tier2_cache_size_mb)))
-        } else {
-            None
-        };
-
-        let pending = Arc::new(parking_lot::Mutex::new(PendingBuffer::new()));
         let bound_cache = Arc::new(parking_lot::Mutex::new(BoundCacheManager::with_max_count(
             config.cache.bound_target_size,
             config.cache.bound_max_size,
@@ -205,19 +187,10 @@ impl ConcurrentEngine {
 
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
 
-        // Collect Tier 1 filter field names for cache invalidation
+        // Collect filter field names for cache invalidation
         let filter_field_names: Vec<String> = config
             .filter_fields
             .iter()
-            .filter(|f| f.storage == StorageMode::Snapshot)
-            .map(|f| f.name.clone())
-            .collect();
-
-        // Collect Tier 2 field names for mutation routing
-        let tier2_field_names: std::collections::HashSet<String> = config
-            .filter_fields
-            .iter()
-            .filter(|f| f.storage == StorageMode::Cached)
             .map(|f| f.name.clone())
             .collect();
 
@@ -232,9 +205,6 @@ impl ConcurrentEngine {
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
             let field_names = filter_field_names;
-            let tier2_fields = tier2_field_names.clone();
-            let flush_pending = Arc::clone(&pending);
-            let flush_tier2_cache = tier2_cache.clone();
             let flush_bound_cache = Arc::clone(&bound_cache);
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
@@ -262,15 +232,6 @@ impl ConcurrentEngine {
                     if bitmap_count > 0 {
                         staging_dirty = true;
                         flush_dirty_flag.store(true, Ordering::Release);
-                        // Extract Tier 2 mutations BEFORE apply (apply would silently
-                        // ignore them since Tier 2 fields aren't in FilterIndex,
-                        // but we need them for PendingBuffer).
-                        let tier2_mutations = if !tier2_fields.is_empty() {
-                            coalescer.take_tier2_mutations(&tier2_fields)
-                        } else {
-                            Vec::new()
-                        };
-
                         coalescer.apply_prepared(
                             &mut staging.slots,
                             &mut staging.filters,
@@ -361,27 +322,6 @@ impl ConcurrentEngine {
                                 }
                             }
 
-                            // Route Tier 2 mutations to PendingBuffer and invalidate moka cache
-                            if !tier2_mutations.is_empty() {
-                                let mut p = flush_pending.lock();
-                                for (field, value, slots, is_set) in &tier2_mutations {
-                                    for &slot in slots {
-                                        if *is_set {
-                                            p.add_set(field, *value, slot);
-                                        } else {
-                                            p.add_clear(field, *value, slot);
-                                        }
-                                    }
-                                }
-                                drop(p);
-                                // Invalidate moka cache entries that were mutated
-                                if let Some(ref t2c) = flush_tier2_cache {
-                                    for (field, value, _, _) in &tier2_mutations {
-                                        t2c.invalidate(field, *value);
-                                    }
-                                }
-                            }
-
                             // Cache maintenance: live updates for Eq entries, invalidation for the rest.
                             if coalescer.has_alive_mutations() {
                                 // Alive changed — invalidate all filter fields because NotEq/Not
@@ -389,13 +329,6 @@ impl ConcurrentEngine {
                                 let mut c = cache.lock();
                                 for name in &field_names {
                                     c.invalidate_field(name);
-                                }
-                                // Also invalidate all Tier 2 cache entries (alive changed)
-                                if let Some(ref t2c) = flush_tier2_cache {
-                                    for field_name in &tier2_fields {
-                                        let arc: Arc<str> = Arc::from(field_name.as_str());
-                                        t2c.invalidate_field(&arc);
-                                    }
                                 }
                             } else {
                                 // Live update: insert/remove mutated slots into matching Eq cache entries.
@@ -501,12 +434,6 @@ impl ConcurrentEngine {
                             c.invalidate_field(name);
                         }
                         drop(c);
-                        if let Some(ref t2c) = flush_tier2_cache {
-                            for field_name in &tier2_fields {
-                                let arc: Arc<str> = Arc::from(field_name.as_str());
-                                t2c.invalidate_field(&arc);
-                            }
-                        }
                         inner.store(Arc::new(staging.clone()));
                         staging_dirty = false;
                     }
@@ -535,31 +462,11 @@ impl ConcurrentEngine {
                 let count = coalescer.prepare();
                 if count > 0 {
                     flush_dirty_flag.store(true, Ordering::Release);
-                    // Extract Tier 2 mutations before final apply
-                    let tier2_mutations = if !tier2_fields.is_empty() {
-                        coalescer.take_tier2_mutations(&tier2_fields)
-                    } else {
-                        Vec::new()
-                    };
-
                     coalescer.apply_prepared(
                         &mut staging.slots,
                         &mut staging.filters,
                         &mut staging.sorts,
                     );
-
-                    if !tier2_mutations.is_empty() {
-                        let mut p = flush_pending.lock();
-                        for (field, value, slots, is_set) in &tier2_mutations {
-                            for &slot in slots {
-                                if *is_set {
-                                    p.add_set(field, *value, slot);
-                                } else {
-                                    p.add_clear(field, *value, slot);
-                                }
-                            }
-                        }
-                    }
 
                     // Compact all remaining filter diffs before final publish
                     for (_name, field) in staging.filters.fields_mut() {
@@ -591,11 +498,8 @@ impl ConcurrentEngine {
             let shutdown = Arc::clone(&shutdown);
             let merge_inner = Arc::clone(&inner);
             let merge_interval_ms = config.merge_interval_ms;
-            let merge_pending = Arc::clone(&pending);
             let merge_bitmap_store = bitmap_store.clone();
-            let merge_tier2_cache = tier2_cache.clone();
             let merge_dirty_flag = Arc::clone(&dirty_flag);
-            let pending_drain_cap = config.storage.pending_drain_cap;
             let sort_field_configs: Vec<crate::config::SortFieldConfig> =
                 config.sort_fields.clone();
 
@@ -604,19 +508,18 @@ impl ConcurrentEngine {
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(sleep_duration);
 
-                    // S2.2: Snapshot, compact Tier 1 filter diffs, persist to redb
+                    // Snapshot, compact filter diffs, persist to filesystem
                     // Only write if bitmaps have changed since last snapshot.
                     let needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
                     if needs_write {
                     if let Some(ref store) = merge_bitmap_store {
-                        // Take a snapshot and compact filter diffs
                         let snap = merge_inner.load_full();
                         let mut compacted = (*snap).clone();
                         for (_name, field) in compacted.filters.fields_mut() {
                             field.merge_dirty();
                         }
 
-                        // Collect Tier 1 filter bitmap entries for persistence
+                        // Collect filter bitmap entries for persistence
                         let mut filter_entries: Vec<(String, u64, RoaringBitmap)> = Vec::new();
                         for (name, field) in compacted.filters.fields() {
                             for (&value, vb) in field.iter_versioned() {
@@ -641,7 +544,6 @@ impl ConcurrentEngine {
                             }
                         }
 
-                        // Build references for write_full_snapshot
                         let filter_refs: Vec<(&str, u64, &RoaringBitmap)> = filter_entries
                             .iter()
                             .map(|(f, v, b)| (f.as_str(), *v, b))
@@ -649,7 +551,6 @@ impl ConcurrentEngine {
                         let alive = compacted.slots.alive_bitmap().clone();
                         let slot_counter = compacted.slots.slot_counter();
 
-                        // Sort layer refs: owned Vec<&BM> must outlive the slice refs
                         let sort_owned_refs: Vec<(String, Vec<&RoaringBitmap>)> = sort_data
                             .iter()
                             .map(|(name, layers)| {
@@ -667,48 +568,7 @@ impl ConcurrentEngine {
                             &sort_slice_refs,
                             slot_counter,
                         ) {
-                            eprintln!("merge thread: redb snapshot write failed: {e}");
-                        }
-
-                        // Drain pending buffer to redb (Tier 2)
-                        let to_drain = {
-                            let mut p = merge_pending.lock();
-                            p.drain_heaviest(pending_drain_cap)
-                        };
-
-                        if !to_drain.is_empty() {
-                            let mut batch: Vec<(String, u64, roaring::RoaringBitmap)> = Vec::new();
-                            for ((field, value), mutations) in &to_drain {
-                                let mut bitmap = store
-                                    .load_single(field, *value)
-                                    .unwrap_or_default();
-                                mutations.apply_to(&mut bitmap);
-                                batch.push((field.to_string(), *value, bitmap));
-                            }
-                            let refs: Vec<(&str, u64, &roaring::RoaringBitmap)> = batch
-                                .iter()
-                                .map(|(f, v, b)| (f.as_str(), *v, b))
-                                .collect();
-                            if let Err(e) = store.write_batch(&refs) {
-                                eprintln!("merge thread: redb Tier 2 write failed: {e}");
-                            }
-                            if let Some(ref t2c) = merge_tier2_cache {
-                                for (i, ((field, value), _)) in to_drain.iter().enumerate() {
-                                    if t2c.contains(field, *value) {
-                                        t2c.insert(
-                                            field,
-                                            *value,
-                                            Arc::new(batch[i].2.clone()),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // S2.6: Log pending buffer depth after drain
-                        let remaining = merge_pending.lock().depth();
-                        if remaining > 0 {
-                            eprintln!("merge thread: pending buffer depth after drain: {remaining}");
+                            eprintln!("merge thread: bitmap snapshot write failed: {e}");
                         }
                     }
                     } // needs_write
@@ -729,8 +589,6 @@ impl ConcurrentEngine {
             flush_handle: Some(flush_handle),
             merge_handle: Some(merge_handle),
             bitmap_store,
-            tier2_cache,
-            pending,
             bound_cache,
             loading_mode,
             dirty_since_snapshot: Arc::clone(&dirty_flag),
@@ -846,18 +704,6 @@ impl ConcurrentEngine {
         Ok(())
     }
 
-    /// Build a Tier2Resolver if Tier 2 components are available.
-    fn make_tier2_resolver(&self) -> Option<Tier2Resolver> {
-        match (&self.tier2_cache, &self.bitmap_store) {
-            (Some(cache), Some(store)) => Some(Tier2Resolver {
-                cache: Arc::clone(cache),
-                pending: Arc::clone(&self.pending),
-                store: Arc::clone(store),
-            }),
-            _ => None,
-        }
-    }
-
     /// Execute a query from individual filter/sort/limit components.
     pub fn query(
         &self,
@@ -866,29 +712,18 @@ impl ConcurrentEngine {
         limit: usize,
     ) -> Result<QueryResult> {
         let snap = self.snapshot(); // lock-free
-        let tier2_resolver = self.make_tier2_resolver();
-        // S3.4: Lock time_buckets once for the query lifetime
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let executor = {
-            let base = match tier2_resolver.as_ref() {
-                Some(t2) => QueryExecutor::with_tier2(
-                    &snap.slots,
-                    &snap.filters,
-                    &snap.sorts,
-                    self.config.max_page_size,
-                    t2,
-                ),
-                None => QueryExecutor::new(
-                    &snap.slots,
-                    &snap.filters,
-                    &snap.sorts,
-                    self.config.max_page_size,
-                ),
-            };
+            let base = QueryExecutor::new(
+                &snap.slots,
+                &snap.filters,
+                &snap.sorts,
+                self.config.max_page_size,
+            );
             if let Some(ref tb) = tb_guard {
                 base.with_time_buckets(tb, now_unix)
             } else {
@@ -946,28 +781,18 @@ impl ConcurrentEngine {
     /// Execute a parsed BitdexQuery.
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
         let snap = self.snapshot(); // lock-free
-        let tier2_resolver = self.make_tier2_resolver();
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let executor = {
-            let base = match tier2_resolver.as_ref() {
-                Some(t2) => QueryExecutor::with_tier2(
-                    &snap.slots,
-                    &snap.filters,
-                    &snap.sorts,
-                    self.config.max_page_size,
-                    t2,
-                ),
-                None => QueryExecutor::new(
-                    &snap.slots,
-                    &snap.filters,
-                    &snap.sorts,
-                    self.config.max_page_size,
-                ),
-            };
+            let base = QueryExecutor::new(
+                &snap.slots,
+                &snap.filters,
+                &snap.sorts,
+                self.config.max_page_size,
+            );
             if let Some(ref tb) = tb_guard {
                 base.with_time_buckets(tb, now_unix)
             } else {
@@ -1376,10 +1201,9 @@ impl ConcurrentEngine {
         s
     }
 
-    /// Get the current pending buffer depth (number of pending entries).
-    /// Useful for monitoring backpressure on Tier 2 writes.
+    /// Get the current pending buffer depth. Always 0 (tier 2 removed).
     pub fn pending_depth(&self) -> usize {
-        self.pending.lock().depth()
+        0
     }
 
     /// Report bitmap memory usage broken down by component (lock-free snapshot).
@@ -1478,20 +1302,20 @@ impl ConcurrentEngine {
         Self::write_snapshot_to_store(store, &self.inner, &self.config)
     }
 
-    /// Save a full snapshot of the current published state to a BitmapStore at a custom path.
+    /// Save a full snapshot of the current published state to a BitmapFs at a custom path.
     ///
-    /// Creates a new BitmapStore at the given path and writes the complete engine
+    /// Creates a new BitmapFs at the given path and writes the complete engine
     /// state. Useful for benchmarks that want to save to a specific location,
     /// or for creating point-in-time backups separate from the live store.
     pub fn save_snapshot_to(&self, path: &Path) -> Result<()> {
-        let store = BitmapStore::new(path)?;
+        let store = BitmapFs::new(path)?;
         Self::write_snapshot_to_store(&store, &self.inner, &self.config)
     }
 
     /// Internal: extract all state from the current published snapshot and write it
-    /// to the given BitmapStore in a single atomic transaction.
+    /// to the given BitmapFs.
     fn write_snapshot_to_store(
-        store: &BitmapStore,
+        store: &BitmapFs,
         inner: &ArcSwap<InnerEngine>,
         config: &Config,
     ) -> Result<()> {
@@ -1974,19 +1798,19 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
             ],
@@ -3116,19 +2940,19 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
             ],
@@ -3159,8 +2983,8 @@ mod tests {
     #[test]
     fn test_save_snapshot_and_restore() {
         let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps.redb");
-        let docstore_path = dir.path().join("docstore.redb");
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
         let config = test_config_with_bitmap_path(bitmap_path.clone());
 
         // Phase 1: Create engine, insert data, save snapshot
@@ -3300,7 +3124,7 @@ mod tests {
     #[test]
     fn test_save_snapshot_to_custom_path() {
         let dir = tempfile::tempdir().unwrap();
-        let custom_bitmap_path = dir.path().join("custom_bitmaps.redb");
+        let custom_bitmap_path = dir.path().join("custom_bitmaps");
 
         // Create engine without bitmap_path (in-memory only)
         let mut engine = ConcurrentEngine::new(test_config()).unwrap();
@@ -3331,7 +3155,7 @@ mod tests {
         engine.save_snapshot_to(&custom_bitmap_path).unwrap();
 
         // Verify the file was created and contains the data
-        let store = crate::bitmap_store::BitmapStore::new(&custom_bitmap_path).unwrap();
+        let store = crate::bitmap_fs::BitmapFs::new(&custom_bitmap_path).unwrap();
         let alive = store.load_alive().unwrap().unwrap();
         assert_eq!(alive.len(), 2, "alive bitmap should have 2 entries");
         assert!(alive.contains(1));
@@ -3351,8 +3175,8 @@ mod tests {
     #[test]
     fn test_save_snapshot_empty_engine() {
         let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps.redb");
-        let docstore_path = dir.path().join("docstore.redb");
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
         let config = test_config_with_bitmap_path(bitmap_path.clone());
 
         // Save snapshot of empty engine
@@ -3374,8 +3198,8 @@ mod tests {
     #[test]
     fn test_save_snapshot_after_deletes() {
         let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps.redb");
-        let docstore_path = dir.path().join("docstore.redb");
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
         let config = test_config_with_bitmap_path(bitmap_path.clone());
 
         // Insert 3 docs, delete 1, then save and restore
@@ -3428,8 +3252,8 @@ mod tests {
     #[test]
     fn test_save_snapshot_preserves_sort_values() {
         let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps.redb");
-        let docstore_path = dir.path().join("docstore.redb");
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
         let config = test_config_with_bitmap_path(bitmap_path.clone());
 
         // Insert docs with specific sort values

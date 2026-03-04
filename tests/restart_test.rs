@@ -21,19 +21,19 @@ fn restart_config(bitmap_path: &std::path::Path) -> Config {
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "tagIds".to_string(),
                 field_type: FilterFieldType::MultiValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "onSite".to_string(),
                 field_type: FilterFieldType::Boolean,
-                storage: Default::default(),
+
                 behaviors: None,
             },
         ],
@@ -86,8 +86,8 @@ fn wait_for_merge(ms: u64) {
 #[test]
 fn test_restart_basic() {
     let dir = tempfile::tempdir().unwrap();
-    let docstore_path = dir.path().join("docs.redb");
-    let bitmap_path = dir.path().join("bitmaps.redb");
+    let docstore_path = dir.path().join("docs");
+    let bitmap_path = dir.path().join("bitmaps");
 
     let config = restart_config(&bitmap_path);
 
@@ -245,8 +245,8 @@ fn test_restart_basic() {
 #[test]
 fn test_restart_after_deletes() {
     let dir = tempfile::tempdir().unwrap();
-    let docstore_path = dir.path().join("docs.redb");
-    let bitmap_path = dir.path().join("bitmaps.redb");
+    let docstore_path = dir.path().join("docs");
+    let bitmap_path = dir.path().join("bitmaps");
 
     let config = restart_config(&bitmap_path);
 
@@ -315,8 +315,8 @@ fn test_restart_after_deletes() {
 #[test]
 fn test_restart_empty_engine() {
     let dir = tempfile::tempdir().unwrap();
-    let docstore_path = dir.path().join("docs.redb");
-    let bitmap_path = dir.path().join("bitmaps.redb");
+    let docstore_path = dir.path().join("docs");
+    let bitmap_path = dir.path().join("bitmaps");
 
     let config = restart_config(&bitmap_path);
 
@@ -347,8 +347,8 @@ fn test_restart_empty_engine() {
 #[test]
 fn test_restart_after_upserts() {
     let dir = tempfile::tempdir().unwrap();
-    let docstore_path = dir.path().join("docs.redb");
-    let bitmap_path = dir.path().join("bitmaps.redb");
+    let docstore_path = dir.path().join("docs");
+    let bitmap_path = dir.path().join("bitmaps");
 
     let config = restart_config(&bitmap_path);
 

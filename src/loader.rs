@@ -35,6 +35,8 @@ pub struct LoadStats {
 /// - `path`: path to the NDJSON file
 /// - `limit`: optional max records to load
 /// - `threads`: number of rayon threads for parallel parsing
+/// - `chunk_size`: number of records to accumulate before flushing to bitmap engine
+/// - `docstore_batch_size`: number of docs per docstore write batch
 /// - `progress`: atomic counter updated as records are loaded (for progress polling)
 pub fn load_ndjson(
     engine: &ConcurrentEngine,
@@ -42,10 +44,12 @@ pub fn load_ndjson(
     path: &Path,
     limit: Option<usize>,
     threads: usize,
+    chunk_size: usize,
+    _docstore_batch_size: usize,
     progress: Arc<AtomicU64>,
 ) -> Result<LoadStats, String> {
     let record_limit = limit.unwrap_or(usize::MAX);
-    let chunk_size: usize = if record_limit < 5_000_000 { record_limit } else { 5_000_000 };
+    let chunk_size: usize = chunk_size.max(1_000); // Floor at 1K
     let read_batch_size: usize = 500_000;
     let target_batch_bytes = read_batch_size * 600;
 

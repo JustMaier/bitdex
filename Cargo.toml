@@ -29,14 +29,9 @@ parking_lot = "0.12"
 crossbeam-channel = "0.5"
 arc-swap = "1"
 
-# On-disk document store
-redb = "2"
-bincode = "1"
+# Serialization (document store)
 rmp-serde = "1"
-lz4_flex = "0.11"
-
-# Tier 2 bitmap cache
-moka = { version = "0.12", features = ["sync"] }
+zstd = "0.13"
 
 # Parallel sort / iteration
 rayon = "1"

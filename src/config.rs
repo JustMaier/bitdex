@@ -280,60 +280,24 @@ impl Default for CacheConfig {
     }
 }
 
-/// Where filter bitmaps live at runtime.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageMode {
-    /// Always in ArcSwap snapshot (default for low-cardinality fields).
-    Snapshot,
-    /// Loaded on demand via moka cache over redb (for high-cardinality fields).
-    Cached,
-}
-
-impl Default for StorageMode {
-    fn default() -> Self {
-        Self::Snapshot
-    }
-}
-
-/// Configuration for bitmap persistence and caching.
+/// Configuration for bitmap persistence.
+///
+/// All bitmaps are stored as individual files on the filesystem.
+/// The two-tier snapshot/cached distinction is gone — all bitmaps are
+/// always in the ArcSwap snapshot, and the OS page cache handles
+/// hot/cold management transparently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Path to the redb database file for bitmap persistence.
+    /// Path to the bitmap directory for filesystem persistence.
     /// If None, bitmaps are memory-only (no persistence).
     #[serde(default)]
     pub bitmap_path: Option<std::path::PathBuf>,
-
-    /// Maximum Tier 2 cache memory budget in MB.
-    #[serde(default = "default_tier2_cache_size_mb")]
-    pub tier2_cache_size_mb: u64,
-
-    /// Compact filter diffs when total set+clear count exceeds this threshold.
-    #[serde(default = "default_merge_diff_threshold")]
-    pub merge_diff_threshold: usize,
-
-    /// Max Tier 2 bitmaps to drain from pending buffer per merge cycle.
-    #[serde(default = "default_pending_drain_cap")]
-    pub pending_drain_cap: usize,
-}
-
-fn default_tier2_cache_size_mb() -> u64 {
-    1024
-}
-fn default_merge_diff_threshold() -> usize {
-    10000
-}
-fn default_pending_drain_cap() -> usize {
-    100
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             bitmap_path: None,
-            tier2_cache_size_mb: default_tier2_cache_size_mb(),
-            merge_diff_threshold: default_merge_diff_threshold(),
-            pending_drain_cap: default_pending_drain_cap(),
         }
     }
 }
@@ -343,8 +307,6 @@ impl Default for StorageConfig {
 pub struct FilterFieldConfig {
     pub name: String,
     pub field_type: FilterFieldType,
-    #[serde(default)]
-    pub storage: StorageMode,
     /// Optional time-related behaviors (only valid for timestamp fields).
     #[serde(default)]
     pub behaviors: Option<FieldBehaviors>,
@@ -655,13 +617,13 @@ cache:
                 FilterFieldConfig {
                     name: "status".to_string(),
                     field_type: FilterFieldType::SingleValue,
-                    storage: StorageMode::default(),
+    
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "status".to_string(),
                     field_type: FilterFieldType::SingleValue,
-                    storage: StorageMode::default(),
+    
                     behaviors: None,
                 },
             ],
@@ -698,7 +660,7 @@ cache:
             filter_fields: vec![FilterFieldConfig {
                 name: "".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: StorageMode::default(),
+
                 behaviors: None,
             }],
             ..Default::default()
@@ -882,7 +844,7 @@ sort_fields:
             filter_fields: vec![FilterFieldConfig {
                 name: "status".into(),
                 field_type: FilterFieldType::SingleValue,
-                storage: StorageMode::default(),
+
                 behaviors: None,
             }],
             ..Config::default()
@@ -895,54 +857,36 @@ sort_fields:
     }
 
     #[test]
-    fn test_storage_mode_defaults_to_snapshot() {
-        assert_eq!(StorageMode::default(), StorageMode::Snapshot);
-    }
-
-    #[test]
     fn test_storage_config_defaults() {
         let sc = StorageConfig::default();
         assert!(sc.bitmap_path.is_none());
-        assert_eq!(sc.tier2_cache_size_mb, 1024);
-        assert_eq!(sc.merge_diff_threshold, 10000);
-        assert_eq!(sc.pending_drain_cap, 100);
     }
 
     #[test]
     fn test_config_default_includes_storage() {
         let config = Config::default();
         assert!(config.storage.bitmap_path.is_none());
-        assert_eq!(config.storage.tier2_cache_size_mb, 1024);
     }
 
     #[test]
-    fn test_toml_with_storage_mode() {
+    fn test_toml_with_storage_path() {
         let toml_str = r#"
 [[filter_fields]]
 name = "tagIds"
 field_type = "multi_value"
-storage = "cached"
 
 [[filter_fields]]
 name = "nsfwLevel"
 field_type = "single_value"
 
 [storage]
-bitmap_path = "/tmp/bitmaps.redb"
-tier2_cache_size_mb = 2048
-merge_diff_threshold = 5000
-pending_drain_cap = 50
+bitmap_path = "/tmp/bitmaps"
 "#;
         let config = Config::from_toml(toml_str).unwrap();
-        assert_eq!(config.filter_fields[0].storage, StorageMode::Cached);
-        assert_eq!(config.filter_fields[1].storage, StorageMode::Snapshot);
         assert_eq!(
             config.storage.bitmap_path,
-            Some(std::path::PathBuf::from("/tmp/bitmaps.redb"))
+            Some(std::path::PathBuf::from("/tmp/bitmaps"))
         );
-        assert_eq!(config.storage.tier2_cache_size_mb, 2048);
-        assert_eq!(config.storage.merge_diff_threshold, 5000);
-        assert_eq!(config.storage.pending_drain_cap, 50);
     }
 
     #[test]
@@ -952,23 +896,6 @@ max_page_size = 50
 "#;
         let config = Config::from_toml(toml_str).unwrap();
         assert!(config.storage.bitmap_path.is_none());
-        assert_eq!(config.storage.tier2_cache_size_mb, 1024);
-    }
-
-    #[test]
-    fn test_storage_mode_serde_roundtrip() {
-        let config = Config {
-            filter_fields: vec![FilterFieldConfig {
-                name: "tagIds".into(),
-                field_type: FilterFieldType::MultiValue,
-                storage: StorageMode::Cached,
-                behaviors: None,
-            }],
-            ..Config::default()
-        };
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let roundtrip = Config::from_toml(&toml_str).unwrap();
-        assert_eq!(roundtrip.filter_fields[0].storage, StorageMode::Cached);
     }
 
     #[test]
@@ -1045,7 +972,7 @@ field_type = "single_value"
             filter_fields: vec![FilterFieldConfig {
                 name: "onSite".into(),
                 field_type: FilterFieldType::Boolean,
-                storage: StorageMode::default(),
+
                 behaviors: Some(FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
@@ -1062,7 +989,7 @@ field_type = "single_value"
             filter_fields: vec![FilterFieldConfig {
                 name: "scheduledAt".into(),
                 field_type: FilterFieldType::SingleValue,
-                storage: StorageMode::default(),
+
                 behaviors: Some(FieldBehaviors {
                     deferred_alive: false,
                     range_buckets: vec![
@@ -1090,7 +1017,7 @@ field_type = "single_value"
             filter_fields: vec![FilterFieldConfig {
                 name: "scheduledAt".into(),
                 field_type: FilterFieldType::SingleValue,
-                storage: StorageMode::default(),
+
                 behaviors: Some(FieldBehaviors {
                     deferred_alive: false,
                     range_buckets: vec![BucketConfig {
@@ -1111,7 +1038,7 @@ field_type = "single_value"
             filter_fields: vec![FilterFieldConfig {
                 name: "scheduledAt".into(),
                 field_type: FilterFieldType::SingleValue,
-                storage: StorageMode::default(),
+
                 behaviors: Some(FieldBehaviors {
                     deferred_alive: false,
                     range_buckets: vec![BucketConfig {
@@ -1132,7 +1059,7 @@ field_type = "single_value"
             filter_fields: vec![FilterFieldConfig {
                 name: "scheduledAt".into(),
                 field_type: FilterFieldType::SingleValue,
-                storage: StorageMode::default(),
+
                 behaviors: Some(FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![BucketConfig {

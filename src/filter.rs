@@ -323,7 +323,7 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::SingleValue,
-            storage: crate::config::StorageMode::default(),
+
             behaviors: None,
         }
     }
@@ -332,7 +332,7 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::MultiValue,
-            storage: crate::config::StorageMode::default(),
+
             behaviors: None,
         }
     }
@@ -341,7 +341,7 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::Boolean,
-            storage: crate::config::StorageMode::default(),
+
             behaviors: None,
         }
     }

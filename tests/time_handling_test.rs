@@ -40,7 +40,7 @@ fn test_deferred_alive_far_future_invisible() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
@@ -49,7 +49,7 @@ fn test_deferred_alive_far_future_invisible() {
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
         ],
@@ -111,7 +111,7 @@ fn test_deferred_alive_past_timestamp_visible() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
@@ -120,7 +120,7 @@ fn test_deferred_alive_past_timestamp_visible() {
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
         ],
@@ -169,7 +169,7 @@ fn test_mixed_deferred_and_immediate() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],

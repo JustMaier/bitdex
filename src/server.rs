@@ -61,6 +61,7 @@ struct IndexState {
     definition: IndexDefinition,
     load_progress: Arc<AtomicU64>,
     load_status: Arc<Mutex<LoadStatus>>,
+    load_started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Shared application state.
@@ -89,10 +90,22 @@ struct LoadRequest {
     limit: Option<usize>,
     #[serde(default = "default_threads")]
     threads: usize,
+    #[serde(default = "default_chunk_size")]
+    chunk_size: usize,
+    #[serde(default = "default_docstore_batch_size")]
+    docstore_batch_size: usize,
 }
 
 fn default_threads() -> usize {
     4
+}
+
+fn default_chunk_size() -> usize {
+    500_000
+}
+
+fn default_docstore_batch_size() -> usize {
+    100_000
 }
 
 #[derive(Deserialize)]
@@ -191,9 +204,9 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         let def: IndexDefinition = serde_json::from_str(&json).map_err(|e| e.to_string())?;
 
         // Create engine from persisted config
-        let docstore_path = path.join("docstore.redb");
+        let docstore_path = path.join("docs");
         let mut config = def.config.clone();
-        config.storage.bitmap_path = Some(path.join("bitmaps.redb"));
+        config.storage.bitmap_path = Some(path.join("bitmaps"));
 
         // Always use new_with_path so bitmaps restore from bitmap_path even if
         // docstore doesn't exist yet (it will be created fresh).
@@ -220,6 +233,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             definition: def,
             load_progress: Arc::new(AtomicU64::new(alive)),
             load_status: Arc::new(Mutex::new(load_status)),
+            load_started_at: Arc::new(Mutex::new(None)),
         });
 
         // Only restore the first index (single-index for now)
@@ -289,9 +303,9 @@ async fn handle_create_index(
     }
 
     // Create engine
-    let docstore_path = index_dir.join("docstore.redb");
+    let docstore_path = index_dir.join("docs");
     let mut config = req.config;
-    config.storage.bitmap_path = Some(index_dir.join("bitmaps.redb"));
+    config.storage.bitmap_path = Some(index_dir.join("bitmaps"));
 
     let engine = match ConcurrentEngine::new_with_path(config, &docstore_path) {
         Ok(e) => e,
@@ -308,6 +322,7 @@ async fn handle_create_index(
         definition,
         load_progress: Arc::new(AtomicU64::new(0)),
         load_status: Arc::new(Mutex::new(LoadStatus::Idle)),
+        load_started_at: Arc::new(Mutex::new(None)),
     });
 
     (
@@ -399,7 +414,7 @@ async fn handle_load(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<LoadRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema, load_progress, load_status) = {
+    let (engine, schema, load_progress, load_status, load_started_at) = {
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => {
@@ -418,6 +433,7 @@ async fn handle_load(
                     idx.definition.data_schema.clone(),
                     Arc::clone(&idx.load_progress),
                     Arc::clone(&idx.load_status),
+                    Arc::clone(&idx.load_started_at),
                 )
             }
             _ => {
@@ -437,8 +453,9 @@ async fn handle_load(
         ).into_response();
     }
 
-    // Reset progress
+    // Reset progress and record start time
     load_progress.store(0, Ordering::Release);
+    *load_started_at.lock() = Some(Instant::now());
     *load_status.lock() = LoadStatus::Loading {
         records_loaded: 0,
         elapsed_secs: 0.0,
@@ -446,6 +463,8 @@ async fn handle_load(
 
     let limit = req.limit;
     let threads = req.threads;
+    let chunk_size = req.chunk_size;
+    let docstore_batch_size = req.docstore_batch_size;
     let progress = Arc::clone(&load_progress);
     let status = Arc::clone(&load_status);
 
@@ -454,7 +473,7 @@ async fn handle_load(
         // Enter loading mode
         engine.enter_loading_mode();
 
-        match loader::load_ndjson(&engine, &schema, &path, limit, threads, progress.clone()) {
+        match loader::load_ndjson(&engine, &schema, &path, limit, threads, chunk_size, docstore_batch_size, progress.clone()) {
             Ok(stats) => {
                 // Exit loading mode (publishes staging and restarts maintenance)
                 engine.exit_loading_mode();
@@ -462,17 +481,19 @@ async fn handle_load(
                 let alive = engine.alive_count();
                 eprintln!("Load complete: {} records alive", alive);
 
-                // Save bitmap snapshot for fast restart
-                if let Err(e) = engine.save_snapshot() {
-                    eprintln!("Warning: failed to save bitmap snapshot: {e}");
-                } else {
-                    eprintln!("Bitmap snapshot saved");
-                }
-
+                // Report load complete immediately — bitmap snapshot save can be slow
                 *status.lock() = LoadStatus::Complete {
                     records_loaded: stats.records_loaded,
                     elapsed_secs: stats.elapsed.as_secs_f64(),
                 };
+
+                // Save bitmap snapshot for fast restart (may take a while on NTFS)
+                let snap_start = Instant::now();
+                if let Err(e) = engine.save_snapshot() {
+                    eprintln!("Warning: failed to save bitmap snapshot: {e}");
+                } else {
+                    eprintln!("Bitmap snapshot saved in {:.1}s", snap_start.elapsed().as_secs_f64());
+                }
             }
             Err(e) => {
                 engine.exit_loading_mode();
@@ -497,13 +518,16 @@ async fn handle_load_status(
     match guard.as_ref() {
         Some(idx) if idx.definition.name == name => {
             let status = idx.load_status.lock().clone();
-            // If still loading, update records_loaded from the atomic counter
+            // If still loading, update records_loaded and elapsed from live counters
             let status = match status {
                 LoadStatus::Loading { .. } => {
                     let loaded = idx.load_progress.load(Ordering::Acquire);
+                    let elapsed = idx.load_started_at.lock()
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
                     LoadStatus::Loading {
                         records_loaded: loaded,
-                        elapsed_secs: 0.0, // we don't track start time here; could be added
+                        elapsed_secs: elapsed,
                     }
                 }
                 other => other,

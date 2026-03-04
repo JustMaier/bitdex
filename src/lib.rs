@@ -1,4 +1,4 @@
-pub mod bitmap_store;
+pub mod bitmap_fs;
 pub mod bound_cache;
 pub mod cache;
 pub mod concurrency;
@@ -13,14 +13,12 @@ pub mod loader;
 pub mod meta_index;
 pub mod mutation;
 pub mod parser;
-pub mod pending_buffer;
 pub mod planner;
 pub mod query;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod slot;
 pub mod sort;
-pub mod tier2_cache;
 pub mod time_buckets;
 pub mod types;
 pub mod versioned_bitmap;

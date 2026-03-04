@@ -30,43 +30,43 @@ fn civitai_config() -> Config {
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "tagIds".to_string(),
                 field_type: FilterFieldType::MultiValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "userId".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "modelVersionIds".to_string(),
                 field_type: FilterFieldType::MultiValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "onSite".to_string(),
                 field_type: FilterFieldType::Boolean,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "hasMeta".to_string(),
                 field_type: FilterFieldType::Boolean,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "type".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
         ],
@@ -114,19 +114,19 @@ fn minimal_config() -> Config {
             FilterFieldConfig {
                 name: "status".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
                 field_type: FilterFieldType::MultiValue,
-                storage: Default::default(),
+
                 behaviors: None,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
                 field_type: FilterFieldType::Boolean,
-                storage: Default::default(),
+
                 behaviors: None,
             },
         ],

@@ -177,17 +177,17 @@ fn memrchr_newline(data: &[u8]) -> Option<usize> {
 fn civitai_config() -> Config {
     Config {
         filter_fields: vec![
-            FilterFieldConfig { name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "userId".into(), field_type: FilterFieldType::SingleValue, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "type".into(), field_type: FilterFieldType::SingleValue, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "hasMeta".into(), field_type: FilterFieldType::Boolean, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "onSite".into(), field_type: FilterFieldType::Boolean, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "poi".into(), field_type: FilterFieldType::Boolean, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "minor".into(), field_type: FilterFieldType::Boolean, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "tagIds".into(), field_type: FilterFieldType::MultiValue, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "modelVersionIds".into(), field_type: FilterFieldType::MultiValue, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "toolIds".into(), field_type: FilterFieldType::MultiValue, storage: Default::default(), behaviors: None },
-            FilterFieldConfig { name: "techniqueIds".into(), field_type: FilterFieldType::MultiValue, storage: Default::default(), behaviors: None },
+            FilterFieldConfig { name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue, behaviors: None },
+            FilterFieldConfig { name: "userId".into(), field_type: FilterFieldType::SingleValue, behaviors: None },
+            FilterFieldConfig { name: "type".into(), field_type: FilterFieldType::SingleValue, behaviors: None },
+            FilterFieldConfig { name: "hasMeta".into(), field_type: FilterFieldType::Boolean, behaviors: None },
+            FilterFieldConfig { name: "onSite".into(), field_type: FilterFieldType::Boolean, behaviors: None },
+            FilterFieldConfig { name: "poi".into(), field_type: FilterFieldType::Boolean, behaviors: None },
+            FilterFieldConfig { name: "minor".into(), field_type: FilterFieldType::Boolean, behaviors: None },
+            FilterFieldConfig { name: "tagIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None },
+            FilterFieldConfig { name: "modelVersionIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None },
+            FilterFieldConfig { name: "toolIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None },
+            FilterFieldConfig { name: "techniqueIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None },
         ],
         sort_fields: vec![
             SortFieldConfig { name: "reactionCount".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32 },
@@ -408,6 +408,24 @@ extern "system" {
 #[cfg(target_os = "windows")]
 unsafe fn windows_process_handle() -> isize {
     GetCurrentProcess()
+}
+
+fn dir_size(path: &std::path::Path) -> u64 {
+    fn recurse(p: &std::path::Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for entry in entries.flatten() {
+                let ft = entry.file_type().unwrap_or_else(|_| unreachable!());
+                if ft.is_file() {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                } else if ft.is_dir() {
+                    total += recurse(&entry.path());
+                }
+            }
+        }
+        total
+    }
+    recurse(path)
 }
 
 fn format_bytes(b: u64) -> String {
@@ -689,7 +707,7 @@ fn main() {
         println!("Bench dir: {}", bench_dir.display());
         println!();
     }
-    let persist_path = bench_dir.join("bitmaps.redb");
+    let persist_path = bench_dir.join("bitmaps");
 
     let limit = args.limit.unwrap_or(usize::MAX);
 
@@ -1209,8 +1227,8 @@ fn main() {
         engine.save_snapshot_to(&persist_path).unwrap();
         let persist_elapsed = persist_start.elapsed();
 
-        let file_size = std::fs::metadata(&persist_path).map(|m| m.len()).unwrap_or(0);
-        println!("  Saved {} alive in {:.2}s (bitmaps.redb: {})",
+        let file_size = dir_size(&persist_path);
+        println!("  Saved {} alive in {:.2}s (bitmaps dir: {})",
             alive_before, persist_elapsed.as_secs_f64(), format_bytes(file_size));
         println!("  RSS: {}", format_bytes(rss_bytes()));
         println!();
@@ -1223,7 +1241,7 @@ fn main() {
         println!("--- Phase: Restore (load from bitmap snapshot) ---");
 
         if !persist_path.exists() {
-            eprintln!("  ERROR: no bitmaps.redb found at {}. Run with 'persist' stage first.", persist_path.display());
+            eprintln!("  ERROR: no bitmaps dir found at {}. Run with 'persist' stage first.", persist_path.display());
         } else {
             let rss_before = rss_bytes();
 
@@ -1235,7 +1253,7 @@ fn main() {
             let restored = if args.in_memory_docstore {
                 ConcurrentEngine::new(restore_config).unwrap()
             } else {
-                let db_path = bench_dir.join("restored_docstore.redb");
+                let db_path = bench_dir.join("restored_docs");
                 ConcurrentEngine::new_with_path(restore_config, &db_path).unwrap()
             };
             let restore_elapsed = restore_start.elapsed();

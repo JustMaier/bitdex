@@ -505,13 +505,13 @@ mod tests {
         filters.add_field(FilterFieldConfig {
             name: "status".to_string(),
             field_type: FilterFieldType::SingleValue,
-            storage: crate::config::StorageMode::default(),
+
             behaviors: None,
         });
         filters.add_field(FilterFieldConfig {
             name: "tagIds".to_string(),
             field_type: FilterFieldType::MultiValue,
-            storage: crate::config::StorageMode::default(),
+
             behaviors: None,
         });
         filters

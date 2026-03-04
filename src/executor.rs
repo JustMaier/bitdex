@@ -2,17 +2,14 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
-use crate::bitmap_store::BitmapStore;
 use crate::bound_cache::{BoundCacheManager, BoundKey};
 use crate::cache::{self, CacheLookup, CacheKey, TrieCache};
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
-use crate::pending_buffer::PendingBuffer;
 use crate::planner;
 use crate::query::{FilterClause, SortClause, SortDirection, Value};
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
-use crate::tier2_cache::Tier2Cache;
 use crate::types::QueryResult;
 
 /// Convert a Value to a u64 bitmap key for filter indexing.
@@ -24,16 +21,6 @@ fn value_to_bitmap_key(val: &Value) -> Option<u64> {
     }
 }
 
-/// Provides Tier 2 bitmap resolution: moka cache + pending buffer + redb store.
-///
-/// Passed to the executor so it can resolve filter clauses for high-cardinality
-/// fields (tagIds, userId) that are not stored in the in-memory snapshot.
-pub struct Tier2Resolver {
-    pub cache: Arc<Tier2Cache>,
-    pub pending: Arc<parking_lot::Mutex<PendingBuffer>>,
-    pub store: Arc<BitmapStore>,
-}
-
 /// Query executor: computes filter intersections and sort traversals.
 /// Uses the query planner for cardinality-based clause ordering.
 pub struct QueryExecutor<'a> {
@@ -41,7 +28,6 @@ pub struct QueryExecutor<'a> {
     filters: &'a FilterIndex,
     sorts: &'a SortIndex,
     max_page_size: usize,
-    tier2: Option<&'a Tier2Resolver>,
     time_buckets: Option<&'a crate::time_buckets::TimeBucketManager>,
     now_unix: u64,
     bound_cache: Option<&'a parking_lot::Mutex<BoundCacheManager>>,
@@ -59,26 +45,6 @@ impl<'a> QueryExecutor<'a> {
             filters,
             sorts,
             max_page_size,
-            tier2: None,
-            time_buckets: None,
-            now_unix: 0,
-            bound_cache: None,
-        }
-    }
-
-    pub fn with_tier2(
-        slots: &'a SlotAllocator,
-        filters: &'a FilterIndex,
-        sorts: &'a SortIndex,
-        max_page_size: usize,
-        tier2: &'a Tier2Resolver,
-    ) -> Self {
-        Self {
-            slots,
-            filters,
-            sorts,
-            max_page_size,
-            tier2: Some(tier2),
             time_buckets: None,
             now_unix: 0,
             bound_cache: None,
@@ -438,10 +404,6 @@ impl<'a> QueryExecutor<'a> {
                         .map(|vb| vb.fused())
                         .unwrap_or_default());
                 }
-                // Fall back to Tier 2 (moka cache + pending + redb)
-                if let Some(tier2) = &self.tier2 {
-                    return self.evaluate_tier2_eq(field, value, tier2);
-                }
                 Err(BitdexError::FieldNotFound(field.clone()))
             }
 
@@ -469,10 +431,6 @@ impl<'a> QueryExecutor<'a> {
                         }
                     }
                     return Ok(result);
-                }
-                // Fall back to Tier 2
-                if let Some(tier2) = &self.tier2 {
-                    return self.evaluate_tier2_in(field, values, tier2);
                 }
                 Err(BitdexError::FieldNotFound(field.clone()))
             }
@@ -545,60 +503,6 @@ impl<'a> QueryExecutor<'a> {
             // Pre-computed bucket bitmap from range snapping (C3): use the bitmap directly.
             FilterClause::BucketBitmap { bitmap, .. } => Ok(bitmap.as_ref().clone()),
         }
-    }
-
-    /// Resolve an Eq filter against a Tier 2 field via moka cache + pending + redb.
-    fn evaluate_tier2_eq(
-        &self,
-        field: &str,
-        value: &Value,
-        tier2: &Tier2Resolver,
-    ) -> Result<RoaringBitmap> {
-        let key = value_to_bitmap_key(value).ok_or_else(|| BitdexError::InvalidValue {
-            field: field.to_string(),
-            reason: "cannot convert to bitmap key".to_string(),
-        })?;
-        let field_arc: Arc<str> = Arc::from(field);
-        let store = Arc::clone(&tier2.store);
-        let pending = Arc::clone(&tier2.pending);
-        let field_for_loader = Arc::clone(&field_arc);
-        let bm = tier2.cache.get_or_load(&field_arc, key, move || {
-            let mut bitmap = store.load_single(&field_for_loader, key)?;
-            // Apply any pending mutations (take() consumes them — moka caches the result)
-            if let Some(mutations) = pending.lock().take(&field_for_loader, key) {
-                mutations.apply_to(&mut bitmap);
-            }
-            Ok(bitmap)
-        })?;
-        Ok(bm.as_ref().clone())
-    }
-
-    /// Resolve an In filter against a Tier 2 field via moka cache + pending + redb.
-    fn evaluate_tier2_in(
-        &self,
-        field: &str,
-        values: &[Value],
-        tier2: &Tier2Resolver,
-    ) -> Result<RoaringBitmap> {
-        let field_arc: Arc<str> = Arc::from(field);
-        let mut result = RoaringBitmap::new();
-        for val in values {
-            let Some(key) = value_to_bitmap_key(val) else {
-                continue;
-            };
-            let store = Arc::clone(&tier2.store);
-            let pending = Arc::clone(&tier2.pending);
-            let field_for_loader = Arc::clone(&field_arc);
-            let bm = tier2.cache.get_or_load(&field_arc, key, move || {
-                let mut bitmap = store.load_single(&field_for_loader, key)?;
-                if let Some(mutations) = pending.lock().take(&field_for_loader, key) {
-                    mutations.apply_to(&mut bitmap);
-                }
-                Ok(bitmap)
-            })?;
-            result |= bm.as_ref();
-        }
-        Ok(result)
     }
 
     /// Evaluate a range filter by scanning the filter field's bitmaps.
@@ -803,25 +707,25 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
                 FilterFieldConfig {
                     name: "userId".to_string(),
                     field_type: FilterFieldType::SingleValue,
-                    storage: crate::config::StorageMode::default(),
+
                     behaviors: None,
                 },
             ],
@@ -1295,7 +1199,6 @@ mod tests {
         filters.add_field(FilterFieldConfig {
             name: "sortAt".to_string(),
             field_type: FilterFieldType::SingleValue,
-            storage: crate::config::StorageMode::default(),
             behaviors: None,
         });
         let executor = QueryExecutor::new(
