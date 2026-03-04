@@ -19,8 +19,11 @@
 //! At 105M records with 16K/shard = 6400 files (vs 105M individual files).
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use rayon::prelude::*;
 
 use crate::error::{BitdexError, Result};
 use crate::mutation::FieldValue;
@@ -80,11 +83,11 @@ impl DocStore {
 
     // ---- Shard path helpers ----
 
-    fn shard_id(slot_id: u32) -> u32 {
+    pub(crate) fn shard_id(slot_id: u32) -> u32 {
         slot_id >> SHARD_SHIFT
     }
 
-    fn shard_path(root: &Path, shard_id: u32) -> PathBuf {
+    pub(crate) fn shard_path(root: &Path, shard_id: u32) -> PathBuf {
         // Nest into hex subdirectories: shards/AB/000123.bin
         // Top byte of shard_id → 256 dirs, keeps each dir under ~1000 files at any scale.
         let dir_byte = ((shard_id >> 8) & 0xFF) as u8;
@@ -197,7 +200,7 @@ impl DocStore {
 
     /// Write a complete shard file from a sorted list of (slot_id, raw_bytes).
     /// The data section is zstd-compressed as a single block for efficiency.
-    fn write_shard_file(path: &Path, entries: &[(u32, Vec<u8>)]) -> Result<()> {
+    pub(crate) fn write_shard_file(path: &Path, entries: &[(u32, Vec<u8>)]) -> Result<()> {
         // Concatenate all raw doc bytes
         let total_raw: usize = entries.iter().map(|(_, d)| d.len()).sum();
         let mut raw_data = Vec::with_capacity(total_raw);
@@ -250,7 +253,7 @@ impl DocStore {
     }
 
     /// Read and decompress a shard file, returning (index_entries, decompressed_data).
-    fn read_shard_file(data: &[u8]) -> Result<(Vec<(u32, u32, u32)>, Vec<u8>)> {
+    pub(crate) fn read_shard_file(data: &[u8]) -> Result<(Vec<(u32, u32, u32)>, Vec<u8>)> {
         let entries = Self::read_shard_index(data)?;
         let index_end = Self::data_section_offset(entries.len());
 
@@ -462,6 +465,130 @@ impl DocStore {
     /// No-op for filesystem store.
     pub fn compact(&mut self) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Prepare for bulk loading: ensure field dictionary contains all field names,
+    /// then return a BulkWriter that can encode and write docs without the DocStore lock.
+    pub fn prepare_bulk_load(&mut self, field_names: &[String]) -> Result<BulkWriter> {
+        let mut changed = false;
+        for name in field_names {
+            let old_len = self.idx_to_field.len();
+            self.ensure_field_idx(name);
+            if self.idx_to_field.len() > old_len {
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_field_dict()?;
+        }
+        Ok(BulkWriter {
+            field_to_idx: self.field_to_idx.clone(),
+            root: self.root.clone(),
+            shard_locks: Arc::new(DashMap::new()),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BulkWriter — lock-free parallel docstore writes for bulk loading
+// ---------------------------------------------------------------------------
+
+/// Lock-free docstore writer for bulk loading.
+///
+/// Created by `DocStore::prepare_bulk_load()`. Holds a snapshot of the field
+/// dictionary and the docstore root path. Multiple threads can call
+/// `write_batch()` concurrently — per-shard locking ensures boundary shards
+/// (where consecutive blocks share a shard) are handled correctly.
+pub struct BulkWriter {
+    field_to_idx: HashMap<String, u16>,
+    root: PathBuf,
+    /// Per-shard locks: only contended at block boundaries (~1 shard per block).
+    /// Most shards are written by exactly one thread → zero contention.
+    shard_locks: Arc<DashMap<u32, parking_lot::Mutex<()>>>,
+}
+
+impl BulkWriter {
+    /// Write a batch of documents using parallel encoding and parallel shard writes.
+    ///
+    /// - Encoding: rayon-parallel msgpack serialization (CPU-bound, no lock)
+    /// - Shard writes: rayon-parallel file I/O (per-shard lock for boundary safety)
+    pub fn write_batch(&self, docs: Vec<(u32, StoredDoc)>) {
+        if docs.is_empty() {
+            return;
+        }
+
+        // Step 1: Parallel encode docs to msgpack
+        let encoded: Vec<(u32, Vec<u8>)> = docs
+            .into_par_iter()
+            .map(|(slot, doc)| {
+                let bytes = self.encode_doc(&doc);
+                (slot, bytes)
+            })
+            .collect();
+
+        // Step 2: Group by shard
+        let mut by_shard: HashMap<u32, Vec<(u32, Vec<u8>)>> = HashMap::new();
+        for (slot, bytes) in encoded {
+            by_shard
+                .entry(DocStore::shard_id(slot))
+                .or_default()
+                .push((slot, bytes));
+        }
+
+        // Step 3: Parallel write shard files with per-shard locking
+        let shards: Vec<(u32, Vec<(u32, Vec<u8>)>)> = by_shard.into_iter().collect();
+        shards.into_par_iter().for_each(|(sid, mut new_entries)| {
+            new_entries.sort_by_key(|e| e.0);
+
+            // Per-shard lock: prevents concurrent writers from clobbering
+            // the same shard file (only happens at block boundaries).
+            self.shard_locks
+                .entry(sid)
+                .or_insert_with(|| parking_lot::Mutex::new(()));
+            let shard_lock = self.shard_locks.get(&sid).unwrap();
+            let _guard = shard_lock.lock();
+
+            let path = DocStore::shard_path(&self.root, sid);
+
+            // Read existing entries (if any) and merge
+            let mut entries: Vec<(u32, Vec<u8>)> = match std::fs::read(&path) {
+                Ok(file_data) => {
+                    match DocStore::read_shard_file(&file_data) {
+                        Ok((index, decompressed)) => {
+                            let new_ids: std::collections::HashSet<u32> =
+                                new_entries.iter().map(|(id, _)| *id).collect();
+                            index
+                                .iter()
+                                .filter(|(s, _, _)| !new_ids.contains(s))
+                                .map(|(s, off, len)| {
+                                    let start = *off as usize;
+                                    (*s, decompressed[start..start + *len as usize].to_vec())
+                                })
+                                .collect()
+                        }
+                        Err(_) => Vec::new(), // corrupted shard, overwrite
+                    }
+                }
+                Err(_) => Vec::new(), // new shard
+            };
+
+            entries.append(&mut new_entries);
+            entries.sort_by_key(|e| e.0);
+
+            if let Err(e) = DocStore::write_shard_file(&path, &entries) {
+                eprintln!("BulkWriter: shard {} write failed: {e}", sid);
+            }
+        });
+    }
+
+    fn encode_doc(&self, doc: &StoredDoc) -> Vec<u8> {
+        let mut pairs: Vec<(u16, PackedValue)> = Vec::with_capacity(doc.fields.len());
+        for (name, fv) in &doc.fields {
+            if let Some(&idx) = self.field_to_idx.get(name.as_str()) {
+                pairs.push((idx, pack_field_value(fv)));
+            }
+        }
+        rmp_serde::to_vec(&pairs).unwrap_or_default()
     }
 }
 

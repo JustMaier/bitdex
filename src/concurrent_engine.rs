@@ -1187,6 +1187,13 @@ impl ConcurrentEngine {
         self.docstore.lock().compact()
     }
 
+    /// Prepare a BulkWriter for lock-free parallel docstore writes during bulk loading.
+    /// The BulkWriter holds a snapshot of the field dictionary and can encode/write
+    /// docs without acquiring the DocStore Mutex.
+    pub fn prepare_bulk_writer(&self, field_names: &[String]) -> crate::error::Result<crate::docstore::BulkWriter> {
+        self.docstore.lock().prepare_bulk_load(field_names)
+    }
+
     /// Return the set of indexed field names (filter + sort + "id").
     /// Used by the loader to strip doc-only fields from the bitmap accumulator.
     pub fn indexed_field_names(&self) -> std::collections::HashSet<String> {

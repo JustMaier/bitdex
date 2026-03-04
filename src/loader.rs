@@ -24,6 +24,7 @@ use roaring::RoaringBitmap;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{DataSchema, FieldMapping, FieldValueType};
+use crate::docstore::StoredDoc;
 use crate::mutation::{Document, FieldValue};
 use crate::query::Value;
 
@@ -264,9 +265,20 @@ pub fn load_ndjson(
     let mut chunks_processed: usize = 0;
     let wall_start = Instant::now();
 
-    // Docstore writers run fully concurrent — bitmap apply never blocks on docstore.
-    // Writers serialize docs (CPU-bound, parallel) then write to redb (lock-serialized).
-    // Memory: ~340K docs × 1KB per in-flight writer, acceptable on modern hardware.
+    // Prepare BulkWriter: snapshot field dictionary once, then write lock-free.
+    // Per-shard Mutex handles boundary shards; most shards see zero contention.
+    let all_field_names: Vec<String> = schema
+        .fields
+        .iter()
+        .map(|f| f.target.clone())
+        .chain(std::iter::once("id".to_string()))
+        .collect();
+    let bulk_writer = Arc::new(
+        engine
+            .prepare_bulk_writer(&all_field_names)
+            .expect("prepare_bulk_writer"),
+    );
+
     let mut ds_handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
     while let Ok(chunk) = chunk_rx.recv() {
@@ -294,9 +306,18 @@ pub fn load_ndjson(
             chunks_processed, total_inserted, rate, apply_ms
         );
 
-        // Spawn docstore writer immediately — bitmap path never blocks
+        // Spawn parallel docstore writer via BulkWriter — no Mutex on DocStore.
+        // BulkWriter encodes in parallel (rayon), groups by shard, writes with per-shard locks.
         if !chunk.full_docs.is_empty() {
-            ds_handles.push(engine.spawn_docstore_writer(chunk.full_docs));
+            let writer = Arc::clone(&bulk_writer);
+            ds_handles.push(thread::spawn(move || {
+                let stored: Vec<(u32, StoredDoc)> = chunk
+                    .full_docs
+                    .into_iter()
+                    .map(|(slot, doc)| (slot, StoredDoc { fields: doc.fields }))
+                    .collect();
+                writer.write_batch(stored);
+            }));
         }
     }
 
