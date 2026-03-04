@@ -24,8 +24,11 @@ use roaring::RoaringBitmap;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{DataSchema, FieldMapping, FieldValueType};
+#[cfg(test)]
 use crate::docstore::StoredDoc;
+#[cfg(test)]
 use crate::mutation::FieldValue;
+#[cfg(test)]
 use crate::query::Value;
 
 /// Statistics from a completed load operation.
@@ -241,9 +244,8 @@ pub fn load_ndjson(
                         let slot = base_id + i as u32;
                         match serde_json::from_str::<serde_json::Value>(line) {
                             Ok(json) => {
-                                // Encode doc to msgpack bytes in-fold — no separate rayon pass
-                                let stored = json_to_stored_doc(&json, schema);
-                                let bytes = writer.encode_doc(&stored);
+                                // Encode doc directly from JSON — no StoredDoc allocation
+                                let bytes = writer.encode_json(&json, schema);
                                 acc.encoded_docs.push((slot, bytes));
 
                                 // Build bitmaps directly from JSON
@@ -501,7 +503,8 @@ fn extract_integer(raw: &serde_json::Value, truncate_u32: bool) -> Option<i64> {
 }
 
 /// Convert a raw JSON value to a StoredDoc using the DataSchema field mappings.
-/// Returns StoredDoc directly — no intermediate Document allocation.
+/// Used by tests to verify field mapping correctness.
+#[cfg(test)]
 fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDoc {
     let mut fields = HashMap::new();
 
@@ -546,6 +549,7 @@ fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDo
 }
 
 /// Convert a raw serde_json Value field to a FieldValue.
+#[cfg(test)]
 fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<FieldValue> {
     match mapping.value_type {
         FieldValueType::Integer => {

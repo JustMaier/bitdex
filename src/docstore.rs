@@ -25,6 +25,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use rayon::prelude::*;
 
+use crate::config::{DataSchema, FieldMapping, FieldValueType};
 use crate::error::{BitdexError, Result};
 use crate::mutation::FieldValue;
 use crate::query::Value;
@@ -580,6 +581,53 @@ impl BulkWriter {
         }
         rmp_serde::to_vec(&pairs).unwrap_or_default()
     }
+
+    /// Encode a JSON value directly to msgpack bytes using the DataSchema.
+    /// Skips the intermediate StoredDoc/HashMap allocation entirely —
+    /// walks schema fields once, converts JSON → PackedValue → msgpack.
+    pub fn encode_json(&self, json: &serde_json::Value, schema: &DataSchema) -> Vec<u8> {
+        let mut pairs: Vec<(u16, PackedValue)> =
+            Vec::with_capacity(schema.fields.len() + 1);
+
+        // ID field
+        if let Some(id_val) = json.get(&schema.id_field) {
+            if let Some(&idx) = self.field_to_idx.get("id") {
+                if let Some(n) = id_val
+                    .as_i64()
+                    .or_else(|| id_val.as_u64().map(|u| u as i64))
+                {
+                    pairs.push((idx, PackedValue::I(n)));
+                }
+            }
+        }
+
+        // Schema fields
+        for mapping in &schema.fields {
+            let Some(&idx) = self.field_to_idx.get(&mapping.target) else {
+                continue;
+            };
+
+            let raw = json
+                .get(&mapping.source)
+                .or_else(|| mapping.fallback.as_ref().and_then(|fb| json.get(fb)));
+
+            let raw = match raw {
+                Some(v) if !v.is_null() => v,
+                _ => {
+                    if matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
+                        pairs.push((idx, PackedValue::B(false)));
+                    }
+                    continue;
+                }
+            };
+
+            if let Some(pv) = json_to_packed(raw, mapping) {
+                pairs.push((idx, pv));
+            }
+        }
+
+        rmp_serde::to_vec(&pairs).unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +670,52 @@ fn pack_value(v: &Value) -> PackedValue {
         Value::Float(f) => PackedValue::F(*f),
         Value::Bool(b) => PackedValue::B(*b),
         Value::String(s) => PackedValue::S(s.clone()),
+    }
+}
+
+/// Convert a raw JSON value directly to PackedValue based on field mapping type.
+/// Skips FieldValue intermediate — JSON → PackedValue in one step.
+fn json_to_packed(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<PackedValue> {
+    match mapping.value_type {
+        FieldValueType::Integer => {
+            let n = raw
+                .as_i64()
+                .or_else(|| raw.as_u64().map(|u| u as i64))
+                .or_else(|| raw.as_f64().map(|f| f as i64))?;
+            let n = if mapping.truncate_u32 {
+                (n as u32) as i64
+            } else {
+                n
+            };
+            Some(PackedValue::I(n))
+        }
+        FieldValueType::Boolean => Some(PackedValue::B(raw.as_bool()?)),
+        FieldValueType::String => Some(PackedValue::S(raw.as_str()?.to_string())),
+        FieldValueType::MappedString => {
+            let s = raw.as_str()?;
+            let n = mapping
+                .string_map
+                .as_ref()
+                .and_then(|m| m.get(s).copied())
+                .unwrap_or(0);
+            Some(PackedValue::I(n))
+        }
+        FieldValueType::IntegerArray => {
+            let arr = raw.as_array()?;
+            if arr.is_empty() {
+                return None;
+            }
+            let values: Vec<i64> = arr
+                .iter()
+                .filter_map(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                .collect();
+            if values.is_empty() {
+                None
+            } else {
+                Some(PackedValue::Mi(values))
+            }
+        }
+        FieldValueType::ExistsBoolean => Some(PackedValue::B(true)),
     }
 }
 
