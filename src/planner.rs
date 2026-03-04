@@ -263,7 +263,7 @@ mod tests {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
-                &self.docstore,
+                &mut self.docstore,
             );
             engine.put(id, doc).unwrap();
             // Eager merge: mirror Engine::put() behavior

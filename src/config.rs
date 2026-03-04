@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterFieldType;
@@ -394,6 +396,63 @@ fn default_encoding() -> String {
 }
 fn default_bits() -> u8 {
     32
+}
+
+// ---------------------------------------------------------------------------
+// Data Schema — describes how to map raw NDJSON fields to engine Documents
+// ---------------------------------------------------------------------------
+
+/// Schema describing how raw NDJSON records map to engine documents.
+/// Used by the generic loader to convert arbitrary JSON into Documents.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DataSchema {
+    /// Name of the JSON field containing the document ID.
+    pub id_field: String,
+    /// Field mapping rules: source JSON → target engine field.
+    #[serde(default)]
+    pub fields: Vec<FieldMapping>,
+}
+
+/// Maps a single source JSON field to a target engine field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldMapping {
+    /// Source field name in the raw JSON.
+    pub source: String,
+    /// Target field name in the engine Document.
+    pub target: String,
+    /// How to interpret/convert the value.
+    pub value_type: FieldValueType,
+    /// Fallback source field if the primary is missing.
+    #[serde(default)]
+    pub fallback: Option<String>,
+    /// For `mapped_string`: map string values to integer IDs.
+    #[serde(default)]
+    pub string_map: Option<HashMap<String, i64>>,
+    /// If true, this field is stored in docstore only (not bitmap-indexed).
+    #[serde(default)]
+    pub doc_only: bool,
+    /// If true, cast the value to u32 before storing (for unix timestamps that exceed u32::MAX).
+    #[serde(default)]
+    pub truncate_u32: bool,
+}
+
+/// How a field value should be interpreted during NDJSON loading.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldValueType {
+    /// Numeric value → Value::Integer
+    Integer,
+    /// Boolean value → Value::Bool
+    Boolean,
+    /// String value → Value::String (doc-only, not bitmap-indexed)
+    String,
+    /// String mapped to integer via string_map → Value::Integer
+    MappedString,
+    /// Array of integers → FieldValue::Multi
+    IntegerArray,
+    /// Computed boolean: true if the source field exists and is non-null, false otherwise.
+    /// Useful for "isPublished", "hasBlockedFor", "isRemix", etc.
+    ExistsBoolean,
 }
 
 #[cfg(test)]

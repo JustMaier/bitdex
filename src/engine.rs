@@ -105,7 +105,7 @@ impl Engine {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
-                &self.docstore,
+                &mut self.docstore,
             );
             engine.put(id, doc)
         };
@@ -144,7 +144,7 @@ impl Engine {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
-                &self.docstore,
+                &mut self.docstore,
             );
             engine.patch(id, patch)
         };
@@ -176,7 +176,7 @@ impl Engine {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
-                &self.docstore,
+                &mut self.docstore,
             );
             engine.delete(id)
         };
@@ -216,7 +216,7 @@ impl Engine {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
-                &self.docstore,
+                &mut self.docstore,
             );
             engine.delete_where(&matching)
         };

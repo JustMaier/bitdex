@@ -870,7 +870,7 @@ mod tests {
                 &mut self.filters,
                 &mut self.sorts,
                 &self.config,
-                &self.docstore,
+                &mut self.docstore,
             );
             engine.put(id, doc).unwrap();
             // Eager merge: mirror Engine::put() behavior
@@ -1131,7 +1131,7 @@ mod tests {
                 &mut h.filters,
                 &mut h.sorts,
                 &h.config,
-                &h.docstore,
+                &mut h.docstore,
             );
             engine.delete(1).unwrap();
         }

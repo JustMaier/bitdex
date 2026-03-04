@@ -21,7 +21,7 @@ pub struct Document {
 }
 
 /// A field value in a mutation payload.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FieldValue {
     /// Single value for single_value and boolean fields.
     Single(Value),
@@ -436,7 +436,7 @@ pub struct MutationEngine<'a> {
     filters: &'a mut FilterIndex,
     sorts: &'a mut SortIndex,
     config: &'a Config,
-    docstore: &'a DocStore,
+    docstore: &'a mut DocStore,
 }
 
 impl<'a> MutationEngine<'a> {
@@ -445,7 +445,7 @@ impl<'a> MutationEngine<'a> {
         filters: &'a mut FilterIndex,
         sorts: &'a mut SortIndex,
         config: &'a Config,
-        docstore: &'a DocStore,
+        docstore: &'a mut DocStore,
     ) -> Self {
         Self {
             slots,
@@ -855,9 +855,9 @@ mod tests {
 
     #[test]
     fn test_put_insert() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
 
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -915,9 +915,9 @@ mod tests {
 
     #[test]
     fn test_put_upsert_replaces_old_values() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
 
         let doc1 = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -964,9 +964,9 @@ mod tests {
 
     #[test]
     fn test_patch_filter_field() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
 
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -1010,9 +1010,9 @@ mod tests {
 
     #[test]
     fn test_patch_sort_field_uses_xor() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
 
         let doc = make_doc(vec![
             ("reactionCount", FieldValue::Single(Value::Integer(100))),
@@ -1043,9 +1043,9 @@ mod tests {
 
     #[test]
     fn test_patch_multi_value_field() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
 
         let doc = make_doc(vec![(
             "tagIds",
@@ -1096,9 +1096,9 @@ mod tests {
 
     #[test]
     fn test_delete_only_clears_alive() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
 
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -1134,17 +1134,17 @@ mod tests {
 
     #[test]
     fn test_delete_nonexistent() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
         assert!(engine.delete(999).is_err());
     }
 
     #[test]
     fn test_patch_nonexistent() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
         let patch = PatchPayload {
             fields: HashMap::new(),
         };
@@ -1153,12 +1153,12 @@ mod tests {
 
     #[test]
     fn test_delete_where() {
-        let (mut slots, mut filters, mut sorts, config, docstore) = setup();
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
 
         // Insert docs
         {
             let mut engine =
-                MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+                MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
             for i in 0..10u32 {
                 let doc = make_doc(vec![(
                     "nsfwLevel",
@@ -1181,7 +1181,7 @@ mod tests {
             .unwrap()
             .clone();
         let mut engine =
-            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &docstore);
+            MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
         let deleted = engine.delete_where(&matching).unwrap();
         assert_eq!(deleted, 5);
         assert_eq!(slots.alive_count(), 5);

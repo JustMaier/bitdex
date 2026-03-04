@@ -1,0 +1,82 @@
+{
+  "name": "civitai",
+  "config": {
+    "filter_fields": [
+      { "name": "nsfwLevel", "field_type": "single_value" },
+      { "name": "combinedNsfwLevel", "field_type": "single_value" },
+      { "name": "userId", "field_type": "single_value" },
+      { "name": "type", "field_type": "single_value" },
+      { "name": "baseModel", "field_type": "single_value" },
+      { "name": "availability", "field_type": "single_value" },
+      { "name": "postId", "field_type": "single_value" },
+      { "name": "postedToId", "field_type": "single_value" },
+      { "name": "remixOfId", "field_type": "single_value" },
+      { "name": "hasMeta", "field_type": "boolean" },
+      { "name": "onSite", "field_type": "boolean" },
+      { "name": "poi", "field_type": "boolean" },
+      { "name": "minor", "field_type": "boolean" },
+      { "name": "isPublished", "field_type": "boolean" },
+      { "name": "isRemix", "field_type": "boolean" },
+      { "name": "hasBlockedFor", "field_type": "boolean" },
+      { "name": "tagIds", "field_type": "multi_value" },
+      { "name": "modelVersionIds", "field_type": "multi_value" },
+      { "name": "modelVersionIdsManual", "field_type": "multi_value" },
+      { "name": "toolIds", "field_type": "multi_value" },
+      { "name": "techniqueIds", "field_type": "multi_value" }
+    ],
+    "sort_fields": [
+      { "name": "reactionCount", "bits": 32 },
+      { "name": "sortAt", "bits": 32 },
+      { "name": "commentCount", "bits": 32 },
+      { "name": "collectedCount", "bits": 32 },
+      { "name": "publishedAt", "bits": 32 },
+      { "name": "id", "bits": 32 }
+    ],
+    "max_page_size": 200
+  },
+  "data_schema": {
+    "id_field": "id",
+    "fields": [
+      { "source": "nsfwLevel", "target": "nsfwLevel", "value_type": "integer", "fallback": "combinedNsfwLevel" },
+      { "source": "combinedNsfwLevel", "target": "combinedNsfwLevel", "value_type": "integer" },
+      { "source": "userId", "target": "userId", "value_type": "integer" },
+      { "source": "type", "target": "type", "value_type": "mapped_string", "string_map": { "image": 1, "video": 2, "audio": 3 } },
+      { "source": "baseModel", "target": "baseModel", "value_type": "mapped_string", "string_map": {
+        "SD 1.4": 1, "SD 1.5": 2, "SD 1.5 LCM": 3, "SD 2.0": 4, "SD 2.0 768": 5, "SD 2.1": 6, "SD 2.1 768": 7,
+        "SDXL 0.9": 10, "SDXL 1.0": 11, "SDXL 1.0 LCM": 12, "SDXL Distilled": 13, "SDXL Turbo": 14, "SDXL Lightning": 15, "SDXL Hyper": 16,
+        "Pony": 20, "Flux.1 S": 30, "Flux.1 D": 31, "Flux.1 D2": 32, "Illustrious": 40, "NoobAI": 41, "Stable Cascade": 50,
+        "SVD": 60, "SVD XT": 61, "Stable Audio": 70, "HunyuanDiT": 80, "HunyuanVideo": 81, "Mochi": 82, "LTXV": 83, "CogVideoX": 84,
+        "Kolors": 90, "Lumina": 91, "PixArt a": 92, "PixArt E": 93
+      }},
+      { "source": "availability", "target": "availability", "value_type": "mapped_string", "string_map": {
+        "Public": 1, "Private": 2, "Unsearchable": 3
+      }},
+      { "source": "postId", "target": "postId", "value_type": "integer" },
+      { "source": "postedToId", "target": "postedToId", "value_type": "integer" },
+      { "source": "remixOfId", "target": "remixOfId", "value_type": "integer" },
+      { "source": "publishedAtUnix", "target": "isPublished", "value_type": "exists_boolean" },
+      { "source": "remixOfId", "target": "isRemix", "value_type": "exists_boolean" },
+      { "source": "blockedFor", "target": "hasBlockedFor", "value_type": "exists_boolean" },
+      { "source": "hasMeta", "target": "hasMeta", "value_type": "boolean" },
+      { "source": "onSite", "target": "onSite", "value_type": "boolean" },
+      { "source": "poi", "target": "poi", "value_type": "boolean" },
+      { "source": "minor", "target": "minor", "value_type": "boolean" },
+      { "source": "tagIds", "target": "tagIds", "value_type": "integer_array" },
+      { "source": "modelVersionIds", "target": "modelVersionIds", "value_type": "integer_array" },
+      { "source": "modelVersionIdsManual", "target": "modelVersionIdsManual", "value_type": "integer_array" },
+      { "source": "toolIds", "target": "toolIds", "value_type": "integer_array" },
+      { "source": "techniqueIds", "target": "techniqueIds", "value_type": "integer_array" },
+      { "source": "reactionCount", "target": "reactionCount", "value_type": "integer" },
+      { "source": "sortAtUnix", "target": "sortAt", "value_type": "integer", "fallback": "sortAt", "truncate_u32": true },
+      { "source": "commentCount", "target": "commentCount", "value_type": "integer" },
+      { "source": "collectedCount", "target": "collectedCount", "value_type": "integer" },
+      { "source": "publishedAtUnix", "target": "publishedAt", "value_type": "integer", "truncate_u32": true },
+      { "source": "url", "target": "url", "value_type": "string", "doc_only": true },
+      { "source": "hash", "target": "hash", "value_type": "string", "doc_only": true },
+      { "source": "width", "target": "width", "value_type": "integer", "doc_only": true },
+      { "source": "height", "target": "height", "value_type": "integer", "doc_only": true },
+      { "source": "needsReview", "target": "needsReview", "value_type": "string", "doc_only": true },
+      { "source": "acceptableMinor", "target": "acceptableMinor", "value_type": "boolean", "doc_only": true }
+    ]
+  }
+}

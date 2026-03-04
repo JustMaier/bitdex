@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BitDex V2</title>
+<title>BitDex V2 — Civitai Demo</title>
 <style>
   :root {
     --bg: #0a0e14; --surface: #12171f; --surface-2: #1a2030; --border: #252d3a;
@@ -21,7 +21,7 @@
     overflow-y: scroll;
   }
 
-  /* ── Fixed Header ── */
+  /* Fixed Header */
   .header {
     position: fixed; top: 0; left: 0; right: 0; z-index: 100;
     background: var(--surface); border-bottom: 1px solid var(--border);
@@ -50,12 +50,12 @@
   .toggle-btn:hover { border-color: var(--accent); color: var(--text); }
   .toggle-btn.active { background: var(--accent-glow); border-color: var(--accent); color: var(--accent); }
 
-  /* ── Filter Panel ── */
+  /* Filter Panel */
   .filter-panel {
     position: fixed; top: var(--header-h); left: 0; right: 0; z-index: 90;
     background: var(--surface); border-bottom: 1px solid var(--border);
     overflow: hidden; transition: max-height 0.3s ease, padding 0.3s ease;
-    max-height: 300px; padding: 12px 20px;
+    max-height: 400px; padding: 12px 20px;
   }
   .filter-panel.collapsed { max-height: 0; padding: 0 20px; }
   .filter-grid {
@@ -76,20 +76,33 @@
   .field select:focus, .field input:focus { border-color: var(--accent); }
   .field input::placeholder { color: var(--text-muted); }
 
+  /* NSFW checkbox group */
+  .nsfw-group {
+    display: flex; flex-wrap: wrap; gap: 4px;
+  }
+  .nsfw-group label {
+    display: flex; align-items: center; gap: 3px;
+    font-size: 11px; font-weight: 500; color: var(--text-dim);
+    text-transform: none; letter-spacing: 0; cursor: pointer;
+  }
+  .nsfw-group input[type="checkbox"] {
+    width: 14px; height: 14px; accent-color: var(--accent);
+  }
+
   .sort-row {
     display: flex; gap: 8px; margin-top: 8px; align-items: end; flex-wrap: wrap;
   }
   .sort-row .field { min-width: 140px; }
 
-  /* ── Content Area ── */
+  /* Content Area */
   .content {
     padding-top: calc(var(--header-h) + 12px);
     min-height: 100vh;
     transition: padding-top 0.3s ease;
   }
-  .content.filters-open { padding-top: calc(var(--header-h) + 160px); }
+  .content.filters-open { padding-top: calc(var(--header-h) + 200px); }
 
-  /* ── Image Grid ── */
+  /* Image Grid */
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -129,7 +142,7 @@
     backdrop-filter: blur(4px);
   }
 
-  /* ── Detail Modal ── */
+  /* Detail Modal */
   .modal-overlay {
     display: none; position: fixed; inset: 0; z-index: 200;
     background: rgba(0,0,0,0.8); backdrop-filter: blur(4px);
@@ -156,7 +169,7 @@
     width: 32px; height: 32px; color: #fff; font-size: 18px; cursor: pointer;
   }
 
-  /* ── Raw JSON Toggle ── */
+  /* Raw JSON Toggle */
   .raw-panel {
     display: none; padding: 8px 16px;
   }
@@ -174,7 +187,7 @@
     padding: 4px 14px; font-size: 12px; cursor: pointer;
   }
 
-  /* ── Loading / Scroll sentinel ── */
+  /* Loading / Scroll sentinel */
   .scroll-sentinel { height: 1px; }
   .load-more-indicator {
     text-align: center; padding: 20px; color: var(--text-dim); font-size: 13px;
@@ -186,7 +199,7 @@
   }
   .error-toast.show { display: block; }
 
-  /* ── Spinner ── */
+  /* Spinner */
   @keyframes spin { to { transform: rotate(360deg); } }
   .spinner {
     width: 20px; height: 20px; border: 2px solid var(--border);
@@ -194,7 +207,7 @@
     animation: spin 0.6s linear infinite; display: inline-block;
   }
 
-  /* ── Empty state ── */
+  /* Empty state */
   .empty-state {
     text-align: center; padding: 60px 20px; color: var(--text-dim);
   }
@@ -226,17 +239,16 @@
 <!-- Filter Panel -->
 <div class="filter-panel" id="filter-panel">
   <div class="filter-grid">
-    <div class="field">
+    <div class="field" style="grid-column: span 2">
       <label>NSFW Level</label>
-      <select id="f-nsfwLevel">
-        <option value="">Any</option>
-        <option value="1" selected>1 - None</option>
-        <option value="2">2 - Soft</option>
-        <option value="4">4 - Mature</option>
-        <option value="8">8 - X</option>
-        <option value="16">16 - Blocked</option>
-        <option value="32">32 - Max</option>
-      </select>
+      <div class="nsfw-group" id="nsfw-group">
+        <label><input type="checkbox" value="1" checked> PG</label>
+        <label><input type="checkbox" value="2"> PG-13</label>
+        <label><input type="checkbox" value="4"> Mature</label>
+        <label><input type="checkbox" value="8"> X</label>
+        <label><input type="checkbox" value="16"> XXX</label>
+        <label><input type="checkbox" value="32"> Blocked</label>
+      </div>
     </div>
     <div class="field">
       <label>Type</label>
@@ -245,6 +257,20 @@
         <option value="1">Image</option>
         <option value="2">Video</option>
         <option value="3">Audio</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Base Model</label>
+      <select id="f-baseModel">
+        <option value="">Any</option>
+        <option value="2">SD 1.5</option>
+        <option value="11">SDXL 1.0</option>
+        <option value="20">Pony</option>
+        <option value="31">Flux.1 D</option>
+        <option value="40">Illustrious</option>
+        <option value="41">NoobAI</option>
+        <option value="30">Flux.1 S</option>
+        <option value="32">Flux.1 D2</option>
       </select>
     </div>
     <div class="field">
@@ -258,6 +284,14 @@
     <div class="field">
       <label>Model Versions</label>
       <input type="text" id="f-modelVersionIds" placeholder="100, 200">
+    </div>
+    <div class="field">
+      <label>Tool IDs</label>
+      <input type="text" id="f-toolIds" placeholder="1, 2">
+    </div>
+    <div class="field">
+      <label>Technique IDs</label>
+      <input type="text" id="f-techniqueIds" placeholder="1, 2">
     </div>
     <div class="field">
       <label>Has Meta</label>
@@ -281,10 +315,10 @@
       <label>Sort By</label>
       <select id="sort-field">
         <option value="">Newest (slot order)</option>
-        <option value="reactionCount" selected>Reactions</option>
+        <option value="reactionCount" selected>Most Reactions</option>
         <option value="sortAt">Date</option>
-        <option value="commentCount">Comments</option>
-        <option value="collectedCount">Collections</option>
+        <option value="commentCount">Most Comments</option>
+        <option value="collectedCount">Most Collected</option>
         <option value="id">ID</option>
       </select>
     </div>
@@ -338,8 +372,19 @@
 <div class="error-toast" id="error-toast"></div>
 
 <script>
-const API = '';
+// ── Configuration ──
+// API base URL — default empty string means same origin.
+// Change this if the UI is served separately from the BitDex server.
+const API_URL = '';
+// Index name to query against
+const INDEX_NAME = 'civitai';
+// Civitai image CDN base
 const IMG_BASE = 'https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA';
+
+// Build API path for this index
+function apiPath(suffix) {
+  return `${API_URL}/api/indexes/${INDEX_NAME}${suffix}`;
+}
 
 // State
 let currentCursor = null;
@@ -350,40 +395,59 @@ let totalMatched = 0;
 let lastQueryTime = 0;
 let debounceTimer = null;
 let filtersVisible = true;
-let currentQueryId = 0; // monotonic query version to discard stale responses
+let currentQueryId = 0;
 
-// ── Civitai image URL from GUID ──
+// Civitai image URL from GUID
 function imgUrl(guid, width = 400) {
   if (!guid) return null;
   return `${IMG_BASE}/${guid}/width=${width}/image.jpeg`;
 }
 
-// ── Build Query JSON from UI controls ──
+// Civitai base model name from integer ID (reverse of string_map in config)
+const BASE_MODEL_NAMES = {
+  1: 'SD 1.4', 2: 'SD 1.5', 3: 'SD 1.5 LCM', 4: 'SD 2.0', 5: 'SD 2.0 768',
+  6: 'SD 2.1', 7: 'SD 2.1 768', 10: 'SDXL 0.9', 11: 'SDXL 1.0', 12: 'SDXL 1.0 LCM',
+  13: 'SDXL Distilled', 14: 'SDXL Turbo', 15: 'SDXL Lightning', 16: 'SDXL Hyper',
+  20: 'Pony', 30: 'Flux.1 S', 31: 'Flux.1 D', 32: 'Flux.1 D2',
+  40: 'Illustrious', 41: 'NoobAI', 50: 'Stable Cascade',
+  60: 'SVD', 61: 'SVD XT', 70: 'Stable Audio',
+  80: 'HunyuanDiT', 81: 'HunyuanVideo', 82: 'Mochi', 83: 'LTXV', 84: 'CogVideoX',
+  90: 'Kolors', 91: 'Lumina', 92: 'PixArt a', 93: 'PixArt E',
+};
+
+// Build Query JSON from UI controls
 function buildQuery(cursor) {
   const filters = [];
 
-  const nsfw = document.getElementById('f-nsfwLevel').value;
-  if (nsfw) filters.push({ Eq: ['nsfwLevel', { Integer: parseInt(nsfw) }] });
+  // NSFW Level — multi-checkbox → In clause
+  const nsfwChecked = [...document.querySelectorAll('#nsfw-group input[type="checkbox"]:checked')]
+    .map(cb => parseInt(cb.value));
+  if (nsfwChecked.length > 0 && nsfwChecked.length < 6) {
+    if (nsfwChecked.length === 1) {
+      filters.push({ Eq: ['nsfwLevel', { Integer: nsfwChecked[0] }] });
+    } else {
+      filters.push({ In: ['nsfwLevel', nsfwChecked.map(v => ({ Integer: v }))] });
+    }
+  }
 
   const type_ = document.getElementById('f-type').value;
   if (type_) filters.push({ Eq: ['type', { Integer: parseInt(type_) }] });
 
-  const tagIds = document.getElementById('f-tagIds').value.trim();
-  if (tagIds) {
-    const ids = tagIds.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
-    if (ids.length === 1) filters.push({ Eq: ['tagIds', { Integer: ids[0] }] });
-    else if (ids.length > 1) filters.push({ In: ['tagIds', ids.map(v => ({ Integer: v }))] });
+  const baseModel = document.getElementById('f-baseModel').value;
+  if (baseModel) filters.push({ Eq: ['baseModel', { Integer: parseInt(baseModel) }] });
+
+  // Integer list fields
+  for (const field of ['tagIds', 'modelVersionIds', 'toolIds', 'techniqueIds']) {
+    const val = document.getElementById('f-' + field).value.trim();
+    if (val) {
+      const ids = val.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
+      if (ids.length === 1) filters.push({ Eq: [field, { Integer: ids[0] }] });
+      else if (ids.length > 1) filters.push({ In: [field, ids.map(v => ({ Integer: v }))] });
+    }
   }
 
   const userId = document.getElementById('f-userId').value.trim();
   if (userId && !isNaN(parseInt(userId))) filters.push({ Eq: ['userId', { Integer: parseInt(userId) }] });
-
-  const mvIds = document.getElementById('f-modelVersionIds').value.trim();
-  if (mvIds) {
-    const ids = mvIds.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
-    if (ids.length === 1) filters.push({ Eq: ['modelVersionIds', { Integer: ids[0] }] });
-    else if (ids.length > 1) filters.push({ In: ['modelVersionIds', ids.map(v => ({ Integer: v }))] });
-  }
 
   for (const field of ['hasMeta', 'onSite', 'poi', 'minor']) {
     const val = document.getElementById('f-' + field).value;
@@ -400,10 +464,11 @@ function buildQuery(cursor) {
   return query;
 }
 
-// ── Stats ──
+// Stats
 async function fetchStats() {
   try {
-    const r = await fetch(API + '/api/stats');
+    const r = await fetch(apiPath('/stats'));
+    if (!r.ok) return;
     const d = await r.json();
     document.getElementById('stat-alive').textContent = Number(d.alive_count).toLocaleString();
   } catch(e) {}
@@ -421,7 +486,7 @@ function updateQueryStats(elapsedUs, matched, shown) {
   document.getElementById('stat-returned').textContent = Number(shown).toLocaleString();
 }
 
-// ── Query Execution ──
+// Query Execution
 async function executeQuery(query, append = false) {
   if (isLoading) return;
   isLoading = true;
@@ -438,14 +503,13 @@ async function executeQuery(query, append = false) {
   document.getElementById('load-indicator').style.display = '';
 
   try {
-    const r = await fetch(API + '/api/query', {
+    const r = await fetch(apiPath('/query'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(query),
     });
     const d = await r.json();
 
-    // Discard stale responses
     if (qid !== currentQueryId) { isLoading = false; return; }
 
     if (d.error) {
@@ -461,7 +525,6 @@ async function executeQuery(query, append = false) {
     hasMore = !!d.cursor && d.ids.length > 0;
 
     if (d.ids.length > 0) {
-      // Batch fetch documents for all IDs
       await renderCards(d.ids, append);
       totalShown += d.ids.length;
     }
@@ -480,14 +543,13 @@ async function executeQuery(query, append = false) {
   document.getElementById('load-indicator').style.display = 'none';
 }
 
-// ── Render Image Cards ──
+// Render Image Cards
 async function renderCards(slotIds, append) {
   const grid = document.getElementById('grid');
 
-  // Batch fetch docs
   let docs = {};
   try {
-    const r = await fetch(API + '/api/documents', {
+    const r = await fetch(apiPath('/documents'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ slot_ids: slotIds }),
@@ -498,9 +560,7 @@ async function renderCards(slotIds, append) {
         docs[doc.slot_id] = doc.fields;
       }
     }
-  } catch(e) {
-    // Fall back to rendering without doc details
-  }
+  } catch(e) {}
 
   const frag = document.createDocumentFragment();
 
@@ -510,13 +570,11 @@ async function renderCards(slotIds, append) {
     card.className = 'card';
     card.onclick = () => openModal(slotId, fields);
 
-    // Extract field values
     const url = extractField(fields, 'url');
     const reactions = extractField(fields, 'reactionCount');
     const width = extractField(fields, 'width');
     const height = extractField(fields, 'height');
-    const nsfw = extractField(fields, 'nsfwLevel');
-    const baseModel = extractField(fields, 'baseModel');
+    const baseModelId = extractField(fields, 'baseModel');
 
     const thumbUrl = imgUrl(url, 400);
 
@@ -535,7 +593,6 @@ async function renderCards(slotIds, append) {
       card.appendChild(ph);
     }
 
-    // Dimension badge
     if (width && height) {
       const badge = document.createElement('div');
       badge.className = 'card-dims';
@@ -543,15 +600,15 @@ async function renderCards(slotIds, append) {
       card.appendChild(badge);
     }
 
-    // Model badge
-    if (baseModel && baseModel !== '') {
+    // Show base model name (Civitai-specific label)
+    const baseModelName = BASE_MODEL_NAMES[baseModelId];
+    if (baseModelName) {
       const badge = document.createElement('div');
       badge.className = 'card-badge';
-      badge.textContent = baseModel;
+      badge.textContent = baseModelName;
       card.appendChild(badge);
     }
 
-    // Meta row
     const meta = document.createElement('div');
     meta.className = 'card-meta';
     meta.innerHTML = `<span class="reactions">${reactions != null ? '\u2764 ' + Number(reactions).toLocaleString() : ''}</span>` +
@@ -564,13 +621,10 @@ async function renderCards(slotIds, append) {
   grid.appendChild(frag);
 }
 
-// ── Extract a field value from the docstore format ──
+// Extract a field value from the docstore format
 function extractField(fields, name) {
   if (!fields || !fields[name]) return null;
   const v = fields[name];
-  // FieldValue::Single(Value::Integer(x)) → { "Single": { "Integer": x } }
-  // FieldValue::Single(Value::String(x)) → { "Single": { "String": x } }
-  // FieldValue::Single(Value::Bool(x)) → { "Single": { "Bool": x } }
   if (v.Single) {
     if (v.Single.Integer !== undefined) return v.Single.Integer;
     if (v.Single.String !== undefined) return v.Single.String;
@@ -588,7 +642,7 @@ function extractField(fields, name) {
   return v;
 }
 
-// ── Detail Modal ──
+// Detail Modal
 function openModal(slotId, fields) {
   const modal = document.getElementById('modal');
   const img = document.getElementById('modal-img');
@@ -599,7 +653,6 @@ function openModal(slotId, fields) {
   img.src = bigUrl || '';
   img.style.display = bigUrl ? '' : 'none';
 
-  // Build field list
   dl.innerHTML = '';
   if (fields) {
     const order = ['id', 'url', 'baseModel', 'nsfwLevel', 'type', 'width', 'height',
@@ -610,16 +663,19 @@ function openModal(slotId, fields) {
     for (const key of order) {
       if (fields[key]) {
         shown.add(key);
-        addModalField(dl, key, extractField(fields, key));
+        let val = extractField(fields, key);
+        // Civitai-specific: show base model name
+        if (key === 'baseModel' && typeof val === 'number') {
+          val = BASE_MODEL_NAMES[val] || `Unknown (${val})`;
+        }
+        addModalField(dl, key, val);
       }
     }
-    // Show remaining fields
     for (const key of Object.keys(fields)) {
       if (!shown.has(key)) addModalField(dl, key, extractField(fields, key));
     }
   }
 
-  // Add slot ID
   const dt = document.createElement('dt'); dt.textContent = 'slot_id';
   const dd = document.createElement('dd'); dd.textContent = slotId;
   dl.prepend(dd); dl.prepend(dt);
@@ -643,7 +699,7 @@ function closeModal() {
   document.getElementById('modal').classList.remove('open');
 }
 
-// ── Toggle Controls ──
+// Toggle Controls
 function toggleFilters() {
   const panel = document.getElementById('filter-panel');
   const btn = document.getElementById('btn-filters');
@@ -672,7 +728,7 @@ async function runRawQuery() {
   } catch(e) { showError('Invalid JSON: ' + e.message); }
 }
 
-// ── Error Toast ──
+// Error Toast
 function showError(msg) {
   const el = document.getElementById('error-toast');
   el.textContent = msg;
@@ -680,18 +736,15 @@ function showError(msg) {
   setTimeout(() => el.classList.remove('show'), 5000);
 }
 
-// ── Live Query (debounced) ──
+// Live Query (debounced)
 function onFilterChange() {
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     const query = buildQuery(null);
-    // Update raw JSON if open
     const rawPanel = document.getElementById('raw-panel');
     if (rawPanel.classList.contains('open')) {
       document.getElementById('raw-query').value = JSON.stringify(query, null, 2);
     }
-    // Force-allow the new query even if a scroll/previous query is in-flight.
-    // The currentQueryId mechanism discards stale responses, so this is safe.
     isLoading = false;
     executeQuery(query, false);
   }, 200);
@@ -699,19 +752,23 @@ function onFilterChange() {
 
 // Attach live-update listeners to all filter controls
 function attachListeners() {
-  const ids = ['f-nsfwLevel', 'f-type', 'f-tagIds', 'f-userId', 'f-modelVersionIds',
-               'f-hasMeta', 'f-onSite', 'f-poi', 'f-minor', 'sort-field', 'sort-dir', 'limit'];
-  for (const id of ids) {
-    const el = document.getElementById(id);
-    if (el.tagName === 'SELECT') {
-      el.addEventListener('change', onFilterChange);
-    } else {
-      el.addEventListener('input', onFilterChange);
-    }
+  const selectIds = ['f-type', 'f-baseModel', 'f-hasMeta', 'f-onSite', 'f-poi', 'f-minor', 'sort-field', 'sort-dir'];
+  const inputIds = ['f-tagIds', 'f-userId', 'f-modelVersionIds', 'f-toolIds', 'f-techniqueIds', 'limit'];
+
+  for (const id of selectIds) {
+    document.getElementById(id).addEventListener('change', onFilterChange);
+  }
+  for (const id of inputIds) {
+    document.getElementById(id).addEventListener('input', onFilterChange);
+  }
+
+  // NSFW checkboxes
+  for (const cb of document.querySelectorAll('#nsfw-group input[type="checkbox"]')) {
+    cb.addEventListener('change', onFilterChange);
   }
 }
 
-// ── Infinite Scroll ──
+// Infinite Scroll
 function setupInfiniteScroll() {
   const observer = new IntersectionObserver((entries) => {
     for (const entry of entries) {
@@ -725,17 +782,15 @@ function setupInfiniteScroll() {
   observer.observe(document.getElementById('scroll-sentinel'));
 }
 
-// ── Keyboard shortcuts ──
+// Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeModal();
 });
 
-// ── Init ──
+// Init
 fetchStats();
 attachListeners();
 setupInfiniteScroll();
-
-// Run initial query after a short delay to let the page render
 setTimeout(() => onFilterChange(), 100);
 </script>
 

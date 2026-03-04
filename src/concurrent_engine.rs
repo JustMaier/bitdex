@@ -52,7 +52,7 @@ pub struct ConcurrentEngine {
     cache: Arc<parking_lot::Mutex<TrieCache>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
-    docstore: Arc<DocStore>,
+    docstore: Arc<parking_lot::Mutex<DocStore>>,
     config: Arc<Config>,
     field_registry: FieldRegistry,
     in_flight: InFlightTracker,
@@ -203,7 +203,7 @@ impl ConcurrentEngine {
         let (doc_tx, doc_rx): (Sender<(u32, StoredDoc)>, Receiver<(u32, StoredDoc)>) =
             crossbeam_channel::bounded(config.channel_capacity);
 
-        let docstore = Arc::new(docstore);
+        let docstore = Arc::new(parking_lot::Mutex::new(docstore));
 
         // Collect Tier 1 filter field names for cache invalidation
         let filter_field_names: Vec<String> = config
@@ -519,7 +519,7 @@ impl ConcurrentEngine {
                     }
                     let doc_count = doc_batch.len();
                     if doc_count > 0 {
-                        if let Err(e) = docstore.put_batch(&doc_batch) {
+                        if let Err(e) = docstore.lock().put_batch(&doc_batch) {
                             eprintln!("docstore batch write failed: {e}");
                         }
                     }
@@ -580,7 +580,7 @@ impl ConcurrentEngine {
                     doc_batch.push(item);
                 }
                 if !doc_batch.is_empty() {
-                    if let Err(e) = docstore.put_batch(&doc_batch) {
+                    if let Err(e) = docstore.lock().put_batch(&doc_batch) {
                         eprintln!("docstore final batch write failed: {e}");
                     }
                 }
@@ -774,7 +774,7 @@ impl ConcurrentEngine {
 
             // Read old doc from docstore if needed
             let old_doc = if is_upsert || was_allocated {
-                self.docstore.get(id)?
+                self.docstore.lock().get(id)?
             } else {
                 None
             };
@@ -1354,7 +1354,26 @@ impl ConcurrentEngine {
 
     /// Retrieve a stored document by slot ID from the docstore.
     pub fn get_document(&self, slot_id: u32) -> Result<Option<StoredDoc>> {
-        self.docstore.get(slot_id)
+        self.docstore.lock().get(slot_id)
+    }
+
+    /// Compact the docstore, reclaiming space from old write transactions.
+    pub fn compact_docstore(&self) -> Result<bool> {
+        self.docstore.lock().compact()
+    }
+
+    /// Return the set of indexed field names (filter + sort + "id").
+    /// Used by the loader to strip doc-only fields from the bitmap accumulator.
+    pub fn indexed_field_names(&self) -> std::collections::HashSet<String> {
+        let mut s = std::collections::HashSet::new();
+        for f in &self.config.filter_fields {
+            s.insert(f.name.clone());
+        }
+        for f in &self.config.sort_fields {
+            s.insert(f.name.clone());
+        }
+        s.insert("id".to_string());
+        s
     }
 
     /// Get the current pending buffer depth (number of pending entries).
@@ -1587,7 +1606,7 @@ impl ConcurrentEngine {
                 .iter()
                 .map(|&(id, is_upsert, was_allocated)| {
                     if is_upsert || was_allocated {
-                        self.docstore.get(id).ok().flatten()
+                        self.docstore.lock().get(id).ok().flatten()
                     } else {
                         None
                     }
@@ -1722,19 +1741,19 @@ impl ConcurrentEngine {
     pub fn spawn_docstore_writer(&self, docs: Vec<(u32, Document)>) -> JoinHandle<()> {
         let docstore = Arc::clone(&self.docstore);
         thread::spawn(move || {
-            let batch_size = 5_000;
+            let batch_size = 100_000;
             let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
             for (slot, doc) in docs {
                 batch.push((slot, StoredDoc { fields: doc.fields }));
                 if batch.len() >= batch_size {
-                    if let Err(e) = docstore.put_batch(&batch) {
+                    if let Err(e) = docstore.lock().put_batch(&batch) {
                         eprintln!("put_bulk: docstore batch write failed: {e}");
                     }
                     batch.clear();
                 }
             }
             if !batch.is_empty() {
-                if let Err(e) = docstore.put_batch(&batch) {
+                if let Err(e) = docstore.lock().put_batch(&batch) {
                     eprintln!("put_bulk: docstore batch write failed: {e}");
                 }
             }
@@ -1750,14 +1769,14 @@ impl ConcurrentEngine {
         for (slot, doc) in docs {
             batch.push((*slot, StoredDoc { fields: doc.fields.clone() }));
             if batch.len() >= batch_size {
-                if let Err(e) = self.docstore.put_batch(&batch) {
+                if let Err(e) = self.docstore.lock().put_batch(&batch) {
                     eprintln!("write_docs_to_docstore: batch write failed: {e}");
                 }
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            if let Err(e) = self.docstore.put_batch(&batch) {
+            if let Err(e) = self.docstore.lock().put_batch(&batch) {
                 eprintln!("write_docs_to_docstore: batch write failed: {e}");
             }
         }
