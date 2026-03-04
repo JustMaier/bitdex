@@ -53,8 +53,6 @@ pub fn load_ndjson(
     let read_batch_size: usize = 500_000;
     let target_batch_bytes = read_batch_size * 600;
 
-    let mut staging = engine.clone_staging();
-
     // Build indexed field set for stripping doc-only fields from bitmap accumulator
     let indexed_fields = engine.indexed_field_names();
 
@@ -94,82 +92,115 @@ pub fn load_ndjson(
         }
     });
 
+    // ---- Stage 2: Parse thread ----
+    // Parses raw blocks into Documents using rayon, sends parsed chunks to bitmap stage.
+    // Runs concurrently with bitmap insertion so parsing and indexing overlap.
+
+    struct ParsedChunk {
+        stripped: Vec<(u32, Document)>,  // bitmap-only fields (for put_bulk_loading)
+        full: Vec<(u32, Document)>,       // full docs (for docstore)
+        errors: u64,
+    }
+
     let schema_ref = schema.clone();
+    let indexed_fields_clone = indexed_fields.clone();
+    let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<ParsedChunk>(2);
+
+    let parse_handle = thread::spawn(move || {
+        let mut id_counter: u32 = 0;
+        let mut total_parsed: usize = 0;
+
+        while let Ok(raw_block) = block_rx.recv() {
+            if total_parsed >= record_limit {
+                break;
+            }
+
+            let block_str = match std::str::from_utf8(&raw_block) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let base_id = id_counter;
+
+            let lines: Vec<&str> = block_str
+                .split('\n')
+                .map(|l| l.trim_end_matches('\r'))
+                .filter(|l| !l.is_empty())
+                .collect();
+            let line_count = lines.len() as u32;
+
+            // Parse into two Vecs simultaneously — full doc (for docstore) and
+            // stripped doc (bitmap-only fields). Avoids double allocation.
+            let indexed = &indexed_fields_clone;
+            let results: Vec<Option<(u32, Document, Document)>> = lines
+                .into_par_iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let id = base_id + i as u32;
+                    match serde_json::from_str::<serde_json::Value>(line) {
+                        Ok(json) => {
+                            let full_doc = json_to_document(&json, &schema_ref);
+                            // Build stripped doc inline — only indexed fields
+                            let stripped_fields = full_doc.fields.iter()
+                                .filter(|(k, _)| indexed.contains(k.as_str()))
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            Some((id, full_doc, Document { fields: stripped_fields }))
+                        }
+                        Err(_) => None,
+                    }
+                })
+                .collect();
+
+            id_counter += line_count;
+
+            let mut errors: u64 = 0;
+            let mut full_docs: Vec<(u32, Document)> = Vec::with_capacity(results.len());
+            let mut stripped_docs: Vec<(u32, Document)> = Vec::with_capacity(results.len());
+            for r in results {
+                if let Some((id, full, stripped)) = r {
+                    full_docs.push((id, full));
+                    stripped_docs.push((id, stripped));
+                } else {
+                    errors += 1;
+                }
+            }
+
+            // Respect limit
+            if total_parsed + full_docs.len() > record_limit {
+                let keep = record_limit - total_parsed;
+                full_docs.truncate(keep);
+                stripped_docs.truncate(keep);
+            }
+            total_parsed += full_docs.len();
+
+            if parsed_tx.send(ParsedChunk { stripped: stripped_docs, full: full_docs, errors }).is_err() {
+                break;
+            }
+        }
+    });
+
+    // ---- Stage 3: Bitmap + docstore (main thread) ----
+    // Receives parsed chunks and applies them to the engine.
+    // While put_bulk_loading runs, the parse thread is already parsing the next block.
+
+    let mut staging = engine.clone_staging();
     let mut doc_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
-    let mut id_counter: u32 = 0;
     let mut total_inserted: usize = 0;
     let mut total_errors: u64 = 0;
     let mut chunks_processed: usize = 0;
     let wall_start = Instant::now();
     let mut ds_handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
-    while let Ok(raw_block) = block_rx.recv() {
-        if total_inserted >= record_limit {
-            break;
-        }
-
-        let block_str = std::str::from_utf8(&raw_block).map_err(|e| format!("NDJSON not valid UTF-8: {e}"))?;
-        let base_id = id_counter;
-
-        let lines: Vec<&str> = block_str
-            .split('\n')
-            .map(|l| l.trim_end_matches('\r'))
-            .filter(|l| !l.is_empty())
-            .collect();
-        let line_count = lines.len() as u32;
-
-        let results: Vec<Option<(u32, Document)>> = lines
-            .into_par_iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let id = base_id + i as u32;
-                match serde_json::from_str::<serde_json::Value>(line) {
-                    Ok(json) => {
-                        let doc = json_to_document(&json, &schema_ref);
-                        Some((id, doc))
-                    }
-                    Err(_) => None,
-                }
-            })
-            .collect();
-
-        id_counter += line_count;
-
-        let mut parsed: Vec<(u32, Document)> = Vec::with_capacity(results.len());
-        for r in results {
-            if let Some(pair) = r {
-                parsed.push(pair);
-            } else {
-                total_errors += 1;
-            }
-        }
-
-        // Respect limit
-        if total_inserted + parsed.len() > record_limit {
-            parsed.truncate(record_limit - total_inserted);
-        }
-
-        // Strip doc-only fields for bitmap accumulator
-        let stripped: Vec<(u32, Document)> = parsed
-            .iter()
-            .map(|(id, doc)| {
-                let fields = doc
-                    .fields
-                    .iter()
-                    .filter(|(k, _)| indexed_fields.contains(k.as_str()))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                (*id, Document { fields })
-            })
-            .collect();
+    while let Ok(chunk) = parsed_rx.recv() {
+        total_errors += chunk.errors;
 
         // Move full docs to background docstore writer
         if let Some(h) = ds_handles.pop() {
             h.join().unwrap();
         }
-        ds_handles.push(engine.spawn_docstore_writer(parsed));
+        ds_handles.push(engine.spawn_docstore_writer(chunk.full));
 
-        doc_chunk.extend(stripped);
+        doc_chunk.extend(chunk.stripped);
 
         if doc_chunk.len() >= chunk_size {
             let count = engine.put_bulk_loading(&mut staging, &doc_chunk, threads);
@@ -198,8 +229,9 @@ pub fn load_ndjson(
         );
     }
 
-    // Drop the receiver so the reader thread stops
-    drop(block_rx);
+    // Wait for parse thread to finish
+    parse_handle.join().unwrap();
+    // Reader thread stops when block_rx is dropped inside parse thread
     reader_handle.join().unwrap();
 
     // Wait for all outstanding docstore writes
