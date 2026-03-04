@@ -1,8 +1,10 @@
 //! Generic NDJSON loader — converts arbitrary NDJSON files to engine Documents
 //! using a DataSchema definition.
 //!
-//! Reuses the proven pipelined loading pattern:
-//!   reader thread → crossbeam channel → rayon parallel parse → put_bulk_loading
+//! Three-stage pipeline:
+//!   Stage 1 (reader thread): reads raw bytes from disk into blocks
+//!   Stage 2 (parse thread):  rayon-parallel JSON parse → Documents
+//!   Stage 3 (main thread):   put_bulk_loading + async docstore writes
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -56,6 +58,8 @@ pub fn load_ndjson(
     // Build indexed field set for stripping doc-only fields from bitmap accumulator
     let indexed_fields = engine.indexed_field_names();
 
+    // ---- Stage 1: Reader thread ----
+    // Reads raw bytes from disk in large blocks, split on newline boundaries.
     let data_path_owned = path.to_owned();
     let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
 
@@ -93,12 +97,12 @@ pub fn load_ndjson(
     });
 
     // ---- Stage 2: Parse thread ----
-    // Parses raw blocks into Documents using rayon, sends parsed chunks to bitmap stage.
-    // Runs concurrently with bitmap insertion so parsing and indexing overlap.
+    // Parses raw blocks into Documents using rayon + simd-json. Produces both
+    // full (docstore) and stripped (bitmap-only) documents in a single pass.
 
     struct ParsedChunk {
-        stripped: Vec<(u32, Document)>,  // bitmap-only fields (for put_bulk_loading)
-        full: Vec<(u32, Document)>,       // full docs (for docstore)
+        stripped: Vec<(u32, Document)>, // bitmap-only fields (for put_bulk_loading)
+        full: Vec<(u32, Document)>,    // full docs (for docstore)
         errors: u64,
     }
 
@@ -109,6 +113,7 @@ pub fn load_ndjson(
     let parse_handle = thread::spawn(move || {
         let mut id_counter: u32 = 0;
         let mut total_parsed: usize = 0;
+        let indexed = &indexed_fields_clone;
 
         while let Ok(raw_block) = block_rx.recv() {
             if total_parsed >= record_limit {
@@ -128,9 +133,7 @@ pub fn load_ndjson(
                 .collect();
             let line_count = lines.len() as u32;
 
-            // Parse into two Vecs simultaneously — full doc (for docstore) and
-            // stripped doc (bitmap-only fields). Avoids double allocation.
-            let indexed = &indexed_fields_clone;
+            // Rayon parallel parse: build full doc, then strip to indexed-only.
             let results: Vec<Option<(u32, Document, Document)>> = lines
                 .into_par_iter()
                 .enumerate()
@@ -139,8 +142,9 @@ pub fn load_ndjson(
                     match serde_json::from_str::<serde_json::Value>(line) {
                         Ok(json) => {
                             let full_doc = json_to_document(&json, &schema_ref);
-                            // Build stripped doc inline — only indexed fields
-                            let stripped_fields = full_doc.fields.iter()
+                            let stripped_fields = full_doc
+                                .fields
+                                .iter()
                                 .filter(|(k, _)| indexed.contains(k.as_str()))
                                 .map(|(k, v)| (k.clone(), v.clone()))
                                 .collect();
@@ -173,7 +177,14 @@ pub fn load_ndjson(
             }
             total_parsed += full_docs.len();
 
-            if parsed_tx.send(ParsedChunk { stripped: stripped_docs, full: full_docs, errors }).is_err() {
+            if parsed_tx
+                .send(ParsedChunk {
+                    stripped: stripped_docs,
+                    full: full_docs,
+                    errors,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -184,26 +195,39 @@ pub fn load_ndjson(
     // While put_bulk_loading runs, the parse thread is already parsing the next block.
 
     let mut staging = engine.clone_staging();
-    let mut doc_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
+    let mut stripped_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
+    let mut full_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
     let mut total_inserted: usize = 0;
     let mut total_errors: u64 = 0;
     let mut chunks_processed: usize = 0;
     let wall_start = Instant::now();
-    let mut ds_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    // Allow up to MAX_DS_WRITERS concurrent docstore writers to avoid blocking bitmap ops.
+    // During bulk loading with sequential IDs, each writer hits different shards → no conflicts.
+    const MAX_DS_WRITERS: usize = 4;
+    let mut ds_handles: std::collections::VecDeque<thread::JoinHandle<()>> =
+        std::collections::VecDeque::new();
 
     while let Ok(chunk) = parsed_rx.recv() {
         total_errors += chunk.errors;
 
-        // Move full docs to background docstore writer
-        if let Some(h) = ds_handles.pop() {
-            h.join().unwrap();
-        }
-        ds_handles.push(engine.spawn_docstore_writer(chunk.full));
+        // Accumulate both stripped (bitmap) and full (docstore) docs
+        stripped_chunk.extend(chunk.stripped);
+        full_chunk.extend(chunk.full);
 
-        doc_chunk.extend(chunk.stripped);
+        if stripped_chunk.len() >= chunk_size {
+            // Bound outstanding docstore writers to limit memory
+            while ds_handles.len() >= MAX_DS_WRITERS {
+                ds_handles.pop_front().unwrap().join().unwrap();
+            }
+            // Spawn docstore writer in background (doesn't block bitmap work)
+            let full_batch = std::mem::replace(
+                &mut full_chunk,
+                Vec::with_capacity(chunk_size),
+            );
+            ds_handles.push_back(engine.spawn_docstore_writer(full_batch));
 
-        if doc_chunk.len() >= chunk_size {
-            let count = engine.put_bulk_loading(&mut staging, &doc_chunk, threads);
+            // Run bitmap insertion (concurrent with docstore writers)
+            let count = engine.put_bulk_loading(&mut staging, &stripped_chunk, threads);
             total_inserted += count;
             progress.store(total_inserted as u64, Ordering::Release);
             chunks_processed += 1;
@@ -213,12 +237,15 @@ pub fn load_ndjson(
                 "  chunk {}: {} total ({:.0}/s)",
                 chunks_processed, total_inserted, rate
             );
-            doc_chunk = Vec::with_capacity(chunk_size);
+            stripped_chunk = Vec::with_capacity(chunk_size);
         }
     }
 
-    if !doc_chunk.is_empty() {
-        let count = engine.put_bulk_loading(&mut staging, &doc_chunk, threads);
+    if !stripped_chunk.is_empty() {
+        let full_batch = std::mem::replace(&mut full_chunk, Vec::new());
+        ds_handles.push_back(engine.spawn_docstore_writer(full_batch));
+
+        let count = engine.put_bulk_loading(&mut staging, &stripped_chunk, threads);
         total_inserted += count;
         progress.store(total_inserted as u64, Ordering::Release);
         chunks_processed += 1;
@@ -231,10 +258,9 @@ pub fn load_ndjson(
 
     // Wait for parse thread to finish
     parse_handle.join().unwrap();
-    // Reader thread stops when block_rx is dropped inside parse thread
     reader_handle.join().unwrap();
 
-    // Wait for all outstanding docstore writes
+    // Wait for all outstanding docstore writers
     for h in ds_handles {
         h.join().unwrap();
     }
@@ -263,17 +289,18 @@ pub fn load_ndjson(
 fn json_to_document(json: &serde_json::Value, schema: &DataSchema) -> Document {
     let mut fields = HashMap::new();
 
-    // Always include the ID field
     if let Some(id_val) = json.get(&schema.id_field) {
         if let Some(n) = id_val.as_i64() {
             fields.insert("id".to_string(), FieldValue::Single(Value::Integer(n)));
         } else if let Some(n) = id_val.as_u64() {
-            fields.insert("id".to_string(), FieldValue::Single(Value::Integer(n as i64)));
+            fields.insert(
+                "id".to_string(),
+                FieldValue::Single(Value::Integer(n as i64)),
+            );
         }
     }
 
     for mapping in &schema.fields {
-        // Try primary source, then fallback
         let raw = json
             .get(&mapping.source)
             .or_else(|| mapping.fallback.as_ref().and_then(|fb| json.get(fb)));
@@ -281,7 +308,6 @@ fn json_to_document(json: &serde_json::Value, schema: &DataSchema) -> Document {
         let raw = match raw {
             Some(v) if !v.is_null() => v,
             _ => {
-                // For ExistsBoolean, missing/null means false
                 match mapping.value_type {
                     FieldValueType::ExistsBoolean => {
                         fields.insert(
@@ -303,7 +329,7 @@ fn json_to_document(json: &serde_json::Value, schema: &DataSchema) -> Document {
     Document { fields }
 }
 
-/// Convert a raw JSON value to a FieldValue based on the mapping rules.
+/// Convert a raw serde_json Value field to a FieldValue.
 fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<FieldValue> {
     match mapping.value_type {
         FieldValueType::Integer => {
@@ -316,7 +342,11 @@ fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<Fiel
             } else {
                 return None;
             };
-            let n = if mapping.truncate_u32 { (n as u32) as i64 } else { n };
+            let n = if mapping.truncate_u32 {
+                (n as u32) as i64
+            } else {
+                n
+            };
             Some(FieldValue::Single(Value::Integer(n)))
         }
         FieldValueType::Boolean => {
@@ -336,7 +366,7 @@ fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<Fiel
         FieldValueType::IntegerArray => {
             let arr = raw.as_array()?;
             if arr.is_empty() {
-                return None; // skip empty arrays (same as current behavior)
+                return None;
             }
             let values: Vec<Value> = arr
                 .iter()
@@ -352,10 +382,7 @@ fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<Fiel
                 Some(FieldValue::Multi(values))
             }
         }
-        FieldValueType::ExistsBoolean => {
-            // True if field exists and is non-null (raw already checked for null)
-            Some(FieldValue::Single(Value::Bool(true)))
-        }
+        FieldValueType::ExistsBoolean => Some(FieldValue::Single(Value::Bool(true))),
     }
 }
 
@@ -383,8 +410,14 @@ mod tests {
         };
         let json: serde_json::Value = serde_json::json!({"id": 42, "count": 100});
         let doc = json_to_document(&json, &schema);
-        assert_eq!(doc.fields.get("id"), Some(&FieldValue::Single(Value::Integer(42))));
-        assert_eq!(doc.fields.get("count"), Some(&FieldValue::Single(Value::Integer(100))));
+        assert_eq!(
+            doc.fields.get("id"),
+            Some(&FieldValue::Single(Value::Integer(42)))
+        );
+        assert_eq!(
+            doc.fields.get("count"),
+            Some(&FieldValue::Single(Value::Integer(100)))
+        );
     }
 
     #[test]
@@ -403,7 +436,10 @@ mod tests {
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "secondary": 99});
         let doc = json_to_document(&json, &schema);
-        assert_eq!(doc.fields.get("val"), Some(&FieldValue::Single(Value::Integer(99))));
+        assert_eq!(
+            doc.fields.get("val"),
+            Some(&FieldValue::Single(Value::Integer(99)))
+        );
     }
 
     #[test]
@@ -426,7 +462,10 @@ mod tests {
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "type": "image"});
         let doc = json_to_document(&json, &schema);
-        assert_eq!(doc.fields.get("type"), Some(&FieldValue::Single(Value::Integer(1))));
+        assert_eq!(
+            doc.fields.get("type"),
+            Some(&FieldValue::Single(Value::Integer(1)))
+        );
     }
 
     #[test]
@@ -445,7 +484,10 @@ mod tests {
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "hasMeta": true});
         let doc = json_to_document(&json, &schema);
-        assert_eq!(doc.fields.get("hasMeta"), Some(&FieldValue::Single(Value::Bool(true))));
+        assert_eq!(
+            doc.fields.get("hasMeta"),
+            Some(&FieldValue::Single(Value::Bool(true)))
+        );
     }
 
     #[test]
@@ -492,7 +534,10 @@ mod tests {
         let json: serde_json::Value = serde_json::json!({"id": 1, "ts": big_val});
         let doc = json_to_document(&json, &schema);
         let expected = (big_val as u32) as i64;
-        assert_eq!(doc.fields.get("ts"), Some(&FieldValue::Single(Value::Integer(expected))));
+        assert_eq!(
+            doc.fields.get("ts"),
+            Some(&FieldValue::Single(Value::Integer(expected)))
+        );
     }
 
     #[test]
@@ -513,7 +558,9 @@ mod tests {
         let doc = json_to_document(&json, &schema);
         assert_eq!(
             doc.fields.get("url"),
-            Some(&FieldValue::Single(Value::String("http://example.com".into())))
+            Some(&FieldValue::Single(Value::String(
+                "http://example.com".into()
+            )))
         );
     }
 
