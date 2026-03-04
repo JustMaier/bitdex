@@ -25,7 +25,7 @@ use roaring::RoaringBitmap;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{DataSchema, FieldMapping, FieldValueType};
 use crate::docstore::StoredDoc;
-use crate::mutation::{Document, FieldValue};
+use crate::mutation::FieldValue;
 use crate::query::Value;
 
 /// Statistics from a completed load operation.
@@ -42,7 +42,9 @@ struct BitmapAccum {
     filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
     sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
     alive: RoaringBitmap,
-    full_docs: Vec<(u32, Document)>,
+    /// Pre-encoded msgpack bytes — encoding happens in the rayon fold so
+    /// BulkWriter does pure I/O with no rayon contention.
+    encoded_docs: Vec<(u32, Vec<u8>)>,
     count: usize,
     errors: u64,
 }
@@ -61,7 +63,7 @@ impl BitmapAccum {
             filter_maps,
             sort_maps,
             alive: RoaringBitmap::new(),
-            full_docs: Vec::new(),
+            encoded_docs: Vec::new(),
             count: 0,
             errors: 0,
         }
@@ -87,7 +89,7 @@ impl BitmapAccum {
                     .or_insert(bm);
             }
         }
-        self.full_docs.extend(other.full_docs);
+        self.encoded_docs.extend(other.encoded_docs);
         self.count += other.count;
         self.errors += other.errors;
         self
@@ -168,14 +170,29 @@ pub fn load_ndjson(
         }
     });
 
-    // ---- Stage 2: Fused parse + bitmap build thread ----
-    // Rayon fold+reduce: JSON → bitmap maps + full docs in one pass.
-    // No intermediate Document for the bitmap path.
+    // Prepare BulkWriter before Stage 2 so encoding happens in the rayon fold.
+    // This eliminates rayon contention — all CPU work in one pool pass.
+    let all_field_names: Vec<String> = schema
+        .fields
+        .iter()
+        .map(|f| f.target.clone())
+        .chain(std::iter::once("id".to_string()))
+        .collect();
+    let bulk_writer = Arc::new(
+        engine
+            .prepare_bulk_writer(&all_field_names)
+            .expect("prepare_bulk_writer"),
+    );
+
+    // ---- Stage 2: Fused parse + bitmap build + doc encode thread ----
+    // Rayon fold+reduce: JSON → bitmap maps + pre-encoded msgpack bytes in one pass.
+    // No intermediate Document for the bitmap path; encoding in-fold avoids rayon contention.
     let schema_ref = schema.clone();
     let filter_names_clone = filter_names.clone();
     let sort_configs_clone = sort_configs.clone();
     let filter_set_clone = filter_set;
     let sort_bits_clone = sort_bits;
+    let parse_writer = Arc::clone(&bulk_writer);
     let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<BitmapAccum>(2);
 
     let parse_handle = thread::spawn(move || {
@@ -211,8 +228,10 @@ pub fn load_ndjson(
             let s_configs = &sort_configs_clone;
             let f_set = &filter_set_clone;
             let s_bits = &sort_bits_clone;
+            let writer = &parse_writer;
 
             // Rayon fold+reduce: each worker builds thread-local bitmap maps
+            // AND encodes docs to msgpack bytes — all CPU work in one pass.
             let accum = lines
                 .into_par_iter()
                 .enumerate()
@@ -222,9 +241,10 @@ pub fn load_ndjson(
                         let slot = base_id + i as u32;
                         match serde_json::from_str::<serde_json::Value>(line) {
                             Ok(json) => {
-                                // Build full doc for docstore
-                                let full_doc = json_to_document(&json, schema);
-                                acc.full_docs.push((slot, full_doc));
+                                // Encode doc to msgpack bytes in-fold — no separate rayon pass
+                                let stored = json_to_stored_doc(&json, schema);
+                                let bytes = writer.encode_doc(&stored);
+                                acc.encoded_docs.push((slot, bytes));
 
                                 // Build bitmaps directly from JSON
                                 acc.alive.insert(slot);
@@ -265,20 +285,6 @@ pub fn load_ndjson(
     let mut chunks_processed: usize = 0;
     let wall_start = Instant::now();
 
-    // Prepare BulkWriter: snapshot field dictionary once, then write lock-free.
-    // Per-shard Mutex handles boundary shards; most shards see zero contention.
-    let all_field_names: Vec<String> = schema
-        .fields
-        .iter()
-        .map(|f| f.target.clone())
-        .chain(std::iter::once("id".to_string()))
-        .collect();
-    let bulk_writer = Arc::new(
-        engine
-            .prepare_bulk_writer(&all_field_names)
-            .expect("prepare_bulk_writer"),
-    );
-
     let mut ds_handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
     while let Ok(chunk) = chunk_rx.recv() {
@@ -306,17 +312,11 @@ pub fn load_ndjson(
             chunks_processed, total_inserted, rate, apply_ms
         );
 
-        // Spawn parallel docstore writer via BulkWriter — no Mutex on DocStore.
-        // BulkWriter encodes in parallel (rayon), groups by shard, writes with per-shard locks.
-        if !chunk.full_docs.is_empty() {
+        // Spawn docstore writer with pre-encoded bytes — pure I/O, no rayon contention.
+        if !chunk.encoded_docs.is_empty() {
             let writer = Arc::clone(&bulk_writer);
             ds_handles.push(thread::spawn(move || {
-                let stored: Vec<(u32, StoredDoc)> = chunk
-                    .full_docs
-                    .into_iter()
-                    .map(|(slot, doc)| (slot, StoredDoc { fields: doc.fields }))
-                    .collect();
-                writer.write_batch(stored);
+                writer.write_batch_encoded(chunk.encoded_docs);
             }));
         }
     }
@@ -500,9 +500,9 @@ fn extract_integer(raw: &serde_json::Value, truncate_u32: bool) -> Option<i64> {
     })
 }
 
-/// Convert a raw JSON value to a Document using the DataSchema field mappings.
-/// Used for building full documents for the docstore.
-fn json_to_document(json: &serde_json::Value, schema: &DataSchema) -> Document {
+/// Convert a raw JSON value to a StoredDoc using the DataSchema field mappings.
+/// Returns StoredDoc directly — no intermediate Document allocation.
+fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDoc {
     let mut fields = HashMap::new();
 
     if let Some(id_val) = json.get(&schema.id_field) {
@@ -542,7 +542,7 @@ fn json_to_document(json: &serde_json::Value, schema: &DataSchema) -> Document {
         }
     }
 
-    Document { fields }
+    StoredDoc { fields }
 }
 
 /// Convert a raw serde_json Value field to a FieldValue.
@@ -611,7 +611,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_json_to_document_integer() {
+    fn test_json_to_stored_doc_integer() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -625,7 +625,7 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 42, "count": 100});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert_eq!(
             doc.fields.get("id"),
             Some(&FieldValue::Single(Value::Integer(42)))
@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_document_fallback() {
+    fn test_json_to_stored_doc_fallback() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -651,7 +651,7 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "secondary": 99});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert_eq!(
             doc.fields.get("val"),
             Some(&FieldValue::Single(Value::Integer(99)))
@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_document_mapped_string() {
+    fn test_json_to_stored_doc_mapped_string() {
         let mut map = HashMap::new();
         map.insert("image".into(), 1);
         map.insert("video".into(), 2);
@@ -677,7 +677,7 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "type": "image"});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert_eq!(
             doc.fields.get("type"),
             Some(&FieldValue::Single(Value::Integer(1)))
@@ -685,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_document_boolean() {
+    fn test_json_to_stored_doc_boolean() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -699,7 +699,7 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "hasMeta": true});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert_eq!(
             doc.fields.get("hasMeta"),
             Some(&FieldValue::Single(Value::Bool(true)))
@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_document_integer_array() {
+    fn test_json_to_stored_doc_integer_array() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -721,7 +721,7 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "tagIds": [10, 20, 30]});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert_eq!(
             doc.fields.get("tagIds"),
             Some(&FieldValue::Multi(vec![
@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_document_truncate_u32() {
+    fn test_json_to_stored_doc_truncate_u32() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -748,7 +748,7 @@ mod tests {
         };
         let big_val: i64 = 5_000_000_000;
         let json: serde_json::Value = serde_json::json!({"id": 1, "ts": big_val});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         let expected = (big_val as u32) as i64;
         assert_eq!(
             doc.fields.get("ts"),
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_document_string() {
+    fn test_json_to_stored_doc_string() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -771,7 +771,7 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "url": "http://example.com"});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert_eq!(
             doc.fields.get("url"),
             Some(&FieldValue::Single(Value::String(
@@ -781,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_to_document_missing_field_skipped() {
+    fn test_json_to_stored_doc_missing_field_skipped() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -795,12 +795,12 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert!(doc.fields.get("val").is_none());
     }
 
     #[test]
-    fn test_json_to_document_null_field_skipped() {
+    fn test_json_to_stored_doc_null_field_skipped() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -814,12 +814,12 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "val": null});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert!(doc.fields.get("val").is_none());
     }
 
     #[test]
-    fn test_json_to_document_empty_array_skipped() {
+    fn test_json_to_stored_doc_empty_array_skipped() {
         let schema = DataSchema {
             id_field: "id".into(),
             fields: vec![FieldMapping {
@@ -833,7 +833,7 @@ mod tests {
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "tags": []});
-        let doc = json_to_document(&json, &schema);
+        let doc = json_to_stored_doc(&json, &schema);
         assert!(doc.fields.get("tags").is_none());
     }
 }

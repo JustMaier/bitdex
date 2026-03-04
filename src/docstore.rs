@@ -508,25 +508,14 @@ pub struct BulkWriter {
 }
 
 impl BulkWriter {
-    /// Write a batch of documents using parallel encoding and parallel shard writes.
-    ///
-    /// - Encoding: rayon-parallel msgpack serialization (CPU-bound, no lock)
-    /// - Shard writes: rayon-parallel file I/O (per-shard lock for boundary safety)
-    pub fn write_batch(&self, docs: Vec<(u32, StoredDoc)>) {
-        if docs.is_empty() {
+    /// Write pre-encoded docs to shard files. Pure I/O — no CPU-bound encoding.
+    /// Docs are already msgpack bytes from the parse stage.
+    pub fn write_batch_encoded(&self, encoded: Vec<(u32, Vec<u8>)>) {
+        if encoded.is_empty() {
             return;
         }
 
-        // Step 1: Parallel encode docs to msgpack
-        let encoded: Vec<(u32, Vec<u8>)> = docs
-            .into_par_iter()
-            .map(|(slot, doc)| {
-                let bytes = self.encode_doc(&doc);
-                (slot, bytes)
-            })
-            .collect();
-
-        // Step 2: Group by shard
+        // Group by shard
         let mut by_shard: HashMap<u32, Vec<(u32, Vec<u8>)>> = HashMap::new();
         for (slot, bytes) in encoded {
             by_shard
@@ -535,7 +524,7 @@ impl BulkWriter {
                 .push((slot, bytes));
         }
 
-        // Step 3: Parallel write shard files with per-shard locking
+        // Parallel write shard files with per-shard locking
         let shards: Vec<(u32, Vec<(u32, Vec<u8>)>)> = by_shard.into_iter().collect();
         shards.into_par_iter().for_each(|(sid, mut new_entries)| {
             new_entries.sort_by_key(|e| e.0);
@@ -581,7 +570,8 @@ impl BulkWriter {
         });
     }
 
-    fn encode_doc(&self, doc: &StoredDoc) -> Vec<u8> {
+    /// Encode a StoredDoc to msgpack bytes using the snapshotted field dictionary.
+    pub fn encode_doc(&self, doc: &StoredDoc) -> Vec<u8> {
         let mut pairs: Vec<(u16, PackedValue)> = Vec::with_capacity(doc.fields.len());
         for (name, fv) in &doc.fields {
             if let Some(&idx) = self.field_to_idx.get(name.as_str()) {
