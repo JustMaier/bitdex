@@ -97,7 +97,12 @@ struct LoadRequest {
 }
 
 fn default_threads() -> usize {
-    4
+    // Unused by fused parse+bitmap loader (rayon manages parallelism),
+    // kept for API compat.
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    (logical / 2).clamp(4, 8)
 }
 
 fn default_chunk_size() -> usize {

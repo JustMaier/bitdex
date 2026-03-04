@@ -1606,6 +1606,31 @@ impl ConcurrentEngine {
         }
     }
 
+    /// Apply pre-built bitmap maps directly to a staging snapshot.
+    /// Used by the fused parse+bitmap loader to skip the decompose/merge/apply pipeline.
+    pub fn apply_bitmap_maps(
+        staging: &mut InnerEngine,
+        filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
+        sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
+        alive: RoaringBitmap,
+    ) {
+        for (field_name, value_map) in filter_maps {
+            if let Some(field) = staging.filters.get_field_mut(&field_name) {
+                for (value, bitmap) in value_map {
+                    field.or_bitmap(value, &bitmap);
+                }
+            }
+        }
+        for (field_name, bit_map) in sort_maps {
+            if let Some(field) = staging.sorts.get_field_mut(&field_name) {
+                for (bit, bitmap) in bit_map {
+                    field.or_layer(bit, &bitmap);
+                }
+            }
+        }
+        staging.slots.alive_or_bitmap(&alive);
+    }
+
     /// Core decompose + merge + apply logic, shared by put_bulk() and put_bulk_loading().
     fn put_bulk_into(config: &Config, staging: &mut InnerEngine, docs: &[(u32, Document)], num_threads: usize) -> usize {
         let t0 = std::time::Instant::now();

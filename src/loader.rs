@@ -3,10 +3,14 @@
 //!
 //! Three-stage pipeline:
 //!   Stage 1 (reader thread): reads raw bytes from disk into blocks
-//!   Stage 2 (parse thread):  rayon-parallel JSON parse → Documents
-//!   Stage 3 (main thread):   put_bulk_loading + async docstore writes
+//!   Stage 2 (parse thread):  rayon fold+reduce → bitmap maps + full docs (fused)
+//!   Stage 3 (main thread):   apply bitmaps to staging + async docstore writes
+//!
+//! Key optimization: bitmaps are built directly from JSON during parse — no
+//! intermediate Document allocation for the bitmap path. The old decompose/merge
+//! pipeline in put_bulk_into is bypassed entirely.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
@@ -16,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{DataSchema, FieldMapping, FieldValueType};
@@ -30,33 +35,99 @@ pub struct LoadStats {
     pub errors_skipped: u64,
 }
 
+/// Bitmap accumulator for rayon fold+reduce.
+/// Each rayon task builds its own instance; reduce merges them with bitmap OR.
+struct BitmapAccum {
+    filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
+    sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
+    alive: RoaringBitmap,
+    full_docs: Vec<(u32, Document)>,
+    count: usize,
+    errors: u64,
+}
+
+impl BitmapAccum {
+    fn new(filter_names: &[String], sort_configs: &[(String, u8)]) -> Self {
+        let mut filter_maps = HashMap::with_capacity(filter_names.len());
+        for name in filter_names {
+            filter_maps.insert(name.clone(), HashMap::new());
+        }
+        let mut sort_maps = HashMap::with_capacity(sort_configs.len());
+        for (name, bits) in sort_configs {
+            sort_maps.insert(name.clone(), HashMap::with_capacity(*bits as usize));
+        }
+        BitmapAccum {
+            filter_maps,
+            sort_maps,
+            alive: RoaringBitmap::new(),
+            full_docs: Vec::new(),
+            count: 0,
+            errors: 0,
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        self.alive |= &other.alive;
+        for (field, value_map) in other.filter_maps {
+            let target = self.filter_maps.entry(field).or_default();
+            for (value, bm) in value_map {
+                target
+                    .entry(value)
+                    .and_modify(|e| *e |= &bm)
+                    .or_insert(bm);
+            }
+        }
+        for (field, bit_map) in other.sort_maps {
+            let target = self.sort_maps.entry(field).or_default();
+            for (bit, bm) in bit_map {
+                target
+                    .entry(bit)
+                    .and_modify(|e| *e |= &bm)
+                    .or_insert(bm);
+            }
+        }
+        self.full_docs.extend(other.full_docs);
+        self.count += other.count;
+        self.errors += other.errors;
+        self
+    }
+}
+
 /// Load an NDJSON file into an engine using the given data schema.
 ///
 /// - `engine`: target ConcurrentEngine (must already be constructed with the right config)
 /// - `schema`: field mapping rules for converting raw JSON → Documents
 /// - `path`: path to the NDJSON file
 /// - `limit`: optional max records to load
-/// - `threads`: number of rayon threads for parallel parsing
-/// - `chunk_size`: number of records to accumulate before flushing to bitmap engine
-/// - `docstore_batch_size`: number of docs per docstore write batch
+/// - `threads`: number of threads (unused — rayon manages parallelism)
+/// - `chunk_size`: number of full docs to accumulate before flushing docstore
+/// - `docstore_batch_size`: unused
 /// - `progress`: atomic counter updated as records are loaded (for progress polling)
 pub fn load_ndjson(
     engine: &ConcurrentEngine,
     schema: &DataSchema,
     path: &Path,
     limit: Option<usize>,
-    threads: usize,
+    _threads: usize,
     chunk_size: usize,
     _docstore_batch_size: usize,
     progress: Arc<AtomicU64>,
 ) -> Result<LoadStats, String> {
     let record_limit = limit.unwrap_or(usize::MAX);
-    let chunk_size: usize = chunk_size.max(1_000); // Floor at 1K
+    let _chunk_size = chunk_size; // kept for API compat; docstore flushes per block now
     let read_batch_size: usize = 500_000;
     let target_batch_bytes = read_batch_size * 600;
 
-    // Build indexed field set for stripping doc-only fields from bitmap accumulator
-    let indexed_fields = engine.indexed_field_names();
+    // Pre-build field lookup tables for direct bitmap extraction
+    let config = engine.config();
+    let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
+    let sort_configs: Vec<(String, u8)> = config
+        .sort_fields
+        .iter()
+        .map(|f| (f.name.clone(), f.bits))
+        .collect();
+    let filter_set: HashSet<String> = filter_names.iter().cloned().collect();
+    let sort_bits: HashMap<String, u8> = sort_configs.iter().cloned().collect();
 
     // ---- Stage 1: Reader thread ----
     // Reads raw bytes from disk in large blocks, split on newline boundaries.
@@ -96,24 +167,19 @@ pub fn load_ndjson(
         }
     });
 
-    // ---- Stage 2: Parse thread ----
-    // Parses raw blocks into Documents using rayon + simd-json. Produces both
-    // full (docstore) and stripped (bitmap-only) documents in a single pass.
-
-    struct ParsedChunk {
-        stripped: Vec<(u32, Document)>, // bitmap-only fields (for put_bulk_loading)
-        full: Vec<(u32, Document)>,    // full docs (for docstore)
-        errors: u64,
-    }
-
+    // ---- Stage 2: Fused parse + bitmap build thread ----
+    // Rayon fold+reduce: JSON → bitmap maps + full docs in one pass.
+    // No intermediate Document for the bitmap path.
     let schema_ref = schema.clone();
-    let indexed_fields_clone = indexed_fields.clone();
-    let (parsed_tx, parsed_rx) = std::sync::mpsc::sync_channel::<ParsedChunk>(2);
+    let filter_names_clone = filter_names.clone();
+    let sort_configs_clone = sort_configs.clone();
+    let filter_set_clone = filter_set;
+    let sort_bits_clone = sort_bits;
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<BitmapAccum>(2);
 
     let parse_handle = thread::spawn(move || {
         let mut id_counter: u32 = 0;
         let mut total_parsed: usize = 0;
-        let indexed = &indexed_fields_clone;
 
         while let Ok(raw_block) = block_rx.recv() {
             if total_parsed >= record_limit {
@@ -126,141 +192,117 @@ pub fn load_ndjson(
             };
             let base_id = id_counter;
 
-            let lines: Vec<&str> = block_str
+            let mut lines: Vec<&str> = block_str
                 .split('\n')
                 .map(|l| l.trim_end_matches('\r'))
                 .filter(|l| !l.is_empty())
                 .collect();
-            let line_count = lines.len() as u32;
-
-            // Rayon parallel parse: build full doc, then strip to indexed-only.
-            let results: Vec<Option<(u32, Document, Document)>> = lines
-                .into_par_iter()
-                .enumerate()
-                .map(|(i, line)| {
-                    let id = base_id + i as u32;
-                    match serde_json::from_str::<serde_json::Value>(line) {
-                        Ok(json) => {
-                            let full_doc = json_to_document(&json, &schema_ref);
-                            let stripped_fields = full_doc
-                                .fields
-                                .iter()
-                                .filter(|(k, _)| indexed.contains(k.as_str()))
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
-                            Some((id, full_doc, Document { fields: stripped_fields }))
-                        }
-                        Err(_) => None,
-                    }
-                })
-                .collect();
-
-            id_counter += line_count;
-
-            let mut errors: u64 = 0;
-            let mut full_docs: Vec<(u32, Document)> = Vec::with_capacity(results.len());
-            let mut stripped_docs: Vec<(u32, Document)> = Vec::with_capacity(results.len());
-            for r in results {
-                if let Some((id, full, stripped)) = r {
-                    full_docs.push((id, full));
-                    stripped_docs.push((id, stripped));
-                } else {
-                    errors += 1;
-                }
-            }
 
             // Respect limit
-            if total_parsed + full_docs.len() > record_limit {
-                let keep = record_limit - total_parsed;
-                full_docs.truncate(keep);
-                stripped_docs.truncate(keep);
+            let remaining = record_limit.saturating_sub(total_parsed);
+            if lines.len() > remaining {
+                lines.truncate(remaining);
             }
-            total_parsed += full_docs.len();
+            let line_count = lines.len();
 
-            if parsed_tx
-                .send(ParsedChunk {
-                    stripped: stripped_docs,
-                    full: full_docs,
-                    errors,
-                })
-                .is_err()
-            {
+            let schema = &schema_ref;
+            let f_names = &filter_names_clone;
+            let s_configs = &sort_configs_clone;
+            let f_set = &filter_set_clone;
+            let s_bits = &sort_bits_clone;
+
+            // Rayon fold+reduce: each worker builds thread-local bitmap maps
+            let accum = lines
+                .into_par_iter()
+                .enumerate()
+                .fold(
+                    || BitmapAccum::new(f_names, s_configs),
+                    |mut acc, (i, line)| {
+                        let slot = base_id + i as u32;
+                        match serde_json::from_str::<serde_json::Value>(line) {
+                            Ok(json) => {
+                                // Build full doc for docstore
+                                let full_doc = json_to_document(&json, schema);
+                                acc.full_docs.push((slot, full_doc));
+
+                                // Build bitmaps directly from JSON
+                                acc.alive.insert(slot);
+                                extract_bitmaps(
+                                    &json,
+                                    schema,
+                                    f_set,
+                                    s_bits,
+                                    slot,
+                                    &mut acc.filter_maps,
+                                    &mut acc.sort_maps,
+                                );
+                                acc.count += 1;
+                            }
+                            Err(_) => acc.errors += 1,
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || BitmapAccum::new(f_names, s_configs),
+                    |a, b| a.merge(b),
+                );
+
+            id_counter += line_count as u32;
+            total_parsed += accum.count;
+
+            if chunk_tx.send(accum).is_err() {
                 break;
             }
         }
     });
 
-    // ---- Stage 3: Bitmap + docstore (main thread) ----
-    // Receives parsed chunks and applies them to the engine.
-    // While put_bulk_loading runs, the parse thread is already parsing the next block.
-
+    // ---- Stage 3: Apply bitmaps + docstore (main thread) ----
     let mut staging = engine.clone_staging();
-    let mut stripped_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
-    let mut full_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
     let mut total_inserted: usize = 0;
     let mut total_errors: u64 = 0;
     let mut chunks_processed: usize = 0;
     let wall_start = Instant::now();
-    // Allow up to MAX_DS_WRITERS concurrent docstore writers to avoid blocking bitmap ops.
-    // During bulk loading with sequential IDs, each writer hits different shards → no conflicts.
-    const MAX_DS_WRITERS: usize = 4;
-    let mut ds_handles: std::collections::VecDeque<thread::JoinHandle<()>> =
-        std::collections::VecDeque::new();
 
-    while let Ok(chunk) = parsed_rx.recv() {
+    // Docstore writers run fully concurrent — bitmap apply never blocks on docstore.
+    // Writers serialize docs (CPU-bound, parallel) then write to redb (lock-serialized).
+    // Memory: ~340K docs × 1KB per in-flight writer, acceptable on modern hardware.
+    let mut ds_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+
+    while let Ok(chunk) = chunk_rx.recv() {
         total_errors += chunk.errors;
+        let chunk_count = chunk.count;
 
-        // Accumulate both stripped (bitmap) and full (docstore) docs
-        stripped_chunk.extend(chunk.stripped);
-        full_chunk.extend(chunk.full);
+        // Apply pre-built bitmaps directly to staging — no decompose/merge needed
+        let t0 = Instant::now();
+        ConcurrentEngine::apply_bitmap_maps(
+            &mut staging,
+            chunk.filter_maps,
+            chunk.sort_maps,
+            chunk.alive,
+        );
+        let apply_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        if stripped_chunk.len() >= chunk_size {
-            // Bound outstanding docstore writers to limit memory
-            while ds_handles.len() >= MAX_DS_WRITERS {
-                ds_handles.pop_front().unwrap().join().unwrap();
-            }
-            // Spawn docstore writer in background (doesn't block bitmap work)
-            let full_batch = std::mem::replace(
-                &mut full_chunk,
-                Vec::with_capacity(chunk_size),
-            );
-            ds_handles.push_back(engine.spawn_docstore_writer(full_batch));
+        total_inserted += chunk_count;
+        progress.store(total_inserted as u64, Ordering::Release);
+        chunks_processed += 1;
 
-            // Run bitmap insertion (concurrent with docstore writers)
-            let count = engine.put_bulk_loading(&mut staging, &stripped_chunk, threads);
-            total_inserted += count;
-            progress.store(total_inserted as u64, Ordering::Release);
-            chunks_processed += 1;
-            let elapsed = wall_start.elapsed();
-            let rate = total_inserted as f64 / elapsed.as_secs_f64();
-            eprintln!(
-                "  chunk {}: {} total ({:.0}/s)",
-                chunks_processed, total_inserted, rate
-            );
-            stripped_chunk = Vec::with_capacity(chunk_size);
+        let elapsed = wall_start.elapsed();
+        let rate = total_inserted as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "  chunk {}: {} total ({:.0}/s) apply={:.1}ms",
+            chunks_processed, total_inserted, rate, apply_ms
+        );
+
+        // Spawn docstore writer immediately — bitmap path never blocks
+        if !chunk.full_docs.is_empty() {
+            ds_handles.push(engine.spawn_docstore_writer(chunk.full_docs));
         }
     }
 
-    if !stripped_chunk.is_empty() {
-        let full_batch = std::mem::replace(&mut full_chunk, Vec::new());
-        ds_handles.push_back(engine.spawn_docstore_writer(full_batch));
-
-        let count = engine.put_bulk_loading(&mut staging, &stripped_chunk, threads);
-        total_inserted += count;
-        progress.store(total_inserted as u64, Ordering::Release);
-        chunks_processed += 1;
-        let rate = total_inserted as f64 / wall_start.elapsed().as_secs_f64();
-        eprintln!(
-            "  chunk {}: {} total ({:.0}/s)",
-            chunks_processed, total_inserted, rate
-        );
-    }
-
-    // Wait for parse thread to finish
+    // Wait for threads
     parse_handle.join().unwrap();
     reader_handle.join().unwrap();
-
-    // Wait for all outstanding docstore writers
     for h in ds_handles {
         h.join().unwrap();
     }
@@ -285,7 +327,160 @@ pub fn load_ndjson(
     })
 }
 
+/// Extract bitmap entries directly from JSON into accumulator maps.
+/// Skips intermediate Document creation for indexed fields.
+fn extract_bitmaps(
+    json: &serde_json::Value,
+    schema: &DataSchema,
+    filter_set: &HashSet<String>,
+    sort_bits: &HashMap<String, u8>,
+    slot: u32,
+    filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
+    sort_maps: &mut HashMap<String, HashMap<usize, RoaringBitmap>>,
+) {
+    for mapping in &schema.fields {
+        if mapping.doc_only {
+            continue;
+        }
+
+        let is_filter = filter_set.contains(&mapping.target);
+        let s_bits = sort_bits.get(&mapping.target).copied();
+
+        if !is_filter && s_bits.is_none() {
+            continue;
+        }
+
+        let raw = json
+            .get(&mapping.source)
+            .or_else(|| mapping.fallback.as_ref().and_then(|fb| json.get(fb)));
+
+        let raw = match raw {
+            Some(v) if !v.is_null() => v,
+            _ => {
+                // ExistsBoolean: field absent → false
+                if is_filter && matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
+                    if let Some(fm) = filter_maps.get_mut(&mapping.target) {
+                        fm.entry(0)
+                            .or_insert_with(RoaringBitmap::new)
+                            .insert(slot);
+                    }
+                }
+                continue;
+            }
+        };
+
+        if is_filter {
+            if let Some(fm) = filter_maps.get_mut(&mapping.target) {
+                extract_filter_value(raw, mapping, slot, fm);
+            }
+        }
+
+        if let Some(bits) = s_bits {
+            if let Some(sm) = sort_maps.get_mut(&mapping.target) {
+                extract_sort_value(raw, mapping, slot, bits, sm);
+            }
+        }
+    }
+}
+
+/// Extract a single filter value from JSON and insert into the field's bitmap map.
+fn extract_filter_value(
+    raw: &serde_json::Value,
+    mapping: &FieldMapping,
+    slot: u32,
+    field_map: &mut HashMap<u64, RoaringBitmap>,
+) {
+    match mapping.value_type {
+        FieldValueType::Integer => {
+            if let Some(n) = extract_integer(raw, mapping.truncate_u32) {
+                field_map
+                    .entry(n as u64)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(slot);
+            }
+        }
+        FieldValueType::Boolean => {
+            if let Some(b) = raw.as_bool() {
+                field_map
+                    .entry(if b { 1 } else { 0 })
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(slot);
+            }
+        }
+        FieldValueType::MappedString => {
+            if let Some(s) = raw.as_str() {
+                let n = mapping
+                    .string_map
+                    .as_ref()
+                    .and_then(|m| m.get(s).copied())
+                    .unwrap_or(0);
+                field_map
+                    .entry(n as u64)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(slot);
+            }
+        }
+        FieldValueType::IntegerArray => {
+            if let Some(arr) = raw.as_array() {
+                for v in arr {
+                    if let Some(n) = v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)) {
+                        field_map
+                            .entry(n as u64)
+                            .or_insert_with(RoaringBitmap::new)
+                            .insert(slot);
+                    }
+                }
+            }
+        }
+        FieldValueType::ExistsBoolean => {
+            field_map
+                .entry(1)
+                .or_insert_with(RoaringBitmap::new)
+                .insert(slot);
+        }
+        FieldValueType::String => {} // String filter fields not supported in bitmap index
+    }
+}
+
+/// Extract sort value from JSON and insert into bit-layer bitmap maps.
+fn extract_sort_value(
+    raw: &serde_json::Value,
+    mapping: &FieldMapping,
+    slot: u32,
+    bits: u8,
+    bit_map: &mut HashMap<usize, RoaringBitmap>,
+) {
+    let value = match mapping.value_type {
+        FieldValueType::Integer => extract_integer(raw, mapping.truncate_u32).map(|n| n as u32),
+        _ => None,
+    };
+    if let Some(v) = value {
+        for bit in 0..(bits as usize) {
+            if (v >> bit) & 1 == 1 {
+                bit_map
+                    .entry(bit)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(slot);
+            }
+        }
+    }
+}
+
+/// Extract an integer from a JSON value, optionally truncating to u32.
+fn extract_integer(raw: &serde_json::Value, truncate_u32: bool) -> Option<i64> {
+    let n = raw
+        .as_i64()
+        .or_else(|| raw.as_u64().map(|n| n as i64))
+        .or_else(|| raw.as_f64().map(|n| n as i64))?;
+    Some(if truncate_u32 {
+        (n as u32) as i64
+    } else {
+        n
+    })
+}
+
 /// Convert a raw JSON value to a Document using the DataSchema field mappings.
+/// Used for building full documents for the docstore.
 fn json_to_document(json: &serde_json::Value, schema: &DataSchema) -> Document {
     let mut fields = HashMap::new();
 
