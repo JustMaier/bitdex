@@ -899,6 +899,13 @@ impl ConcurrentEngine {
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, filters)?;
 
+        // Compute total_matched from the FULL filter bitmap before bound narrowing.
+        let full_total_matched = if executor.slot_allocator().all_slots_alive() {
+            filter_arc.len()
+        } else {
+            (&*filter_arc & executor.slot_allocator().alive_bitmap()).len()
+        };
+
         // D5: Narrow filter bitmap with bound cache.
         // Synthesize implicit "__slot__" sort for filter-only queries so they
         // benefit from slot-based bounds (newest-first = sort by slot desc).
@@ -921,8 +928,14 @@ impl ConcurrentEngine {
         let mut result =
             executor.execute_from_bitmap(&effective_bitmap, sort, limit, None, use_simple)?;
 
+        // Override total_matched with the accurate count from the full filter bitmap.
+        result.total_matched = full_total_matched;
+
         // D2: Form or update bound from results (slot-based for filter-only)
-        self.update_bound_from_results(&snap, bound_sort, &cache_key, &result.ids, None);
+        self.update_bound_from_results(
+            &snap, bound_sort, &cache_key, &result.ids, None,
+            &filter_arc, &executor,
+        );
 
         // Post-validation against in-flight writes
         self.post_validate(&mut result, filters, &executor)?;
@@ -965,6 +978,15 @@ impl ConcurrentEngine {
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, &query.filters)?;
 
+        // Compute total_matched from the FULL filter bitmap before bound narrowing.
+        // This ensures pagination/total counts remain accurate even when the bound
+        // cache narrows the working set for sort acceleration.
+        let full_total_matched = if executor.slot_allocator().all_slots_alive() {
+            filter_arc.len()
+        } else {
+            (&*filter_arc & executor.slot_allocator().alive_bitmap()).len()
+        };
+
         // D5: Narrow filter bitmap with bound cache.
         // Synthesize implicit "__slot__" sort for filter-only queries.
         let implicit_sort;
@@ -996,13 +1018,22 @@ impl ConcurrentEngine {
             use_simple,
         )?;
 
-        // D2/D6: Form or update bound from results (with cursor for tiered bounds)
+        // Override total_matched with the accurate count from the full filter bitmap.
+        // execute_from_bitmap computes total_matched from the possibly-narrowed bitmap,
+        // but users need the true count for pagination UI.
+        result.total_matched = full_total_matched;
+
+        // D2/D6: Form or update bound from results (with cursor for tiered bounds).
+        // Passes filter bitmap + executor so bounds can be seeded with target_size
+        // entries via a full traversal, not just the page-limited result set.
         self.update_bound_from_results(
             &snap,
             bound_sort,
             &cache_key,
             &result.ids,
             query.cursor.as_ref(),
+            &filter_arc,
+            &executor,
         );
 
         self.post_validate(&mut result, &query.filters, &executor)?;
@@ -1134,16 +1165,6 @@ impl ConcurrentEngine {
         for _tier in 0..max_tiers {
             if let Some(entry) = bc.lookup_mut(&try_key) {
                 if !entry.needs_rebuild() {
-                    // Skip bound if it's too small to be meaningful — a bound
-                    // with fewer entries than half target_size hasn't been fully
-                    // populated yet (only seeded from a small result set).
-                    // Using it would incorrectly narrow total_matched and break
-                    // pagination/infinite scroll.
-                    if entry.bitmap().len() < entry.target_size() as u64 / 2 {
-                        skip_all_bounds = true;
-                        break;
-                    }
-
                     // Check if cursor is past this tier's range
                     let cursor_past = if let Some(c) = cursor {
                         let cursor_val = c.sort_value as u32;
@@ -1187,19 +1208,16 @@ impl ConcurrentEngine {
         // subset of this query's. A bound for {nsfwLevel=1} can narrow a query
         // for {nsfwLevel=1, onSite=true}. The bound bitmap is still ANDed with
         // the full filter result, so correctness is preserved.
-        // Skip when bounds are unusable (too small, cursor exhausted tiers).
+        // Skip when cursor exhausted all available tiers.
         if !skip_all_bounds {
             if let Some(entry) = bc.find_superset_bound(
                 filter_key,
                 &sort_clause.field,
                 sort_clause.direction,
             ) {
-                // Also skip superset bounds that are too small
-                if entry.bitmap().len() >= entry.target_size() as u64 / 2 {
-                    entry.touch();
-                    let narrowed = filter_bitmap & entry.bitmap();
-                    return (narrowed, false, cache_key);
-                }
+                entry.touch();
+                let narrowed = filter_bitmap & entry.bitmap();
+                return (narrowed, false, cache_key);
             }
         }
 
@@ -1211,6 +1229,11 @@ impl ConcurrentEngine {
     /// D2/D6: Form or update a bound from sort query results.
     /// With cursor awareness: if a cursor was past tier 0's range, form a tiered bound.
     /// Supports "__slot__" pseudo-sort where sort value = slot ID.
+    ///
+    /// When forming or rebuilding a bound, if the query result set is smaller
+    /// than target_size, does a full sort traversal to seed the bound with
+    /// target_size entries. This ensures the bound covers many pages of
+    /// pagination, not just the first page's results.
     fn update_bound_from_results(
         &self,
         snap: &Guard<Arc<InnerEngine>>,
@@ -1218,6 +1241,8 @@ impl ConcurrentEngine {
         cache_key: &Option<CacheKey>,
         result_ids: &[i64],
         cursor: Option<&crate::query::CursorPosition>,
+        filter_bitmap: &roaring::RoaringBitmap,
+        executor: &QueryExecutor,
     ) {
         let Some(sort_clause) = sort else { return };
         let Some(ref filter_key) = cache_key else { return };
@@ -1272,7 +1297,26 @@ impl ConcurrentEngine {
             tier,
         };
 
-        let sorted_slots: Vec<u32> = result_ids.iter().map(|&id| id as u32).collect();
+        let target_size = self.bound_cache.lock().target_size();
+
+        // If the query result set is smaller than target_size, do a full
+        // traversal to seed the bound properly. This ensures the bound covers
+        // thousands of entries for pagination, not just a single page.
+        let seed_slots: Vec<u32> = if result_ids.len() < target_size {
+            if let Ok(full_result) = executor.execute_from_bitmap(
+                filter_bitmap,
+                Some(sort_clause),
+                target_size,
+                None, // no cursor — want the top-K from the start
+                false, // full sort, not simple
+            ) {
+                full_result.ids.iter().map(|&id| id as u32).collect()
+            } else {
+                result_ids.iter().map(|&id| id as u32).collect()
+            }
+        } else {
+            result_ids.iter().map(|&id| id as u32).collect()
+        };
 
         // Value function: for __slot__ sort, value = slot ID itself
         let value_fn = |slot: u32| -> u32 {
@@ -1286,10 +1330,10 @@ impl ConcurrentEngine {
         let mut bc = self.bound_cache.lock();
         if let Some(entry) = bc.get_mut(&bound_key) {
             if entry.needs_rebuild() {
-                entry.rebuild(&sorted_slots, &value_fn);
+                entry.rebuild(&seed_slots, &value_fn);
             }
         } else {
-            bc.form_bound(bound_key, &sorted_slots, &value_fn);
+            bc.form_bound(bound_key, &seed_slots, &value_fn);
         }
     }
 

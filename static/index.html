@@ -690,6 +690,9 @@ function onFilterChange() {
     if (rawPanel.classList.contains('open')) {
       document.getElementById('raw-query').value = JSON.stringify(query, null, 2);
     }
+    // Force-allow the new query even if a scroll/previous query is in-flight.
+    // The currentQueryId mechanism discards stale responses, so this is safe.
+    isLoading = false;
     executeQuery(query, false);
   }, 200);
 }
