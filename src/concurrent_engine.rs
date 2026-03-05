@@ -11,6 +11,7 @@ use roaring::RoaringBitmap;
 
 use crate::bitmap_fs::BitmapFs;
 use crate::bound_cache::{BoundCacheManager, BoundKey};
+use crate::filter::FilterFieldType;
 use crate::cache::{self, CacheLookup, CacheKey, TrieCache};
 use crate::concurrency::InFlightTracker;
 use crate::config::Config;
@@ -30,6 +31,12 @@ enum LazyLoad {
     FilterField {
         name: String,
         bitmaps: HashMap<u64, RoaringBitmap>,
+    },
+    /// Per-value lazy load for high-cardinality multi_value fields.
+    /// Only the specific queried values are loaded from disk.
+    FilterValues {
+        field: String,
+        values: HashMap<u64, RoaringBitmap>,
     },
     SortField {
         name: String,
@@ -78,6 +85,9 @@ pub struct ConcurrentEngine {
     /// Fields not yet loaded from disk (lazy loading on first query).
     pending_filter_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
     pending_sort_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// High-cardinality multi_value fields that use per-value lazy loading.
+    /// These are never "fully loaded" — individual values load on demand.
+    lazy_value_fields: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Channel for sending lazy-loaded field data to the flush thread.
     lazy_tx: Sender<LazyLoad>,
 }
@@ -124,6 +134,8 @@ impl ConcurrentEngine {
         // Filter and sort bitmaps are deferred until first query.
         let mut pending_filter_loads: HashSet<String> = HashSet::new();
         let mut pending_sort_loads: HashSet<String> = HashSet::new();
+        // Multi-value fields use per-value lazy loading (never fully loaded).
+        let mut lazy_value_fields: HashSet<String> = HashSet::new();
 
         // Load alive bitmap and slot counter eagerly (small, always needed)
         let mut slots = crate::slot::SlotAllocator::new();
@@ -142,7 +154,13 @@ impl ConcurrentEngine {
                 // Fields with no saved bitmaps don't need lazy loading.
                 if counter_val > 0 {
                     for fc in &config.filter_fields {
-                        pending_filter_loads.insert(fc.name.clone());
+                        if fc.field_type == FilterFieldType::MultiValue {
+                            // High-cardinality: per-value lazy loading
+                            lazy_value_fields.insert(fc.name.clone());
+                        } else {
+                            // Low-cardinality (single_value, boolean): full-field loading
+                            pending_filter_loads.insert(fc.name.clone());
+                        }
                     }
                     for sc in &config.sort_fields {
                         pending_sort_loads.insert(sc.name.clone());
@@ -211,6 +229,7 @@ impl ConcurrentEngine {
 
         let pending_filter_loads = Arc::new(parking_lot::Mutex::new(pending_filter_loads));
         let pending_sort_loads = Arc::new(parking_lot::Mutex::new(pending_sort_loads));
+        let lazy_value_fields = Arc::new(parking_lot::Mutex::new(lazy_value_fields));
 
         let flush_handle = {
             let inner = Arc::clone(&inner);
@@ -250,6 +269,11 @@ impl ConcurrentEngine {
                             LazyLoad::FilterField { name, bitmaps } => {
                                 if let Some(field) = staging.filters.get_field_mut(&name) {
                                     field.load_from(bitmaps);
+                                }
+                            }
+                            LazyLoad::FilterValues { field, values } => {
+                                if let Some(f) = staging.filters.get_field_mut(&field) {
+                                    f.load_from(values);
                                 }
                             }
                             LazyLoad::SortField { name, layers } => {
@@ -635,6 +659,7 @@ impl ConcurrentEngine {
             time_buckets,
             pending_filter_loads,
             pending_sort_loads,
+            lazy_value_fields,
             lazy_tx,
         })
     }
@@ -827,28 +852,27 @@ impl ConcurrentEngine {
     /// Ensure all fields referenced by the query are loaded from disk.
     ///
     /// On startup with lazy loading, filter/sort bitmaps are not loaded until
-    /// the first query touches them. This method:
-    /// 1. Checks which referenced fields are still pending
-    /// 2. Loads them from BitmapFs (disk I/O on this thread)
-    /// 3. Publishes an updated snapshot via ArcSwap (immediate visibility)
-    /// 4. Sends loaded data to the flush thread to keep staging in sync
+    /// the first query touches them. This method handles two strategies:
+    /// - **Full-field loading** for low-cardinality fields (single_value, boolean)
+    /// - **Per-value loading** for high-cardinality multi_value fields (e.g. tagIds)
     ///
-    /// Fast path: if no fields are pending, this is just an atomic read + lock check.
+    /// Fast path: if no loads are pending and no lazy value fields exist, just returns.
     fn ensure_fields_loaded(
         &self,
         filters: &[FilterClause],
         sort_field: Option<&str>,
     ) -> Result<()> {
         // Fast path: check if any loads are pending at all
+        let has_lazy_values = !self.lazy_value_fields.lock().is_empty();
         {
             let pf = self.pending_filter_loads.lock();
             let ps = self.pending_sort_loads.lock();
-            if pf.is_empty() && ps.is_empty() {
+            if pf.is_empty() && ps.is_empty() && !has_lazy_values {
                 return Ok(());
             }
         }
 
-        // Collect field names referenced by this query
+        // --- Full-field loading (single_value, boolean) ---
         let mut needed_filters: Vec<String> = Vec::new();
         let mut needed_sort: Option<String> = None;
 
@@ -865,7 +889,16 @@ impl ConcurrentEngine {
             }
         }
 
-        if needed_filters.is_empty() && needed_sort.is_none() {
+        // --- Per-value loading (multi_value) ---
+        let mut needed_values: HashMap<String, Vec<u64>> = HashMap::new();
+        if has_lazy_values {
+            let lvf = self.lazy_value_fields.lock();
+            for clause in filters {
+                Self::collect_lazy_values(clause, &lvf, &mut needed_values);
+            }
+        }
+
+        if needed_filters.is_empty() && needed_sort.is_none() && needed_values.is_empty() {
             return Ok(());
         }
 
@@ -878,7 +911,9 @@ impl ConcurrentEngine {
         // Clone current snapshot, apply loaded fields, publish immediately
         let current: Arc<InnerEngine> = self.inner.load_full();
         let mut updated = (*current).clone();
+        let mut any_loaded = false;
 
+        // Full-field loads (low-cardinality)
         for name in &needed_filters {
             let t0 = std::time::Instant::now();
             let bitmaps = store.load_field(name)?;
@@ -893,16 +928,55 @@ impl ConcurrentEngine {
                 t0.elapsed().as_secs_f64() * 1000.0
             );
 
-            // Send to flush thread for staging sync
             let _ = self.lazy_tx.send(LazyLoad::FilterField {
                 name: name.clone(),
                 bitmaps,
             });
-
-            // Remove from pending set
             self.pending_filter_loads.lock().remove(name);
+            any_loaded = true;
         }
 
+        // Per-value loads (high-cardinality multi_value)
+        for (field_name, values) in &needed_values {
+            // Filter out values already present in the snapshot
+            let missing: Vec<u64> = if let Some(field) = updated.filters.get_field(field_name) {
+                values
+                    .iter()
+                    .copied()
+                    .filter(|v| field.get_versioned(*v).is_none())
+                    .collect()
+            } else {
+                values.clone()
+            };
+
+            if missing.is_empty() {
+                continue;
+            }
+
+            let t0 = std::time::Instant::now();
+            let loaded = store.load_field_values(field_name, &missing)?;
+            if loaded.is_empty() {
+                continue;
+            }
+            let count = loaded.len();
+            if let Some(field) = updated.filters.get_field_mut(field_name) {
+                field.load_from(loaded.clone());
+            }
+            eprintln!(
+                "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
+                field_name,
+                count,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+
+            let _ = self.lazy_tx.send(LazyLoad::FilterValues {
+                field: field_name.clone(),
+                values: loaded,
+            });
+            any_loaded = true;
+        }
+
+        // Sort field loads
         if let Some(ref sort_name) = needed_sort {
             let t0 = std::time::Instant::now();
             let bits = self
@@ -924,19 +998,20 @@ impl ConcurrentEngine {
                     t0.elapsed().as_secs_f64() * 1000.0
                 );
 
-                // Send to flush thread for staging sync
                 let _ = self.lazy_tx.send(LazyLoad::SortField {
                     name: sort_name.clone(),
                     layers,
                 });
+                any_loaded = true;
             }
 
-            // Remove from pending set
             self.pending_sort_loads.lock().remove(sort_name);
         }
 
-        // Publish updated snapshot immediately (queries can proceed)
-        self.inner.store(Arc::new(updated));
+        if any_loaded {
+            // Publish updated snapshot immediately (queries can proceed)
+            self.inner.store(Arc::new(updated));
+        }
 
         Ok(())
     }
@@ -974,6 +1049,58 @@ impl ConcurrentEngine {
                     out.push(field.clone());
                 }
             }
+        }
+    }
+
+    /// Recursively collect (field, value) pairs from filter clauses for per-value
+    /// lazy loading of high-cardinality multi_value fields.
+    fn collect_lazy_values(
+        clause: &FilterClause,
+        lazy_fields: &HashSet<String>,
+        out: &mut HashMap<String, Vec<u64>>,
+    ) {
+        match clause {
+            FilterClause::Eq(f, v) => {
+                if lazy_fields.contains(f) {
+                    if let Some(key) = value_to_bitmap_key(v) {
+                        out.entry(f.clone()).or_default().push(key);
+                    }
+                }
+            }
+            FilterClause::NotEq(f, v) => {
+                if lazy_fields.contains(f) {
+                    if let Some(key) = value_to_bitmap_key(v) {
+                        out.entry(f.clone()).or_default().push(key);
+                    }
+                }
+            }
+            FilterClause::In(f, vs) => {
+                if lazy_fields.contains(f) {
+                    let entry = out.entry(f.clone()).or_default();
+                    for v in vs {
+                        if let Some(key) = value_to_bitmap_key(v) {
+                            entry.push(key);
+                        }
+                    }
+                }
+            }
+            FilterClause::Gt(f, v)
+            | FilterClause::Lt(f, v)
+            | FilterClause::Gte(f, v)
+            | FilterClause::Lte(f, v) => {
+                if lazy_fields.contains(f) {
+                    if let Some(key) = value_to_bitmap_key(v) {
+                        out.entry(f.clone()).or_default().push(key);
+                    }
+                }
+            }
+            FilterClause::Not(inner) => Self::collect_lazy_values(inner, lazy_fields, out),
+            FilterClause::And(clauses) | FilterClause::Or(clauses) => {
+                for c in clauses {
+                    Self::collect_lazy_values(c, lazy_fields, out);
+                }
+            }
+            FilterClause::BucketBitmap { .. } => {}
         }
     }
 

@@ -198,6 +198,97 @@ impl BitmapFs {
         Ok(result)
     }
 
+    /// Load specific values from a field's bucket pack files.
+    /// Groups requested values by bucket, reads only the needed pack files,
+    /// and deserializes only the matching entries. Values not present on disk
+    /// are simply absent from the result.
+    pub fn load_field_values(
+        &self,
+        field_name: &str,
+        values: &[u64],
+    ) -> Result<HashMap<u64, RoaringBitmap>> {
+        if values.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Group requested values by bucket
+        let mut by_bucket: HashMap<u8, Vec<u64>> = HashMap::new();
+        for &v in values {
+            by_bucket.entry(Self::filter_bucket(v)).or_default().push(v);
+        }
+
+        let mut result = HashMap::with_capacity(values.len());
+
+        for (bucket, wanted) in &by_bucket {
+            let path = self.filter_pack_path(field_name, *bucket);
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(BitdexError::DocStore(format!("read pack file: {e}"))),
+            };
+
+            if data.len() < 4 {
+                return Err(BitdexError::DocStore("filter pack header truncated".into()));
+            }
+
+            let num_entries =
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            let header_size = 4 + num_entries * 16;
+            if data.len() < header_size {
+                return Err(BitdexError::DocStore("filter pack index truncated".into()));
+            }
+
+            let data_start = header_size;
+
+            // Scan the index for matching values only
+            for i in 0..num_entries {
+                let idx = 4 + i * 16;
+                let value = u64::from_le_bytes([
+                    data[idx],
+                    data[idx + 1],
+                    data[idx + 2],
+                    data[idx + 3],
+                    data[idx + 4],
+                    data[idx + 5],
+                    data[idx + 6],
+                    data[idx + 7],
+                ]);
+
+                if !wanted.contains(&value) {
+                    continue;
+                }
+
+                let offset = u32::from_le_bytes([
+                    data[idx + 8],
+                    data[idx + 9],
+                    data[idx + 10],
+                    data[idx + 11],
+                ]) as usize;
+                let length = u32::from_le_bytes([
+                    data[idx + 12],
+                    data[idx + 13],
+                    data[idx + 14],
+                    data[idx + 15],
+                ]) as usize;
+
+                let start = data_start + offset;
+                let end = start + length;
+                if end > data.len() {
+                    return Err(BitdexError::DocStore(
+                        "filter bitmap data truncated".into(),
+                    ));
+                }
+
+                let bm = RoaringBitmap::deserialize_from(&data[start..end]).map_err(|e| {
+                    BitdexError::DocStore(format!("filter bitmap deserialize: {e}"))
+                })?;
+                result.insert(value, bm);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Load all bitmaps for a single field by reading all bucket pack files.
     pub fn load_field(&self, field_name: &str) -> Result<HashMap<u64, RoaringBitmap>> {
         let dir = self.root.join("filter").join(field_name);
@@ -561,5 +652,72 @@ mod tests {
         let bm = make_bitmap(&[1]);
         store.write_batch(&[("a", 1, &bm), ("b", 2, &bm), ("a", 3, &bm)]).unwrap();
         assert_eq!(store.bitmap_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_load_field_values_selective() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitmapFs::new(dir.path()).unwrap();
+
+        let bm1 = make_bitmap(&[1, 2, 3]);
+        let bm2 = make_bitmap(&[10, 20, 30]);
+        let bm3 = make_bitmap(&[100, 200]);
+
+        store
+            .write_batch(&[
+                ("tagIds", 42, &bm1),
+                ("tagIds", 99, &bm2),
+                ("tagIds", 7, &bm3),
+            ])
+            .unwrap();
+
+        // Load only value 42 — should get just that one
+        let loaded = store.load_field_values("tagIds", &[42]).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[&42], bm1);
+
+        // Load values 99 and 7 — should get both
+        let loaded = store.load_field_values("tagIds", &[99, 7]).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[&99], bm2);
+        assert_eq!(loaded[&7], bm3);
+
+        // Load a value that doesn't exist — empty result
+        let loaded = store.load_field_values("tagIds", &[999]).unwrap();
+        assert!(loaded.is_empty());
+
+        // Load from nonexistent field — empty result
+        let loaded = store.load_field_values("nope", &[1]).unwrap();
+        assert!(loaded.is_empty());
+
+        // Empty values slice — empty result
+        let loaded = store.load_field_values("tagIds", &[]).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_load_field_values_cross_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitmapFs::new(dir.path()).unwrap();
+
+        // Values in different buckets (bucket = (value >> 8) & 0xFF)
+        // value 1 → bucket 0, value 256 → bucket 1, value 512 → bucket 2
+        let bm1 = make_bitmap(&[1]);
+        let bm2 = make_bitmap(&[2]);
+        let bm3 = make_bitmap(&[3]);
+
+        store
+            .write_batch(&[
+                ("field", 1, &bm1),
+                ("field", 256, &bm2),
+                ("field", 512, &bm3),
+            ])
+            .unwrap();
+
+        // Load values from different buckets in one call
+        let loaded = store.load_field_values("field", &[1, 512]).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[&1], bm1);
+        assert_eq!(loaded[&512], bm3);
     }
 }

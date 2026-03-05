@@ -425,3 +425,119 @@ fn test_restart_after_upserts() {
         );
     }
 }
+
+#[test]
+fn test_restart_lazy_value_loading() {
+    // Verifies that multi_value fields (tagIds) use per-value lazy loading:
+    // only the specific queried tag values are loaded, not all 10 tag bitmaps.
+    let dir = tempfile::tempdir().unwrap();
+    let docstore_path = dir.path().join("docs");
+    let bitmap_path = dir.path().join("bitmaps");
+
+    let config = restart_config(&bitmap_path);
+
+    // Phase 1: Insert documents with various tagIds
+    {
+        let engine = ConcurrentEngine::new_with_path(
+            config.clone(),
+            docstore_path.as_path(),
+        )
+        .unwrap();
+
+        for i in 1..=20u32 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        (
+                            "tagIds",
+                            FieldValue::Multi(vec![
+                                Value::Integer((i % 5) as i64),     // tags 0-4
+                                Value::Integer((i % 3) as i64 + 10), // tags 10-12
+                            ]),
+                        ),
+                        ("onSite", FieldValue::Single(Value::Bool(true))),
+                        (
+                            "reactionCount",
+                            FieldValue::Single(Value::Integer(i as i64 * 10)),
+                        ),
+                    ]),
+                )
+                .unwrap();
+        }
+
+        wait_for_flush(&engine, 20, 2000);
+        wait_for_merge(500);
+    }
+
+    // Phase 2: Restart and query specific tag values
+    {
+        let engine = ConcurrentEngine::new_with_path(
+            config.clone(),
+            docstore_path.as_path(),
+        )
+        .unwrap();
+
+        assert_eq!(engine.alive_count(), 20);
+
+        // Query tagIds=0 — should load just that value's bitmap
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(0))],
+                None,
+                100,
+            )
+            .unwrap();
+        // Docs with i % 5 == 0: 5, 10, 15, 20
+        assert_eq!(result.ids.len(), 4, "tagIds=0 should match 4 docs");
+        let mut ids = result.ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec![5, 10, 15, 20]);
+
+        // Query tagIds=10 — should load just that value
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(10))],
+                None,
+                100,
+            )
+            .unwrap();
+        // Docs with i % 3 == 0: 3, 6, 9, 12, 15, 18
+        assert_eq!(result.ids.len(), 6, "tagIds=10 should match 6 docs");
+
+        // Query with In clause — loads multiple specific values
+        let result = engine
+            .query(
+                &[FilterClause::In(
+                    "tagIds".to_string(),
+                    vec![Value::Integer(1), Value::Integer(2)],
+                )],
+                None,
+                100,
+            )
+            .unwrap();
+        // tagIds=1: i%5==1 → 1,6,11,16 ; tagIds=2: i%5==2 → 2,7,12,17
+        assert_eq!(result.ids.len(), 8, "tagIds IN [1,2] should match 8 docs");
+
+        // Repeat same query — should be instant (already loaded)
+        let result2 = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(0))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result2.ids.len(), 4, "repeated query should still work");
+
+        // Query a tag value that doesn't exist — should return empty
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(999))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids.len(), 0, "nonexistent tag should match nothing");
+    }
+}
