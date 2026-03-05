@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,6 +23,19 @@ use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
+
+/// Lazy-load request sent from query threads to the flush thread.
+/// Used during startup restore to load bitmaps on demand per field.
+enum LazyLoad {
+    FilterField {
+        name: String,
+        bitmaps: HashMap<u64, RoaringBitmap>,
+    },
+    SortField {
+        name: String,
+        layers: Vec<RoaringBitmap>,
+    },
+}
 
 /// Inner bitmap state published as immutable snapshots via ArcSwap.
 ///
@@ -62,6 +75,11 @@ pub struct ConcurrentEngine {
     loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
+    /// Fields not yet loaded from disk (lazy loading on first query).
+    pending_filter_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pending_sort_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// Channel for sending lazy-loaded field data to the flush thread.
+    lazy_tx: Sender<LazyLoad>,
 }
 
 impl ConcurrentEngine {
@@ -101,26 +119,13 @@ impl ConcurrentEngine {
             None
         };
 
-        // Load filter bitmaps from filesystem on startup
-        if let Some(ref store) = bitmap_store {
-            let field_names: Vec<&str> = config
-                .filter_fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect();
-            if !field_names.is_empty() {
-                let loaded = store.load_all_fields(&field_names)?;
-                for (field_name, bitmaps) in loaded {
-                    if !bitmaps.is_empty() {
-                        if let Some(field) = filters.get_field_mut(&field_name) {
-                            field.load_from(bitmaps);
-                        }
-                    }
-                }
-            }
-        }
+        // Track which fields need lazy loading from disk.
+        // Alive + slot counter are always loaded eagerly (tiny, always needed).
+        // Filter and sort bitmaps are deferred until first query.
+        let mut pending_filter_loads: HashSet<String> = HashSet::new();
+        let mut pending_sort_loads: HashSet<String> = HashSet::new();
 
-        // Load alive, sort layers, and slot counter from filesystem on startup
+        // Load alive bitmap and slot counter eagerly (small, always needed)
         let mut slots = crate::slot::SlotAllocator::new();
         if let Some(ref store) = bitmap_store {
             let alive = store.load_alive()?;
@@ -132,13 +137,15 @@ impl ConcurrentEngine {
                     alive_bm,
                     RoaringBitmap::new(),
                 );
-            }
 
-            // Load sort layers
-            for sc in &config.sort_fields {
-                if let Some(layers) = store.load_sort_layers(&sc.name, sc.bits as usize)? {
-                    if let Some(sf) = sorts.get_field_mut(&sc.name) {
-                        sf.load_layers(layers);
+                // Only register pending loads if there are actual records to restore.
+                // Fields with no saved bitmaps don't need lazy loading.
+                if counter_val > 0 {
+                    for fc in &config.filter_fields {
+                        pending_filter_loads.insert(fc.name.clone());
+                    }
+                    for sc in &config.sort_fields {
+                        pending_sort_loads.insert(sc.name.clone());
                     }
                 }
             }
@@ -198,6 +205,13 @@ impl ConcurrentEngine {
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
 
+        // Lazy load channel: query threads send loaded field data here for staging sync.
+        let (lazy_tx, lazy_rx): (Sender<LazyLoad>, Receiver<LazyLoad>) =
+            crossbeam_channel::unbounded();
+
+        let pending_filter_loads = Arc::new(parking_lot::Mutex::new(pending_filter_loads));
+        let pending_sort_loads = Arc::new(parking_lot::Mutex::new(pending_sort_loads));
+
         let flush_handle = {
             let inner = Arc::clone(&inner);
             let cache = Arc::clone(&cache);
@@ -227,6 +241,25 @@ impl ConcurrentEngine {
 
                     // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
                     let bitmap_count = coalescer.prepare();
+
+                    // Phase 1b: Drain lazy load channel — apply loaded fields to staging.
+                    // This keeps staging in sync with snapshots published by ensure_loaded().
+                    let mut lazy_loaded = false;
+                    while let Ok(load) = lazy_rx.try_recv() {
+                        match load {
+                            LazyLoad::FilterField { name, bitmaps } => {
+                                if let Some(field) = staging.filters.get_field_mut(&name) {
+                                    field.load_from(bitmaps);
+                                }
+                            }
+                            LazyLoad::SortField { name, layers } => {
+                                if let Some(sf) = staging.sorts.get_field_mut(&name) {
+                                    sf.load_layers(layers);
+                                }
+                            }
+                        }
+                        lazy_loaded = true;
+                    }
 
                     // Phase 2: Apply mutations to staging (private, no lock needed)
                     if bitmap_count > 0 {
@@ -439,6 +472,13 @@ impl ConcurrentEngine {
                     }
                     was_loading = is_loading;
 
+                    // Publish if lazy loads updated staging but no mutations triggered a publish.
+                    // This ensures staging stays consistent with the snapshot published by
+                    // ensure_loaded() on the query thread.
+                    if lazy_loaded && bitmap_count == 0 && !is_loading {
+                        inner.store(Arc::new(staging.clone()));
+                    }
+
                     // Phase 3: Drain docstore channel and batch write
                     doc_batch.clear();
                     while let Ok(item) = doc_rx.try_recv() {
@@ -451,7 +491,7 @@ impl ConcurrentEngine {
                         }
                     }
 
-                    if bitmap_count > 0 || doc_count > 0 {
+                    if bitmap_count > 0 || doc_count > 0 || lazy_loaded {
                         current_sleep = min_sleep;
                     } else {
                         current_sleep = (current_sleep * 2).min(max_sleep);
@@ -593,6 +633,9 @@ impl ConcurrentEngine {
             loading_mode,
             dirty_since_snapshot: Arc::clone(&dirty_flag),
             time_buckets,
+            pending_filter_loads,
+            pending_sort_loads,
+            lazy_tx,
         })
     }
 
@@ -711,6 +754,9 @@ impl ConcurrentEngine {
         sort: Option<&SortClause>,
         limit: usize,
     ) -> Result<QueryResult> {
+        // Lazy-load any fields not yet loaded from disk
+        self.ensure_fields_loaded(filters, sort.map(|s| s.field.as_str()))?;
+
         let snap = self.snapshot(); // lock-free
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
@@ -778,8 +824,167 @@ impl ConcurrentEngine {
         Ok(result)
     }
 
+    /// Ensure all fields referenced by the query are loaded from disk.
+    ///
+    /// On startup with lazy loading, filter/sort bitmaps are not loaded until
+    /// the first query touches them. This method:
+    /// 1. Checks which referenced fields are still pending
+    /// 2. Loads them from BitmapFs (disk I/O on this thread)
+    /// 3. Publishes an updated snapshot via ArcSwap (immediate visibility)
+    /// 4. Sends loaded data to the flush thread to keep staging in sync
+    ///
+    /// Fast path: if no fields are pending, this is just an atomic read + lock check.
+    fn ensure_fields_loaded(
+        &self,
+        filters: &[FilterClause],
+        sort_field: Option<&str>,
+    ) -> Result<()> {
+        // Fast path: check if any loads are pending at all
+        {
+            let pf = self.pending_filter_loads.lock();
+            let ps = self.pending_sort_loads.lock();
+            if pf.is_empty() && ps.is_empty() {
+                return Ok(());
+            }
+        }
+
+        // Collect field names referenced by this query
+        let mut needed_filters: Vec<String> = Vec::new();
+        let mut needed_sort: Option<String> = None;
+
+        {
+            let pf = self.pending_filter_loads.lock();
+            for clause in filters {
+                Self::collect_filter_fields(clause, &pf, &mut needed_filters);
+            }
+        }
+        if let Some(sort_name) = sort_field {
+            let ps = self.pending_sort_loads.lock();
+            if ps.contains(sort_name) {
+                needed_sort = Some(sort_name.to_string());
+            }
+        }
+
+        if needed_filters.is_empty() && needed_sort.is_none() {
+            return Ok(());
+        }
+
+        // Load from BitmapFs
+        let store = match self.bitmap_store.as_ref() {
+            Some(s) => s,
+            None => return Ok(()), // no store, nothing to load
+        };
+
+        // Clone current snapshot, apply loaded fields, publish immediately
+        let current: Arc<InnerEngine> = self.inner.load_full();
+        let mut updated = (*current).clone();
+
+        for name in &needed_filters {
+            let t0 = std::time::Instant::now();
+            let bitmaps = store.load_field(name)?;
+            let count = bitmaps.len();
+            if let Some(field) = updated.filters.get_field_mut(name) {
+                field.load_from(bitmaps.clone());
+            }
+            eprintln!(
+                "Lazy-loaded filter '{}': {} values in {:.1}ms",
+                name,
+                count,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+
+            // Send to flush thread for staging sync
+            let _ = self.lazy_tx.send(LazyLoad::FilterField {
+                name: name.clone(),
+                bitmaps,
+            });
+
+            // Remove from pending set
+            self.pending_filter_loads.lock().remove(name);
+        }
+
+        if let Some(ref sort_name) = needed_sort {
+            let t0 = std::time::Instant::now();
+            let bits = self
+                .config
+                .sort_fields
+                .iter()
+                .find(|sc| sc.name == *sort_name)
+                .map(|sc| sc.bits as usize)
+                .unwrap_or(32);
+            if let Some(layers) = store.load_sort_layers(sort_name, bits)? {
+                let layer_count = layers.len();
+                if let Some(sf) = updated.sorts.get_field_mut(sort_name) {
+                    sf.load_layers(layers.clone());
+                }
+                eprintln!(
+                    "Lazy-loaded sort '{}': {} layers in {:.1}ms",
+                    sort_name,
+                    layer_count,
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+
+                // Send to flush thread for staging sync
+                let _ = self.lazy_tx.send(LazyLoad::SortField {
+                    name: sort_name.clone(),
+                    layers,
+                });
+            }
+
+            // Remove from pending set
+            self.pending_sort_loads.lock().remove(sort_name);
+        }
+
+        // Publish updated snapshot immediately (queries can proceed)
+        self.inner.store(Arc::new(updated));
+
+        Ok(())
+    }
+
+    /// Recursively collect filter field names from a FilterClause that are still pending.
+    fn collect_filter_fields(
+        clause: &FilterClause,
+        pending: &HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        match clause {
+            FilterClause::Eq(f, _)
+            | FilterClause::NotEq(f, _)
+            | FilterClause::Gt(f, _)
+            | FilterClause::Lt(f, _)
+            | FilterClause::Gte(f, _)
+            | FilterClause::Lte(f, _) => {
+                if pending.contains(f) && !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+            FilterClause::In(f, _) => {
+                if pending.contains(f) && !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+            FilterClause::Not(inner) => Self::collect_filter_fields(inner, pending, out),
+            FilterClause::And(clauses) | FilterClause::Or(clauses) => {
+                for c in clauses {
+                    Self::collect_filter_fields(c, pending, out);
+                }
+            }
+            FilterClause::BucketBitmap { field, .. } => {
+                if pending.contains(field) && !out.contains(field) {
+                    out.push(field.clone());
+                }
+            }
+        }
+    }
+
     /// Execute a parsed BitdexQuery.
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
+        // Lazy-load any fields not yet loaded from disk
+        self.ensure_fields_loaded(
+            &query.filters,
+            query.sort.as_ref().map(|s| s.field.as_str()),
+        )?;
+
         let snap = self.snapshot(); // lock-free
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
@@ -1121,6 +1326,20 @@ impl ConcurrentEngine {
             direction: sort_clause.direction,
             tier,
         };
+
+        // Check if we actually need to seed/rebuild the bound before doing
+        // the expensive full traversal. Existing healthy bounds can be skipped.
+        let needs_seed = {
+            let bc = self.bound_cache.lock();
+            match bc.lookup(&bound_key) {
+                Some(entry) => entry.needs_rebuild(),
+                None => true, // bound doesn't exist yet
+            }
+        };
+
+        if !needs_seed {
+            return;
+        }
 
         let target_size = self.bound_cache.lock().target_size();
 

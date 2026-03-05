@@ -38,6 +38,11 @@ pub enum LoadStatus {
         records_loaded: u64,
         elapsed_secs: f64,
     },
+    #[serde(rename = "saving")]
+    Saving {
+        records_loaded: u64,
+        elapsed_secs: f64,
+    },
     #[serde(rename = "complete")]
     Complete {
         records_loaded: u64,
@@ -385,13 +390,13 @@ async fn handle_delete_index(
         ).into_response();
     }
 
-    // Check if loading
+    // Check if loading or saving
     if let Some(idx) = guard.as_ref() {
         let status = idx.load_status.lock();
-        if matches!(*status, LoadStatus::Loading { .. }) {
+        if matches!(*status, LoadStatus::Loading { .. } | LoadStatus::Saving { .. }) {
             return (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "Cannot delete index while loading"})),
+                Json(serde_json::json!({"error": "Cannot delete index while loading or saving"})),
             ).into_response();
         }
     }
@@ -423,13 +428,13 @@ async fn handle_load(
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => {
-                // Check if already loading
+                // Check if already loading or saving
                 {
                     let status = idx.load_status.lock();
-                    if matches!(*status, LoadStatus::Loading { .. }) {
+                    if matches!(*status, LoadStatus::Loading { .. } | LoadStatus::Saving { .. }) {
                         return (
                             StatusCode::CONFLICT,
-                            Json(serde_json::json!({"error": "Already loading"})),
+                            Json(serde_json::json!({"error": "Already loading or saving"})),
                         ).into_response();
                     }
                 }
@@ -486,8 +491,8 @@ async fn handle_load(
                 let alive = engine.alive_count();
                 eprintln!("Load complete: {} records alive", alive);
 
-                // Report load complete immediately — bitmap snapshot save can be slow
-                *status.lock() = LoadStatus::Complete {
+                // Transition to Saving — bitmap snapshot save can be slow
+                *status.lock() = LoadStatus::Saving {
                     records_loaded: stats.records_loaded,
                     elapsed_secs: stats.elapsed.as_secs_f64(),
                 };
@@ -499,6 +504,12 @@ async fn handle_load(
                 } else {
                     eprintln!("Bitmap snapshot saved in {:.1}s", snap_start.elapsed().as_secs_f64());
                 }
+
+                // Only report complete after snapshot is fully saved
+                *status.lock() = LoadStatus::Complete {
+                    records_loaded: stats.records_loaded,
+                    elapsed_secs: stats.elapsed.as_secs_f64(),
+                };
             }
             Err(e) => {
                 engine.exit_loading_mode();
@@ -523,7 +534,7 @@ async fn handle_load_status(
     match guard.as_ref() {
         Some(idx) if idx.definition.name == name => {
             let status = idx.load_status.lock().clone();
-            // If still loading, update records_loaded and elapsed from live counters
+            // If loading or saving, update elapsed from live timer
             let status = match status {
                 LoadStatus::Loading { .. } => {
                     let loaded = idx.load_progress.load(Ordering::Acquire);
@@ -532,6 +543,15 @@ async fn handle_load_status(
                         .unwrap_or(0.0);
                     LoadStatus::Loading {
                         records_loaded: loaded,
+                        elapsed_secs: elapsed,
+                    }
+                }
+                LoadStatus::Saving { records_loaded, .. } => {
+                    let elapsed = idx.load_started_at.lock()
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    LoadStatus::Saving {
+                        records_loaded,
                         elapsed_secs: elapsed,
                     }
                 }
@@ -660,14 +680,14 @@ async fn handle_stats(
         }
     };
 
-    let (entries, hits, misses, rebuilds) = engine.bound_cache_stats();
+    let (bound_entries, bound_bytes, meta_entries, meta_bytes) = engine.bound_cache_stats();
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
-        "bound_cache_entries": entries,
-        "bound_cache_hits": hits,
-        "bound_cache_misses": misses,
-        "bound_cache_rebuilds": rebuilds,
+        "bound_cache_entries": bound_entries,
+        "bound_cache_bytes": bound_bytes,
+        "meta_index_entries": meta_entries,
+        "meta_index_bytes": meta_bytes,
     })).into_response()
 }
 
