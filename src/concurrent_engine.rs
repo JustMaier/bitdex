@@ -1091,9 +1091,25 @@ impl ConcurrentEngine {
             match lookup {
                 CacheLookup::ExactHit(arc) => arc,
                 CacheLookup::PrefixHit { bitmap: prefix_arc, matched_prefix_len } => {
+                    // Sort clauses into canonical order (by field name) to match
+                    // the cache key ordering. The planner orders by cardinality,
+                    // but the cache key is alphabetical — using matched_prefix_len
+                    // as an index requires the same ordering.
+                    let mut canonical_clauses = plan.ordered_clauses.clone();
+                    canonical_clauses.sort_by(|a, b| {
+                        let ka = cache::CanonicalClause::from_filter(a);
+                        let kb = cache::CanonicalClause::from_filter(b);
+                        match (ka, kb) {
+                            (Some(a), Some(b)) => a.cmp(&b),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    });
+
                     // Start from prefix bitmap, compute remaining clauses (no lock held)
                     let mut bitmap = (*prefix_arc).clone();
-                    for clause in &plan.ordered_clauses[matched_prefix_len..] {
+                    for clause in &canonical_clauses[matched_prefix_len..] {
                         let clause_bm = executor.evaluate_clause(clause)?;
                         bitmap &= &clause_bm;
                     }

@@ -474,7 +474,11 @@ fn extract_sort_value(
     bit_map: &mut HashMap<usize, RoaringBitmap>,
 ) {
     let value = match mapping.value_type {
-        FieldValueType::Integer => extract_integer(raw, mapping.truncate_u32).map(|n| n as u32),
+        // Sort fields are stored as u32 — clamp negative values to 0 so they don't
+        // wrap around to u32::MAX and sort incorrectly.
+        FieldValueType::Integer => {
+            extract_integer(raw, mapping.truncate_u32).map(|n| n.max(0) as u32)
+        }
         _ => None,
     };
     if let Some(v) = value {

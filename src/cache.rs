@@ -37,7 +37,7 @@ pub struct CanonicalClause {
 }
 
 impl CanonicalClause {
-    fn from_filter(clause: &FilterClause) -> Option<Self> {
+    pub(crate) fn from_filter(clause: &FilterClause) -> Option<Self> {
         match clause {
             FilterClause::Eq(field, value) => Some(CanonicalClause {
                 field: field.clone(),
