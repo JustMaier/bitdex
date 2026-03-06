@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
 use crate::concurrent_engine::ConcurrentEngine;
-use crate::config::{Config, DataSchema};
+use crate::config::{Config, DataSchema, FieldValueType};
+use crate::executor::StringMaps;
 use crate::loader;
 use crate::query::BitdexQuery;
 
@@ -128,6 +129,16 @@ struct DocumentBatchRequest {
     slot_ids: Vec<u32>,
 }
 
+#[derive(Deserialize)]
+struct UpsertRequest {
+    documents: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct DeleteDocsRequest {
+    ids: Vec<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // Public server entry point
 // ---------------------------------------------------------------------------
@@ -169,7 +180,8 @@ impl BitdexServer {
             // Query & documents
             .route("/api/indexes/{name}/query", post(handle_query))
             .route("/api/indexes/{name}/document", post(handle_document))
-            .route("/api/indexes/{name}/documents", post(handle_documents_batch))
+            .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
+            .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
             .route("/api/indexes/{name}/stats", get(handle_stats))
             // Utility
             .route("/api/health", get(handle_health))
@@ -220,8 +232,14 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
         // Always use new_with_path so bitmaps restore from bitmap_path even if
         // docstore doesn't exist yet (it will be created fresh).
-        let engine = ConcurrentEngine::new_with_path(config, &docstore_path)
+        let mut engine = ConcurrentEngine::new_with_path(config, &docstore_path)
             .map_err(|e| e.to_string())?;
+
+        // Build string_maps from DataSchema for MappedString field reverse lookup
+        let string_maps = build_string_maps(&def.data_schema);
+        if !string_maps.is_empty() {
+            engine.set_string_maps(string_maps);
+        }
 
         let alive = engine.alive_count();
         eprintln!(
@@ -256,6 +274,19 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Handlers: Index management
 // ---------------------------------------------------------------------------
+
+/// Build reverse string maps from DataSchema for MappedString field query resolution.
+fn build_string_maps(schema: &DataSchema) -> StringMaps {
+    let mut maps = StringMaps::new();
+    for mapping in &schema.fields {
+        if mapping.value_type == FieldValueType::MappedString {
+            if let Some(ref string_map) = mapping.string_map {
+                maps.insert(mapping.target.clone(), string_map.clone());
+            }
+        }
+    }
+    maps
+}
 
 async fn handle_create_index(
     State(state): State<SharedState>,
@@ -317,7 +348,7 @@ async fn handle_create_index(
     let mut config = req.config;
     config.storage.bitmap_path = Some(index_dir.join("bitmaps"));
 
-    let engine = match ConcurrentEngine::new_with_path(config, &docstore_path) {
+    let mut engine = match ConcurrentEngine::new_with_path(config, &docstore_path) {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -326,6 +357,12 @@ async fn handle_create_index(
             ).into_response();
         }
     };
+
+    // Build string_maps from DataSchema for MappedString field reverse lookup
+    let string_maps = build_string_maps(&definition.data_schema);
+    if !string_maps.is_empty() {
+        engine.set_string_maps(string_maps);
+    }
 
     *state.index.lock() = Some(IndexState {
         engine: Arc::new(engine),
@@ -570,10 +607,19 @@ async fn handle_load_status(
 // Handlers: Query & documents
 // ---------------------------------------------------------------------------
 
+/// Query request with optional include_docs flag.
+#[derive(Deserialize)]
+struct QueryRequest {
+    #[serde(flatten)]
+    query: BitdexQuery,
+    #[serde(default)]
+    include_docs: bool,
+}
+
 async fn handle_query(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(query): Json<BitdexQuery>,
+    Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
     let engine = {
         let guard = state.index.lock();
@@ -589,16 +635,42 @@ async fn handle_query(
     };
 
     let start = Instant::now();
-    match engine.execute_query(&query) {
+    match engine.execute_query(&req.query) {
         Ok(result) => {
             let elapsed_us = start.elapsed().as_micros() as u64;
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
-            Json(serde_json::json!({
+
+            let documents = if req.include_docs {
+                let mut docs = Vec::with_capacity(result.ids.len());
+                for &id in &result.ids {
+                    let doc = engine.get_document(id as u32);
+                    docs.push(match doc {
+                        Ok(Some(stored)) => serde_json::json!({
+                            "id": id,
+                            "fields": serde_json::to_value(&stored.fields).unwrap_or_default(),
+                        }),
+                        _ => serde_json::json!({
+                            "id": id,
+                            "fields": null,
+                        }),
+                    });
+                }
+                Some(docs)
+            } else {
+                None
+            };
+
+            let mut response = serde_json::json!({
                 "ids": result.ids,
                 "cursor": cursor,
                 "total_matched": result.total_matched,
                 "elapsed_us": elapsed_us,
-            })).into_response()
+            });
+            if let Some(docs) = documents {
+                response["documents"] = serde_json::json!(docs);
+            }
+
+            Json(response).into_response()
         }
         Err(e) => {
             (
@@ -661,6 +733,93 @@ async fn handle_documents_batch(
         }
     }
     Json(serde_json::json!({"documents": docs})).into_response()
+}
+
+async fn handle_upsert(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<UpsertRequest>,
+) -> impl IntoResponse {
+    let (engine, schema) = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                idx.definition.data_schema.clone(),
+            ),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let mut upserted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, doc_json) in req.documents.iter().enumerate() {
+        match loader::json_to_document(doc_json, &schema) {
+            Ok((slot, doc)) => {
+                if let Err(e) = engine.put(slot, &doc) {
+                    errors.push(format!("doc[{}] id={}: {}", i, slot, e));
+                } else {
+                    upserted += 1;
+                }
+            }
+            Err(e) => {
+                errors.push(format!("doc[{}]: {}", i, e));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Json(serde_json::json!({"upserted": upserted})).into_response()
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"upserted": upserted, "errors": errors})),
+        ).into_response()
+    }
+}
+
+async fn handle_delete_docs(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<DeleteDocsRequest>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let mut deleted = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    for id in &req.ids {
+        match engine.delete(*id) {
+            Ok(()) => deleted += 1,
+            Err(e) => errors.push(format!("id={}: {}", id, e)),
+        }
+    }
+
+    if errors.is_empty() {
+        Json(serde_json::json!({"deleted": deleted})).into_response()
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"deleted": deleted, "errors": errors})),
+        ).into_response()
+    }
 }
 
 async fn handle_stats(

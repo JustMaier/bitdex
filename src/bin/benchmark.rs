@@ -1731,6 +1731,7 @@ fn main() {
                 sort: Some(pagination_sort.clone()),
                 limit: page_size,
                 cursor: cursor.clone(),
+                offset: None,
             };
 
             let start = Instant::now();

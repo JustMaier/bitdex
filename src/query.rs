@@ -11,6 +11,11 @@ pub struct BitdexQuery {
     pub sort: Option<SortClause>,
     pub limit: usize,
     pub cursor: Option<CursorPosition>,
+    /// Offset-based pagination: skip the first N results before returning.
+    /// Used for shadow mode compatibility with Meilisearch's offset pagination.
+    /// When both cursor and offset are set, cursor takes precedence.
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 /// A filter clause representing a predicate on indexed data.
@@ -25,6 +30,7 @@ pub enum FilterClause {
     Eq(String, Value),
     NotEq(String, Value),
     In(String, Vec<Value>),
+    NotIn(String, Vec<Value>),
     Gt(String, Value),
     Lt(String, Value),
     Gte(String, Value),
@@ -398,6 +404,7 @@ mod tests {
                 sort_value: 100,
                 slot_id: 42,
             }),
+            offset: None,
         };
         let json = serde_json::to_string(&query).unwrap();
         let roundtrip: BitdexQuery = serde_json::from_str(&json).unwrap();

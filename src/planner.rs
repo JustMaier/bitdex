@@ -43,6 +43,19 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
             alive_count
         }
 
+        FilterClause::NotIn(field, values) => {
+            if let Some(ff) = filters.get_field(field) {
+                let mut total = 0u64;
+                for v in values {
+                    if let Some(key) = value_to_bitmap_key(v) {
+                        total += ff.cardinality(key);
+                    }
+                }
+                return alive_count.saturating_sub(total.min(alive_count));
+            }
+            alive_count
+        }
+
         FilterClause::Not(inner) => {
             let inner_card = estimate_cardinality(inner, filters, alive_count);
             alive_count.saturating_sub(inner_card)

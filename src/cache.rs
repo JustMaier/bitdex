@@ -58,6 +58,15 @@ impl CanonicalClause {
                     value_repr: sorted_values.join(","),
                 })
             }
+            FilterClause::NotIn(field, values) => {
+                let mut sorted_values: Vec<String> = values.iter().map(value_to_string).collect();
+                sorted_values.sort();
+                Some(CanonicalClause {
+                    field: field.clone(),
+                    op: "notin".to_string(),
+                    value_repr: sorted_values.join(","),
+                })
+            }
             FilterClause::Gt(field, value) => Some(CanonicalClause {
                 field: field.clone(),
                 op: "gt".to_string(),

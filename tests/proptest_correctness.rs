@@ -349,6 +349,7 @@ proptest! {
                 sort: Some(sort.clone()),
                 limit: page_size,
                 cursor,
+                offset: None,
             };
             let result = engine.execute_query(&query).unwrap();
             if result.ids.is_empty() {

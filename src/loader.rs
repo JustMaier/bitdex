@@ -24,12 +24,10 @@ use roaring::RoaringBitmap;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{DataSchema, FieldMapping, FieldValueType};
+use crate::mutation::{Document, FieldValue};
+use crate::query::Value;
 #[cfg(test)]
 use crate::docstore::StoredDoc;
-#[cfg(test)]
-use crate::mutation::FieldValue;
-#[cfg(test)]
-use crate::query::Value;
 
 /// Statistics from a completed load operation.
 #[derive(Debug, Clone)]
@@ -198,8 +196,8 @@ pub fn load_ndjson(
     let parse_writer = Arc::clone(&bulk_writer);
     let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<BitmapAccum>(2);
 
+    let id_field = schema_ref.id_field.clone();
     let parse_handle = thread::spawn(move || {
-        let mut id_counter: u32 = 0;
         let mut total_parsed: usize = 0;
 
         while let Ok(raw_block) = block_rx.recv() {
@@ -211,7 +209,6 @@ pub fn load_ndjson(
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let base_id = id_counter;
 
             let mut lines: Vec<&str> = block_str
                 .split('\n')
@@ -224,7 +221,6 @@ pub fn load_ndjson(
             if lines.len() > remaining {
                 lines.truncate(remaining);
             }
-            let line_count = lines.len();
 
             let schema = &schema_ref;
             let f_names = &filter_names_clone;
@@ -232,18 +228,27 @@ pub fn load_ndjson(
             let f_set = &filter_set_clone;
             let s_bits = &sort_bits_clone;
             let writer = &parse_writer;
+            let id_field_ref = &id_field;
 
             // Rayon fold+reduce: each worker builds thread-local bitmap maps
             // AND encodes docs to msgpack bytes — all CPU work in one pass.
+            // Slot = document ID (Postgres ID), not a sequential counter.
             let accum = lines
                 .into_par_iter()
-                .enumerate()
                 .fold(
                     || BitmapAccum::new(f_names, s_configs),
-                    |mut acc, (i, line)| {
-                        let slot = base_id + i as u32;
+                    |mut acc, line| {
                         match serde_json::from_str::<serde_json::Value>(line) {
                             Ok(json) => {
+                                // Extract the document ID to use as the slot
+                                let slot = match json.get(id_field_ref).and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n as u64))) {
+                                    Some(id) => id as u32,
+                                    None => {
+                                        acc.errors += 1;
+                                        return acc;
+                                    }
+                                };
+
                                 // Encode doc directly from JSON — no StoredDoc allocation
                                 let bytes = writer.encode_json(&json, schema);
                                 acc.encoded_docs.push((slot, bytes));
@@ -271,7 +276,6 @@ pub fn load_ndjson(
                     |a, b| a.merge(b),
                 );
 
-            id_counter += line_count as u32;
             total_parsed += accum.count;
 
             if chunk_tx.send(accum).is_err() {
@@ -552,8 +556,60 @@ fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDo
     StoredDoc { fields }
 }
 
+/// Convert a raw JSON object to a `Document` using the given `DataSchema`.
+///
+/// Extracts the ID from `schema.id_field` and builds the Document's field map
+/// using the schema's field mappings. Returns `(slot_id, Document)` or an error
+/// if the ID field is missing or not an integer.
+pub fn json_to_document(
+    json: &serde_json::Value,
+    schema: &DataSchema,
+) -> Result<(u32, Document), String> {
+    // Extract ID
+    let id_val = json
+        .get(&schema.id_field)
+        .ok_or_else(|| format!("Missing id field '{}'", schema.id_field))?;
+    let id = id_val
+        .as_u64()
+        .or_else(|| id_val.as_i64().map(|n| n as u64))
+        .ok_or_else(|| format!("id field '{}' is not an integer", schema.id_field))?;
+    let slot = id as u32;
+
+    let mut fields = HashMap::new();
+
+    // Store the ID in the document fields
+    fields.insert(
+        "id".to_string(),
+        FieldValue::Single(Value::Integer(id as i64)),
+    );
+
+    for mapping in &schema.fields {
+        let raw = json
+            .get(&mapping.source)
+            .or_else(|| mapping.fallback.as_ref().and_then(|fb| json.get(fb)));
+
+        let raw = match raw {
+            Some(v) if !v.is_null() => v,
+            _ => {
+                if matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
+                    fields.insert(
+                        mapping.target.clone(),
+                        FieldValue::Single(Value::Bool(false)),
+                    );
+                }
+                continue;
+            }
+        };
+
+        if let Some(fv) = convert_field(raw, mapping) {
+            fields.insert(mapping.target.clone(), fv);
+        }
+    }
+
+    Ok((slot, Document { fields }))
+}
+
 /// Convert a raw serde_json Value field to a FieldValue.
-#[cfg(test)]
 fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<FieldValue> {
     match mapping.value_type {
         FieldValueType::Integer => {

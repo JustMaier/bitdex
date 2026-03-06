@@ -53,6 +53,7 @@ impl QueryParser for JsonQueryParser {
             sort,
             limit,
             cursor,
+            offset: raw.offset,
         })
     }
 
@@ -67,6 +68,7 @@ struct RawQuery {
     sort: Option<JsonValue>,
     limit: Option<usize>,
     cursor: Option<JsonValue>,
+    offset: Option<usize>,
 }
 
 fn parse_filter_node(value: &JsonValue, depth: usize) -> Result<FilterClause, ParseError> {

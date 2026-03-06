@@ -17,7 +17,7 @@ use crate::concurrency::InFlightTracker;
 use crate::config::Config;
 use crate::docstore::{DocStore, StoredDoc};
 use crate::error::Result;
-use crate::executor::QueryExecutor;
+use crate::executor::{QueryExecutor, StringMaps};
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, Document, FieldRegistry, PatchPayload};
 use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
@@ -90,6 +90,8 @@ pub struct ConcurrentEngine {
     lazy_value_fields: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Channel for sending lazy-loaded field data to the flush thread.
     lazy_tx: Sender<LazyLoad>,
+    /// Reverse string maps for MappedString field query resolution.
+    string_maps: Option<Arc<StringMaps>>,
 }
 
 impl ConcurrentEngine {
@@ -661,7 +663,14 @@ impl ConcurrentEngine {
             pending_sort_loads,
             lazy_value_fields,
             lazy_tx,
+            string_maps: None,
         })
+    }
+
+    /// Set the string maps for MappedString field query resolution.
+    /// Call after creating the engine with schema data that includes string_map entries.
+    pub fn set_string_maps(&mut self, maps: StringMaps) {
+        self.string_maps = Some(Arc::new(maps));
     }
 
     /// Load the current snapshot (lock-free, zero refcount ops).
@@ -789,12 +798,15 @@ impl ConcurrentEngine {
             .unwrap_or_default()
             .as_secs();
         let executor = {
-            let base = QueryExecutor::new(
+            let mut base = QueryExecutor::new(
                 &snap.slots,
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
             );
+            if let Some(ref maps) = self.string_maps {
+                base = base.with_string_maps(maps);
+            }
             if let Some(ref tb) = tb_guard {
                 base.with_time_buckets(tb, now_unix)
             } else {
@@ -1033,7 +1045,7 @@ impl ConcurrentEngine {
                     out.push(f.clone());
                 }
             }
-            FilterClause::In(f, _) => {
+            FilterClause::In(f, _) | FilterClause::NotIn(f, _) => {
                 if pending.contains(f) && !out.contains(f) {
                     out.push(f.clone());
                 }
@@ -1074,7 +1086,7 @@ impl ConcurrentEngine {
                     }
                 }
             }
-            FilterClause::In(f, vs) => {
+            FilterClause::In(f, vs) | FilterClause::NotIn(f, vs) => {
                 if lazy_fields.contains(f) {
                     let entry = out.entry(f.clone()).or_default();
                     for v in vs {
@@ -1119,12 +1131,15 @@ impl ConcurrentEngine {
             .unwrap_or_default()
             .as_secs();
         let executor = {
-            let base = QueryExecutor::new(
+            let mut base = QueryExecutor::new(
                 &snap.slots,
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
             );
+            if let Some(ref maps) = self.string_maps {
+                base = base.with_string_maps(maps);
+            }
             if let Some(ref tb) = tb_guard {
                 base.with_time_buckets(tb, now_unix)
             } else {
@@ -1166,11 +1181,20 @@ impl ConcurrentEngine {
             query.cursor.as_ref(),
         );
 
+        // Offset pagination: if offset is set and no cursor, request offset+limit results
+        // then drop the first `offset` items. Cursor takes precedence over offset.
+        let offset = if query.cursor.is_none() {
+            query.offset.unwrap_or(0)
+        } else {
+            0
+        };
+        let fetch_limit = query.limit.saturating_add(offset);
+
         // Execute with ORIGINAL sort — bound narrows candidates only.
         let mut result = executor.execute_from_bitmap(
             &effective_bitmap,
             query.sort.as_ref(),
-            query.limit,
+            fetch_limit,
             query.cursor.as_ref(),
             use_simple,
         )?;
@@ -1179,6 +1203,28 @@ impl ConcurrentEngine {
         // execute_from_bitmap computes total_matched from the possibly-narrowed bitmap,
         // but users need the true count for pagination UI.
         result.total_matched = full_total_matched;
+
+        // Apply offset: drop the first N results
+        if offset > 0 && !result.ids.is_empty() {
+            if offset >= result.ids.len() {
+                result.ids.clear();
+                result.cursor = None;
+            } else {
+                result.ids = result.ids.split_off(offset);
+                // Recompute cursor from the new last element
+                if let Some(sort_clause) = query.sort.as_ref() {
+                    if let Some(&last_id) = result.ids.last() {
+                        let slot = last_id as u32;
+                        if let Some(sort_field) = snap.sorts.get_field(&sort_clause.field) {
+                            result.cursor = Some(crate::query::CursorPosition {
+                                sort_value: sort_field.reconstruct_value(slot) as u64,
+                                slot_id: slot,
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         // D2/D6: Form or update bound from results (with cursor for tiered bounds).
         // Passes filter bitmap + executor so bounds can be seeded with target_size
@@ -2480,6 +2526,7 @@ mod tests {
             }),
             limit: 50,
             cursor: None,
+            offset: None,
         };
 
         let result = engine.execute_query(&query).unwrap();

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
@@ -13,6 +14,7 @@ use crate::sort::SortIndex;
 use crate::types::QueryResult;
 
 /// Convert a Value to a u64 bitmap key for filter indexing.
+/// For MappedString fields, call `resolve_value_key` instead which consults the string_map.
 fn value_to_bitmap_key(val: &Value) -> Option<u64> {
     match val {
         Value::Bool(b) => Some(if *b { 1 } else { 0 }),
@@ -20,6 +22,10 @@ fn value_to_bitmap_key(val: &Value) -> Option<u64> {
         Value::Float(_) | Value::String(_) => None,
     }
 }
+
+/// Pre-computed reverse string maps: field_name → (string_value → integer_key).
+/// Built from the DataSchema's FieldMapping string_map entries.
+pub type StringMaps = HashMap<String, HashMap<String, i64>>;
 
 /// Query executor: computes filter intersections and sort traversals.
 /// Uses the query planner for cardinality-based clause ordering.
@@ -31,6 +37,7 @@ pub struct QueryExecutor<'a> {
     time_buckets: Option<&'a crate::time_buckets::TimeBucketManager>,
     now_unix: u64,
     bound_cache: Option<&'a parking_lot::Mutex<BoundCacheManager>>,
+    string_maps: Option<&'a StringMaps>,
 }
 
 impl<'a> QueryExecutor<'a> {
@@ -48,7 +55,15 @@ impl<'a> QueryExecutor<'a> {
             time_buckets: None,
             now_unix: 0,
             bound_cache: None,
+            string_maps: None,
         }
+    }
+
+    /// Attach string maps for MappedString field reverse lookup.
+    /// Enables querying with `Value::String("SD 1.5")` on MappedString fields.
+    pub fn with_string_maps(mut self, maps: &'a StringMaps) -> Self {
+        self.string_maps = Some(maps);
+        self
     }
 
     /// Attach a bound cache for sort working set reduction (D5).
@@ -74,6 +89,55 @@ impl<'a> QueryExecutor<'a> {
     /// Get a reference to the slot allocator.
     pub fn slot_allocator(&self) -> &'a SlotAllocator {
         self.slots
+    }
+
+    /// Resolve a Value to a bitmap key, consulting string_maps for MappedString fields.
+    fn resolve_value_key(&self, field: &str, val: &Value) -> Option<u64> {
+        // Try direct conversion first (Integer, Bool)
+        if let Some(key) = value_to_bitmap_key(val) {
+            return Some(key);
+        }
+        // For String values, try the string_map reverse lookup
+        if let Value::String(s) = val {
+            if let Some(maps) = self.string_maps {
+                if let Some(field_map) = maps.get(field) {
+                    return field_map.get(s.as_str()).map(|&v| v as u64);
+                }
+            }
+        }
+        None
+    }
+
+    /// Build a bitmap for a single id = N filter (intersected with alive).
+    fn id_bitmap_single(&self, value: &Value) -> Result<RoaringBitmap> {
+        let slot = match value {
+            Value::Integer(v) => *v as u32,
+            _ => return Err(BitdexError::InvalidValue {
+                field: "id".to_string(),
+                reason: "id must be an integer".to_string(),
+            }),
+        };
+        let alive = self.slots.alive_bitmap();
+        let mut bm = RoaringBitmap::new();
+        if alive.contains(slot) {
+            bm.insert(slot);
+        }
+        Ok(bm)
+    }
+
+    /// Build a bitmap for id IN [N1, N2, ...] filter (intersected with alive).
+    fn id_bitmap_multi(&self, values: &[Value]) -> Result<RoaringBitmap> {
+        let alive = self.slots.alive_bitmap();
+        let mut bm = RoaringBitmap::new();
+        for v in values {
+            if let Value::Integer(id) = v {
+                let slot = *id as u32;
+                if alive.contains(slot) {
+                    bm.insert(slot);
+                }
+            }
+        }
+        Ok(bm)
     }
 
     /// Execute a full query: plan -> filter -> sort -> paginate -> return IDs.
@@ -392,9 +456,13 @@ impl<'a> QueryExecutor<'a> {
     pub(crate) fn evaluate_clause(&self, clause: &FilterClause) -> Result<RoaringBitmap> {
         match clause {
             FilterClause::Eq(field, value) => {
+                // Special case: "id" means slot ID — construct bitmap directly
+                if field == "id" {
+                    return self.id_bitmap_single(value);
+                }
                 // Try Tier 1 (snapshot FilterIndex) first — diff-aware read
                 if let Some(filter_field) = self.filters.get_field(field) {
-                    let key = value_to_bitmap_key(value)
+                    let key = self.resolve_value_key(field, value)
                         .ok_or_else(|| BitdexError::InvalidValue {
                             field: field.clone(),
                             reason: "cannot convert to bitmap key".to_string(),
@@ -418,11 +486,15 @@ impl<'a> QueryExecutor<'a> {
             }
 
             FilterClause::In(field, values) => {
+                // Special case: "id" means slot ID — construct bitmap directly
+                if field == "id" {
+                    return self.id_bitmap_multi(values);
+                }
                 // Try Tier 1 first — diff-aware union
                 if let Some(filter_field) = self.filters.get_field(field) {
                     let keys: Vec<u64> = values
                         .iter()
-                        .filter_map(value_to_bitmap_key)
+                        .filter_map(|v| self.resolve_value_key(field, v))
                         .collect();
                     let mut result = RoaringBitmap::new();
                     for &key in &keys {
@@ -433,6 +505,15 @@ impl<'a> QueryExecutor<'a> {
                     return Ok(result);
                 }
                 Err(BitdexError::FieldNotFound(field.clone()))
+            }
+
+            FilterClause::NotIn(field, values) => {
+                // NotIn = alive - In(field, values)
+                let in_bitmap = self.evaluate_clause(&FilterClause::In(field.clone(), values.clone()))?;
+                let alive = self.slots.alive_bitmap();
+                let mut result = alive.clone();
+                result -= &in_bitmap;
+                Ok(result)
             }
 
             FilterClause::Not(inner) => {

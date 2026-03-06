@@ -233,13 +233,32 @@ impl Engine {
             &self.sorts,
             self.config.max_page_size,
         );
+
+        // Offset pagination: fetch offset+limit results, then drop first offset
+        let offset = if query.cursor.is_none() {
+            query.offset.unwrap_or(0)
+        } else {
+            0
+        };
+        let fetch_limit = query.limit.saturating_add(offset);
+
         let mut result = executor.execute_with_cache(
             &query.filters,
             query.sort.as_ref(),
-            query.limit,
+            fetch_limit,
             query.cursor.as_ref(),
             &mut self.cache.lock(),
         )?;
+
+        // Apply offset: drop the first N results
+        if offset > 0 && !result.ids.is_empty() {
+            if offset >= result.ids.len() {
+                result.ids.clear();
+                result.cursor = None;
+            } else {
+                result.ids = result.ids.split_off(offset);
+            }
+        }
 
         // Post-validation: check for in-flight write overlap and revalidate
         self.post_validate(&mut result, &query.filters, &executor)?;
@@ -588,10 +607,73 @@ mod tests {
             }),
             limit: 50,
             cursor: None,
+            offset: None,
         };
 
         let result = engine.execute_query(&query).unwrap();
         assert_eq!(result.ids, vec![1]);
+    }
+
+    #[test]
+    fn test_offset_pagination() {
+        let mut engine = Engine::new(test_config()).unwrap();
+
+        // Insert 5 docs with different reactionCounts
+        for i in 1..=5u32 {
+            engine.put(i, &make_doc(vec![
+                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 10))),
+            ])).unwrap();
+        }
+
+        let sort = SortClause {
+            field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        // Page 1: limit=2, offset=0 → [5, 4]
+        let q1 = BitdexQuery {
+            filters: vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            sort: Some(sort.clone()),
+            limit: 2,
+            cursor: None,
+            offset: None,
+        };
+        let r1 = engine.execute_query(&q1).unwrap();
+        assert_eq!(r1.ids, vec![5, 4]);
+
+        // Page 2: limit=2, offset=2 → [3, 2]
+        let q2 = BitdexQuery {
+            filters: vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            sort: Some(sort.clone()),
+            limit: 2,
+            cursor: None,
+            offset: Some(2),
+        };
+        let r2 = engine.execute_query(&q2).unwrap();
+        assert_eq!(r2.ids, vec![3, 2]);
+
+        // Page 3: limit=2, offset=4 → [1]
+        let q3 = BitdexQuery {
+            filters: vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            sort: Some(sort.clone()),
+            limit: 2,
+            cursor: None,
+            offset: Some(4),
+        };
+        let r3 = engine.execute_query(&q3).unwrap();
+        assert_eq!(r3.ids, vec![1]);
+
+        // Offset past end → empty
+        let q4 = BitdexQuery {
+            filters: vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+            sort: Some(sort.clone()),
+            limit: 2,
+            cursor: None,
+            offset: Some(10),
+        };
+        let r4 = engine.execute_query(&q4).unwrap();
+        assert!(r4.ids.is_empty());
     }
 
     #[test]
