@@ -95,8 +95,41 @@ impl CanonicalClause {
                 op: "bucket".to_string(),
                 value_repr: bucket_name.clone(),
             }),
-            // Compound clauses (And/Or/Not) are not directly cacheable as trie keys
-            FilterClause::Not(_) | FilterClause::And(_) | FilterClause::Or(_) => None,
+            // Compound clauses: recursively canonicalize sub-clauses
+            FilterClause::Not(inner) => {
+                let inner_key = Self::from_filter(inner)?;
+                Some(CanonicalClause {
+                    field: inner_key.field,
+                    op: format!("not({})", inner_key.op),
+                    value_repr: inner_key.value_repr,
+                })
+            }
+            FilterClause::And(inner) => {
+                let mut parts: Vec<String> = Vec::new();
+                for c in inner {
+                    let k = Self::from_filter(c)?;
+                    parts.push(format!("{}:{}:{}", k.field, k.op, k.value_repr));
+                }
+                parts.sort();
+                Some(CanonicalClause {
+                    field: "".to_string(),
+                    op: "and".to_string(),
+                    value_repr: parts.join("+"),
+                })
+            }
+            FilterClause::Or(inner) => {
+                let mut parts: Vec<String> = Vec::new();
+                for c in inner {
+                    let k = Self::from_filter(c)?;
+                    parts.push(format!("{}:{}:{}", k.field, k.op, k.value_repr));
+                }
+                parts.sort();
+                Some(CanonicalClause {
+                    field: "".to_string(),
+                    op: "or".to_string(),
+                    value_repr: parts.join("|"),
+                })
+            }
         }
     }
 }
@@ -675,11 +708,42 @@ mod tests {
     }
 
     #[test]
-    fn test_canonicalize_rejects_compound_not() {
+    fn test_canonicalize_handles_compound_not() {
         let clauses = vec![
             FilterClause::Not(Box::new(eq_clause("nsfwLevel", 28))),
         ];
-        assert!(canonicalize(&clauses).is_none());
+        let key = canonicalize(&clauses).unwrap();
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].field, "nsfwLevel");
+        assert_eq!(key[0].op, "not(eq)");
+        assert_eq!(key[0].value_repr, "28");
+    }
+
+    #[test]
+    fn test_canonicalize_handles_compound_or() {
+        let clauses = vec![
+            FilterClause::Or(vec![
+                eq_clause("nsfwLevel", 1),
+                eq_clause("userId", 42),
+            ]),
+        ];
+        let key = canonicalize(&clauses).unwrap();
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].op, "or");
+    }
+
+    #[test]
+    fn test_canonicalize_handles_deeply_nested() {
+        // Not(Or(...)) produces a stable key
+        let clauses = vec![
+            FilterClause::Not(Box::new(FilterClause::Or(vec![
+                eq_clause("a", 1),
+                eq_clause("b", 2),
+            ]))),
+        ];
+        let key = canonicalize(&clauses).unwrap();
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].op, "not(or)");
     }
 
     #[test]
