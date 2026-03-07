@@ -9,6 +9,7 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 [features]
 default = []
 server = ["axum", "tower-http", "tokio"]
+loadtest = ["ureq"]
 
 [dependencies]
 # Bitmap indexes
@@ -42,6 +43,9 @@ rpmalloc = "0.2"
 # HTTP server (optional — only needed for HTTP server)
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
+
+# HTTP client (optional — only needed for loadtest binary)
+ureq = { version = "2", optional = true }
 
 # RNG (used by benchmark binary)
 rand = "0.8"
@@ -81,3 +85,8 @@ path = "src/bin/benchmark.rs"
 name = "server"
 path = "src/bin/server.rs"
 required-features = ["server"]
+
+[[bin]]
+name = "loadtest"
+path = "src/bin/loadtest.rs"
+required-features = ["loadtest"]
