@@ -3,9 +3,9 @@
 A purpose-built, in-memory bitmap index engine. Takes filter predicates + sort parameters, returns an ordered list of integer IDs. Bitmaps all the way down.
 
 **In:** Filter clauses + sort field + direction + limit
-**Out:** Ordered `Vec<i64>` of matching IDs
+**Out:** Ordered list of matching IDs + optional full documents
 
-Built for datasets in the 100M+ record range on a single node. No clustering, no replication, no full-text search — just fast filtering and sorting via roaring bitmap operations.
+Built for datasets in the 100M+ record range on a single node. No clustering, no replication, no full-text search — just fast filtering, sorting, and document retrieval via roaring bitmap operations.
 
 ## Performance
 
@@ -55,7 +55,7 @@ Sortable fields are decomposed into bit layers (one bitmap per bit position). To
 - **Bound cache** — Pre-computed approximate top-K bitmaps per sort field. Reduces sort working set by 10-100x.
 - **Trie cache** — Query result cache keyed by canonically sorted filter clauses. Prefix matching for partial hits.
 - **ArcSwap snapshots** — Lock-free reads via immutable snapshots. Writers publish atomically. Zero reader contention.
-- **Document store** — Custom packed-shard filesystem store keyed by slot ID. Enables upsert diffing and optional document serving.
+- **Document store** — Custom packed-shard filesystem store keyed by slot ID. Enables upsert diffing and serving full documents alongside query results (via `include_docs: true`).
 - **Lazy loading** — Bitmaps load per-field on first query. Server starts in <1s at 105M records; fields load on demand (typically <100ms each).
 - **Clean deletes** — Deletes clear all filter/sort bitmap bits, keeping bitmaps permanently clean. No alive bitmap AND in the query hot path.
 
@@ -131,7 +131,8 @@ curl -X POST http://localhost:3001/api/indexes/my_index/query \
       {"Eq": ["active", {"Bool": true}]}
     ],
     "sort": {"field": "createdAt", "direction": "Desc"},
-    "limit": 20
+    "limit": 20,
+    "include_docs": true
   }'
 ```
 
@@ -139,11 +140,19 @@ Response:
 
 ```json
 {
-  "ids": [9823, 9817, 9801, ...],
+  "ids": [9823, 9817, 9801],
   "total_matched": 4521983,
-  "elapsed_us": 142
+  "elapsed_us": 142,
+  "cursor": {"slot": 9801, "sort_value": 1709251200},
+  "documents": [
+    {"id": 9823, "fields": {"status": "published", "category": "art", "score": 4250}},
+    {"id": 9817, "fields": {"status": "published", "category": "photo", "score": 3891}},
+    {"id": 9801, "fields": {"status": "published", "category": "art", "score": 3544}}
+  ]
 }
 ```
+
+Set `include_docs: false` (or omit it) to return only IDs — useful when you just need the ordered ID list and will fetch documents from your own data layer.
 
 ## API Reference
 
