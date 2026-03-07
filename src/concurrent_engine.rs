@@ -243,6 +243,7 @@ impl ConcurrentEngine {
             let flush_bound_cache = Arc::clone(&bound_cache);
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
+            let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
@@ -473,6 +474,34 @@ impl ConcurrentEngine {
                                     field.merge_dirty();
                                 }
                             }
+                            // Periodic time bucket refresh: rebuild any buckets whose
+                            // refresh interval has elapsed. Uses the staging snapshot's
+                            // alive bitmap and sort field to iterate (slot, timestamp) pairs.
+                            if let Some(ref tb_arc) = flush_time_buckets {
+                                let now_secs = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let mut tb = tb_arc.lock();
+                                let due = tb.refresh_due(now_secs);
+                                if !due.is_empty() {
+                                    let field_name = tb.field_name().to_string();
+                                    let due_names: Vec<String> = due.iter().map(|s| s.to_string()).collect();
+                                    if let Some(sort_field) = staging.sorts.get_field(&field_name) {
+                                        let alive = staging.slots.alive_bitmap();
+                                        for bucket_name in &due_names {
+                                            let iter = alive.iter().map(|slot| {
+                                                (slot, sort_field.reconstruct_value(slot) as u64)
+                                            });
+                                            tb.rebuild_bucket(bucket_name, iter, now_secs);
+                                        }
+                                        // Invalidate trie cache entries referencing the bucket field
+                                        // so queries re-snap with the freshly rebuilt bucket bitmaps.
+                                        cache.lock().invalidate_field(&field_name);
+                                    }
+                                }
+                            }
+
                             flush_cycle += 1;
 
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
@@ -854,7 +883,7 @@ impl ConcurrentEngine {
         };
 
         let (filter_arc, use_simple_sort) =
-            self.resolve_filters(&executor, filters)?;
+            self.resolve_filters(&executor, filters, tb_guard.as_deref(), now_unix)?;
 
         // Compute total_matched from the FULL filter bitmap before bound narrowing.
         // Filter bitmaps are kept clean (no stale bits from deleted docs),
@@ -1185,7 +1214,7 @@ impl ConcurrentEngine {
         };
 
         let (filter_arc, use_simple_sort) =
-            self.resolve_filters(&executor, &query.filters)?;
+            self.resolve_filters(&executor, &query.filters, tb_guard.as_deref(), now_unix)?;
 
         // Compute total_matched from the FULL filter bitmap before bound narrowing.
         // Filter bitmaps are kept clean (no stale bits from deleted docs),
@@ -1285,8 +1314,28 @@ impl ConcurrentEngine {
         &self,
         executor: &QueryExecutor,
         filters: &[FilterClause],
+        time_buckets: Option<&TimeBucketManager>,
+        now_unix: u64,
     ) -> Result<(Arc<roaring::RoaringBitmap>, bool)> {
-        let plan = planner::plan_query(filters, executor.filter_index(), executor.slot_allocator());
+        // Snap range filters to pre-computed time bucket bitmaps (C3).
+        // This must happen BEFORE canonicalization so cache keys use stable
+        // bucket names ("7d") instead of moving timestamps.
+        let snapped;
+        let effective_filters = if let Some(tb) = time_buckets {
+            let mut managers = std::collections::HashMap::new();
+            managers.insert(tb.field_name().to_string(), tb);
+            let ctx = crate::query::BucketSnapContext {
+                managers: &managers,
+                now_secs: now_unix,
+                tolerance_pct: 0.10,
+            };
+            snapped = crate::query::snap_range_clauses(filters, &ctx);
+            &snapped[..]
+        } else {
+            filters
+        };
+
+        let plan = planner::plan_query(effective_filters, executor.filter_index(), executor.slot_allocator());
         let cache_key = cache::canonicalize(&plan.ordered_clauses);
 
         let filter_bitmap = if let Some(ref key) = cache_key {

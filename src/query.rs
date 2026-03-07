@@ -126,7 +126,7 @@ pub trait QueryParser: Send + Sync {
 /// pre-computed time buckets (C3).
 pub struct BucketSnapContext<'a> {
     /// Map from field name → TimeBucketManager for that field.
-    pub managers: &'a std::collections::HashMap<String, crate::time_buckets::TimeBucketManager>,
+    pub managers: &'a std::collections::HashMap<String, &'a crate::time_buckets::TimeBucketManager>,
     /// Current unix timestamp in seconds (used to compute `now - duration` for Gt/Gte).
     pub now_secs: u64,
     /// Snap tolerance as a fraction (e.g. 0.10 for 10%).
@@ -201,10 +201,10 @@ mod tests {
     use std::collections::HashMap;
 
     /// Build a BucketSnapContext with a single field and two buckets (24h, 7d).
-    fn make_ctx(
-        managers: &HashMap<String, TimeBucketManager>,
+    fn make_ctx<'a>(
+        managers: &'a HashMap<String, &'a TimeBucketManager>,
         now_secs: u64,
-    ) -> BucketSnapContext<'_> {
+    ) -> BucketSnapContext<'a> {
         BucketSnapContext {
             managers,
             now_secs,
@@ -238,7 +238,7 @@ mod tests {
         let now: u64 = 1_700_000_000;
         let mgr = make_manager_with_data(now);
         let mut managers = HashMap::new();
-        managers.insert("sortAt".to_string(), mgr);
+        managers.insert("sortAt".to_string(), &mgr);
         let ctx = make_ctx(&managers, now);
 
         // Gt("sortAt", now - 86400) → exactly 24h duration → snap to "24h"
@@ -262,7 +262,7 @@ mod tests {
         let now: u64 = 1_700_000_000;
         let mgr = make_manager_with_data(now);
         let mut managers = HashMap::new();
-        managers.insert("sortAt".to_string(), mgr);
+        managers.insert("sortAt".to_string(), &mgr);
         let ctx = make_ctx(&managers, now);
 
         // Gte("sortAt", now - 590000) → duration=590000, 7d=604800, delta=14800, threshold=60480 → snap
@@ -283,7 +283,7 @@ mod tests {
         let now: u64 = 1_700_000_000;
         let mgr = make_manager_with_data(now);
         let mut managers = HashMap::new();
-        managers.insert("sortAt".to_string(), mgr);
+        managers.insert("sortAt".to_string(), &mgr);
         let ctx = make_ctx(&managers, now);
 
         // Duration = 200000s. Neither 24h (86400) nor 7d (604800) is within 10% tolerance.
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_no_snap_unknown_field() {
         let now: u64 = 1_700_000_000;
-        let managers: HashMap<String, TimeBucketManager> = HashMap::new();
+        let managers: HashMap<String, &TimeBucketManager> = HashMap::new();
         let ctx = make_ctx(&managers, now);
 
         let ts = (now - 86400) as i64;
@@ -313,7 +313,7 @@ mod tests {
         let now: u64 = 1_700_000_000;
         let mgr = make_manager_with_data(now);
         let mut managers = HashMap::new();
-        managers.insert("sortAt".to_string(), mgr);
+        managers.insert("sortAt".to_string(), &mgr);
         let ctx = make_ctx(&managers, now);
 
         let ts = (now - 86400) as i64;
@@ -330,7 +330,7 @@ mod tests {
         let now: u64 = 1_700_000_000;
         let mgr = make_manager_with_data(now);
         let mut managers = HashMap::new();
-        managers.insert("sortAt".to_string(), mgr);
+        managers.insert("sortAt".to_string(), &mgr);
         let ctx = make_ctx(&managers, now);
 
         let ts = (now - 86400) as i64;
@@ -354,7 +354,7 @@ mod tests {
         let now: u64 = 1_700_000_000;
         let mgr = make_manager_with_data(now);
         let mut managers = HashMap::new();
-        managers.insert("sortAt".to_string(), mgr);
+        managers.insert("sortAt".to_string(), &mgr);
         let ctx = make_ctx(&managers, now);
 
         // Float value — should not snap
