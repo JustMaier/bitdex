@@ -329,7 +329,7 @@ pub fn diff_patch(
 }
 
 /// Collect FilterRemove ops for a field value.
-fn collect_filter_remove_ops(
+pub fn collect_filter_remove_ops(
     ops: &mut Vec<MutationOp>,
     field_name: &Arc<str>,
     slot: u32,
@@ -423,7 +423,7 @@ pub fn value_to_bitmap_key(val: &Value) -> Option<u64> {
 }
 
 /// Convert a Value to a u32 for sort layer bit decomposition.
-fn value_to_sort_u32(val: &Value) -> Option<u32> {
+pub fn value_to_sort_u32(val: &Value) -> Option<u32> {
     match val {
         Value::Integer(v) => Some(*v as u32),
         _ => None,
@@ -763,26 +763,44 @@ impl<'a> MutationEngine<'a> {
         Ok(())
     }
 
-    /// DELETE(id) -- clear the alive bit. That's the entire operation.
+    /// DELETE(id) -- clean delete: clear filter/sort bitmaps then alive bit.
     ///
-    /// All other bitmaps retain stale bits -- they're invisible behind the alive gate.
+    /// Reads the doc from the docstore to determine which bitmaps need clearing.
+    /// This keeps filter bitmaps clean, eliminating the alive AND from queries.
     pub fn delete(&mut self, id: u32) -> Result<()> {
+        // Read old doc to know which bitmaps to clear
+        let old_doc = self.docstore.get(id)?;
+        if let Some(doc) = &old_doc {
+            self.clear_old_bitmaps(id, doc);
+            // Merge sort diffs from the clears
+            for (_name, field) in self.sorts.fields_mut() {
+                field.merge_dirty();
+            }
+        }
         self.slots.delete(id)?;
         self.slots.merge_alive();
         Ok(())
     }
 
-    /// DELETE WHERE(predicate) -- resolve predicate, clear alive bits.
+    /// DELETE WHERE(predicate) -- resolve predicate, clean-delete all matches.
     ///
     /// Takes a pre-computed bitmap of matching slots (the caller resolves the predicate
-    /// using the query engine).
+    /// using the query engine). For each slot, reads the doc and clears filter/sort bitmaps.
     pub fn delete_where(&mut self, matching_slots: &RoaringBitmap) -> Result<u64> {
         let mut count = 0u64;
         for slot in matching_slots.iter() {
             if self.slots.is_alive(slot) {
+                // Clean-delete: clear filter/sort bitmaps using stored doc
+                if let Ok(Some(doc)) = self.docstore.get(slot) {
+                    self.clear_old_bitmaps(slot, &doc);
+                }
                 self.slots.delete(slot)?;
                 count += 1;
             }
+        }
+        // Merge sort diffs and alive
+        for (_name, field) in self.sorts.fields_mut() {
+            field.merge_dirty();
         }
         self.slots.merge_alive();
         Ok(count)
@@ -1095,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_only_clears_alive() {
+    fn test_delete_cleans_all_bitmaps() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
             MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
@@ -1114,21 +1132,24 @@ mod tests {
             field.merge_dirty();
         }
 
-        // Filter bitmap still has stale bit (by design!)
-        assert!(filters
-            .get_field("nsfwLevel")
-            .unwrap()
-            .get(1)
-            .unwrap()
-            .contains(100));
+        // Filter bitmap is clean — stale bit removed on delete
+        assert!(
+            filters.get_field("nsfwLevel").unwrap().get(1).is_none()
+                || !filters
+                    .get_field("nsfwLevel")
+                    .unwrap()
+                    .get(1)
+                    .unwrap()
+                    .contains(100)
+        );
 
-        // Sort bitmap still has stale bits (by design!)
+        // Sort bitmap is clean — stale bits removed on delete
         assert_eq!(
             sorts
                 .get_field("reactionCount")
                 .unwrap()
                 .reconstruct_value(100),
-            42
+            0
         );
     }
 

@@ -769,15 +769,54 @@ impl ConcurrentEngine {
         result
     }
 
-    /// DELETE(id) -- send alive remove op to coalescer.
+    /// DELETE(id) -- clean delete: clear filter/sort bitmaps then alive bit.
+    ///
+    /// Reads the doc from the docstore to determine exactly which filter and sort
+    /// bitmaps need clearing. This makes filter bitmaps always clean (no stale bits),
+    /// eliminating the alive AND from the query hot path.
     pub fn delete(&self, id: u32) -> Result<()> {
-        self.sender
-            .send(MutationOp::AliveRemove { slots: vec![id] })
-            .map_err(|_| {
-                crate::error::BitdexError::CapacityExceeded(
-                    "coalescer channel disconnected".to_string(),
-                )
-            })?;
+        // Read the doc to know which bitmaps to clear
+        let old_doc = self.docstore.lock().get(id)?;
+
+        let mut ops = Vec::new();
+
+        // Generate filter/sort cleanup ops from the stored doc
+        if let Some(doc) = &old_doc {
+            for fc in &self.config.filter_fields {
+                if let Some(val) = doc.fields.get(&fc.name) {
+                    let arc_name = self.field_registry.get(&fc.name);
+                    crate::mutation::collect_filter_remove_ops(&mut ops, &arc_name, id, val);
+                }
+            }
+            for sc in &self.config.sort_fields {
+                if let Some(val) = doc.fields.get(&sc.name) {
+                    if let crate::mutation::FieldValue::Single(v) = val {
+                        if let Some(sort_val) = crate::mutation::value_to_sort_u32(v) {
+                            let arc_name = self.field_registry.get(&sc.name);
+                            let num_bits = sc.bits as usize;
+                            for bit in 0..num_bits {
+                                if (sort_val >> bit) & 1 == 1 {
+                                    ops.push(MutationOp::SortClear {
+                                        field: arc_name.clone(),
+                                        bit_layer: bit,
+                                        slots: vec![id],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clear the alive bit last
+        ops.push(MutationOp::AliveRemove { slots: vec![id] });
+
+        self.sender.send_batch(ops).map_err(|_| {
+            crate::error::BitdexError::CapacityExceeded(
+                "coalescer channel disconnected".to_string(),
+            )
+        })?;
         Ok(())
     }
 
@@ -818,11 +857,9 @@ impl ConcurrentEngine {
             self.resolve_filters(&executor, filters)?;
 
         // Compute total_matched from the FULL filter bitmap before bound narrowing.
-        let full_total_matched = if executor.slot_allocator().all_slots_alive() {
-            filter_arc.len()
-        } else {
-            (&*filter_arc & executor.slot_allocator().alive_bitmap()).len()
-        };
+        // Filter bitmaps are kept clean (no stale bits from deleted docs),
+        // so no alive AND is needed.
+        let full_total_matched = filter_arc.len();
 
         // D5: Narrow filter bitmap with bound cache.
         // Synthesize implicit "__slot__" sort for filter-only queries so they
@@ -1151,13 +1188,9 @@ impl ConcurrentEngine {
             self.resolve_filters(&executor, &query.filters)?;
 
         // Compute total_matched from the FULL filter bitmap before bound narrowing.
-        // This ensures pagination/total counts remain accurate even when the bound
-        // cache narrows the working set for sort acceleration.
-        let full_total_matched = if executor.slot_allocator().all_slots_alive() {
-            filter_arc.len()
-        } else {
-            (&*filter_arc & executor.slot_allocator().alive_bitmap()).len()
-        };
+        // Filter bitmaps are kept clean (no stale bits from deleted docs),
+        // so no alive AND is needed.
+        let full_total_matched = filter_arc.len();
 
         // D5: Narrow filter bitmap with bound cache.
         // Synthesize implicit "__slot__" sort for filter-only queries.

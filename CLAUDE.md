@@ -23,7 +23,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 4. **No in-memory forward maps or reverse indexes.** The on-disk document store replaces the need for these. On upsert, read old doc from disk to determine which bitmaps to update. For DELETE WHERE on high-cardinality fields, scan the bitmaps.
 
-5. **Deletes only clear the alive bit.** No cleanup of other bitmaps on delete. Autovac handles that in the background.
+5. **Clean deletes.** Deletes read the stored doc and clear all filter/sort bitmap bits before clearing the alive bit. This keeps filter bitmaps clean (no stale bits), eliminating the alive AND from the query hot path.
 
 6. **Slot = Postgres ID** for integer ID users. No mapping layer.
 
@@ -41,7 +41,8 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 - Each document's Postgres ID IS the slot (its position in every bitmap)
 - Slots are monotonically assigned via atomic counter on insert
-- Deleted slots are NOT immediately recycled — the alive bitmap hides them
+- Deleted slots have their filter/sort bitmap bits cleared immediately (clean delete)
+- The alive bitmap tracks active documents but is NOT ANDed into queries (filter bitmaps are always clean)
 - An autovac process periodically produces a clean bitmap of recycled slots
 - New inserts check the clean bitmap first (grab first set bit), append only if none available
 
@@ -57,7 +58,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 ### Bitmap Categories
 
-1. **Alive Bitmap** — One bitmap tracking all active documents. ANDed into every query implicitly. Delete = clear one bit here.
+1. **Alive Bitmap** — One bitmap tracking all active documents. Used for slot management, stats, and as the universe for negation operators (NotEq, Not). NOT ANDed into queries — filter bitmaps are kept clean via clean deletes. Delete = clear filter/sort bits + clear alive bit.
 2. **Filter Bitmaps** — One roaring bitmap per distinct value per filterable field. Boolean fields: one bitmap per boolean. Multi-value fields: one bitmap per distinct value.
 3. **Sort Layer Bitmaps** — Each sortable numeric field decomposed into N bitmaps (one per bit position). A u32 field = 32 bitmaps. Top-N retrieval via MSB-to-LSB traversal using AND operations.
 

@@ -156,22 +156,20 @@ impl<'a> QueryExecutor<'a> {
         // Step 2: Compute filter bitmap using planned clause order
         let filter_bitmap = self.compute_filters(&plan.ordered_clauses)?;
 
-        // Step 3: AND with alive bitmap (implicit in every query)
-        let alive = self.slots.alive_bitmap();
-        let candidates = &filter_bitmap & alive;
+        // Filter bitmaps are kept clean (no stale bits from deleted docs),
+        // so no alive AND is needed here.
+        let total_matched = filter_bitmap.len();
 
-        let total_matched = candidates.len();
-
-        // Step 4: Sort and paginate
+        // Step 3: Sort and paginate
         let (ids, next_cursor) = if let Some(sort_clause) = sort {
             if plan.use_simple_sort {
-                self.simple_sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+                self.simple_sort_and_paginate(&filter_bitmap, sort_clause, limit, cursor)?
             } else {
-                self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+                self.sort_and_paginate(&filter_bitmap, sort_clause, limit, cursor)?
             }
         } else {
             // No sort: return in descending slot order (newest first)
-            self.slot_order_paginate(&candidates, limit, cursor)
+            self.slot_order_paginate(&filter_bitmap, limit, cursor)
         };
 
         Ok(QueryResult {
@@ -235,21 +233,15 @@ impl<'a> QueryExecutor<'a> {
             Arc::new(self.compute_filters(&plan.ordered_clauses)?)
         };
 
-        // Step 3: AND with alive bitmap — skip when no deletes have occurred
-        let candidates: std::borrow::Cow<RoaringBitmap> = if self.slots.all_slots_alive() {
-            std::borrow::Cow::Borrowed(&filter_arc)
-        } else {
-            let alive = self.slots.alive_bitmap();
-            std::borrow::Cow::Owned(filter_arc.as_ref() & alive)
-        };
+        // Filter bitmaps are kept clean (no stale bits from deleted docs),
+        // so no alive AND is needed.
+        let total_matched = filter_arc.len();
 
-        let total_matched = candidates.len();
-
-        // Step 4: Sort and paginate — with optional bound cache (D5)
+        // Step 3: Sort and paginate — with optional bound cache (D5)
         let (ids, next_cursor) = if let Some(sort_clause) = sort {
             // D5: Try to narrow working set with bound cache before sort traversal
             let (sort_candidates, did_use_bound) = self.apply_bound_if_available(
-                &candidates,
+                &filter_arc,
                 &cache_key,
                 sort_clause,
                 cursor,
@@ -269,7 +261,7 @@ impl<'a> QueryExecutor<'a> {
             (result_ids, result_cursor)
         } else {
             // No sort: return in descending slot order (newest first)
-            self.slot_order_paginate(&candidates, limit, cursor)
+            self.slot_order_paginate(&filter_arc, limit, cursor)
         };
 
         Ok(QueryResult {
@@ -403,25 +395,20 @@ impl<'a> QueryExecutor<'a> {
     ) -> Result<QueryResult> {
         let limit = limit.min(self.max_page_size);
 
-        // AND with alive bitmap — skip when no deletes have occurred (all slots alive)
-        let candidates: std::borrow::Cow<RoaringBitmap> = if self.slots.all_slots_alive() {
-            std::borrow::Cow::Borrowed(filter_bitmap)
-        } else {
-            let alive = self.slots.alive_bitmap();
-            std::borrow::Cow::Owned(filter_bitmap & alive)
-        };
-        let total_matched = candidates.len();
+        // Filter bitmaps are kept clean (no stale bits from deleted docs),
+        // so no alive AND is needed.
+        let total_matched = filter_bitmap.len();
 
         // Sort and paginate
         let (ids, next_cursor) = if let Some(sort_clause) = sort {
             if use_simple_sort {
-                self.simple_sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+                self.simple_sort_and_paginate(filter_bitmap, sort_clause, limit, cursor)?
             } else {
-                self.sort_and_paginate(&candidates, sort_clause, limit, cursor)?
+                self.sort_and_paginate(filter_bitmap, sort_clause, limit, cursor)?
             }
         } else {
             // No sort: return in descending slot order (newest first)
-            self.slot_order_paginate(&candidates, limit, cursor)
+            self.slot_order_paginate(filter_bitmap, limit, cursor)
         };
 
         Ok(QueryResult {

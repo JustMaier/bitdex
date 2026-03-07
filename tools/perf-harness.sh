@@ -75,6 +75,14 @@ seed_bounds() {
   curl -s -X POST "$QUERY_URL" -H "Content-Type: application/json" \
     -d '{"filters":[{"Eq":["nsfwLevel",{"Integer":1}]},{"Not":{"Eq":["availability",{"String":"Private"}]}}],"sort":{"field":"collectedCount","direction":"Desc"},"limit":10}' > /dev/null 2>&1
 
+  # Mixed filters: nsfwLevel + type + NOT Private
+  curl -s -X POST "$QUERY_URL" -H "Content-Type: application/json" \
+    -d '{"filters":[{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["type",{"String":"image"}]},{"Not":{"Eq":["availability",{"String":"Private"}]}}],"sort":{"field":"sortAt","direction":"Desc"},"limit":10}' > /dev/null 2>&1
+
+  # Mixed filters: nsfwLevel + hasMeta + NOT Private
+  curl -s -X POST "$QUERY_URL" -H "Content-Type: application/json" \
+    -d '{"filters":[{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["hasMeta",{"Bool":true}]},{"Not":{"Eq":["availability",{"String":"Private"}]}}],"sort":{"field":"reactionCount","direction":"Desc"},"limit":10}' > /dev/null 2>&1
+
   echo "  Bounds seeded."
   echo ""
 }

@@ -164,12 +164,19 @@ impl Engine {
         result
     }
 
-    /// DELETE(id) -- clear the alive bit. That's it.
+    /// DELETE(id) -- clean delete: clear filter/sort bitmaps then alive bit.
     /// Marks the slot as in-flight during the mutation.
-    /// Note: deletes don't invalidate filter caches because the alive bitmap
-    /// gate handles filtering out deleted documents.
     pub fn delete(&mut self, id: u32) -> Result<()> {
         self.in_flight.mark_in_flight(id);
+
+        // Invalidate cache for all filter fields (clean delete changes filter bitmaps)
+        {
+            let mut c = self.cache.lock();
+            for fc in &self.config.filter_fields {
+                c.invalidate_field(&fc.name);
+            }
+        }
+
         let result = {
             let mut engine = MutationEngine::new(
                 &mut self.slots,
@@ -180,13 +187,19 @@ impl Engine {
             );
             engine.delete(id)
         };
-        // Merge alive after delete so alive_bitmap() returns correct state
+        // Eager merge: filter/sort diffs and alive must be compacted before readers see them
+        for (_name, field) in self.filters.fields_mut() {
+            field.merge_dirty();
+        }
+        for (_name, field) in self.sorts.fields_mut() {
+            field.merge_dirty();
+        }
         self.slots.merge_alive();
         self.in_flight.clear_in_flight(id);
         result
     }
 
-    /// DELETE WHERE(query) -- resolve query, clear alive bits for matches.
+    /// DELETE WHERE(query) -- resolve query, clean-delete all matches.
     pub fn delete_where(&mut self, filters: &[FilterClause]) -> Result<u64> {
         // First, resolve the filter to get matching slot IDs
         let executor = QueryExecutor::new(
@@ -209,6 +222,14 @@ impl Engine {
             matching.insert(*id as u32);
         }
 
+        // Invalidate cache for all filter fields (clean delete changes filter bitmaps)
+        {
+            let mut c = self.cache.lock();
+            for fc in &self.config.filter_fields {
+                c.invalidate_field(&fc.name);
+            }
+        }
+
         // Now delete them
         let result = {
             let mut engine = MutationEngine::new(
@@ -220,7 +241,13 @@ impl Engine {
             );
             engine.delete_where(&matching)
         };
-        // Merge alive after bulk delete
+        // Eager merge: filter/sort diffs and alive must be compacted before readers see them
+        for (_name, field) in self.filters.fields_mut() {
+            field.merge_dirty();
+        }
+        for (_name, field) in self.sorts.fields_mut() {
+            field.merge_dirty();
+        }
         self.slots.merge_alive();
         result
     }
