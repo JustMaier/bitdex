@@ -871,7 +871,8 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            );
+            )
+            .with_bound_target_size(self.config.cache.bound_target_size);
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -1202,7 +1203,8 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            );
+            )
+            .with_bound_target_size(self.config.cache.bound_target_size);
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -1598,12 +1600,16 @@ impl ConcurrentEngine {
             tier,
         };
 
+        let target_size = self.bound_cache.lock().target_size();
+
         // Check if we actually need to seed/rebuild the bound before doing
-        // the expensive full traversal. Existing healthy bounds can be skipped.
+        // the expensive full traversal. A bound needs seeding if it doesn't exist,
+        // needs rebuild, or was formed from too few results (e.g., just one page
+        // of 20 items instead of the target 10K).
         let needs_seed = {
             let bc = self.bound_cache.lock();
             match bc.lookup(&bound_key) {
-                Some(entry) => entry.needs_rebuild(),
+                Some(entry) => entry.needs_rebuild() || (entry.bitmap().len() as usize) < target_size / 2,
                 None => true, // bound doesn't exist yet
             }
         };
@@ -1612,17 +1618,44 @@ impl ConcurrentEngine {
             return;
         }
 
-        let target_size = self.bound_cache.lock().target_size();
-
         // If the query result set is smaller than target_size, do a full
         // traversal to seed the bound properly. This ensures the bound covers
         // thousands of entries for pagination, not just a single page.
+        //
+        // For tier > 0, we need to start the seed traversal AFTER the previous
+        // tier's range. Find the previous tier's min_tracked_value and use it
+        // as the cursor for the seed traversal.
+        let seed_cursor = if tier > 0 {
+            let bc = self.bound_cache.lock();
+            let prev_key = BoundKey {
+                filter_key: filter_key.clone(),
+                sort_field: sort_clause.field.clone(),
+                direction: sort_clause.direction,
+                tier: tier - 1,
+            };
+            bc.lookup(&prev_key).map(|entry| {
+                let min_val = entry.min_tracked_value();
+                // Find the slot with min_tracked_value to build a cursor.
+                // Use slot_id=0 for Desc (any slot past min_val) or u32::MAX for Asc.
+                let slot_id = match sort_clause.direction {
+                    SortDirection::Desc => 0,
+                    SortDirection::Asc => u32::MAX,
+                };
+                crate::query::CursorPosition {
+                    sort_value: min_val as u64,
+                    slot_id,
+                }
+            })
+        } else {
+            None
+        };
+
         let seed_slots: Vec<u32> = if result_ids.len() < target_size {
-            if let Ok(full_result) = executor.execute_from_bitmap(
+            if let Ok(full_result) = executor.execute_from_bitmap_unclamped(
                 filter_bitmap,
                 Some(sort_clause),
                 target_size,
-                None, // no cursor — want the top-K from the start
+                seed_cursor.as_ref(), // start after previous tier for tier > 0
                 false, // full sort, not simple
             ) {
                 full_result.ids.iter().map(|&id| id as u32).collect()
@@ -1644,7 +1677,7 @@ impl ConcurrentEngine {
 
         let mut bc = self.bound_cache.lock();
         if let Some(entry) = bc.get_mut(&bound_key) {
-            if entry.needs_rebuild() {
+            if entry.needs_rebuild() || (entry.bitmap().len() as usize) < target_size / 2 {
                 entry.rebuild(&seed_slots, &value_fn);
             }
         } else {

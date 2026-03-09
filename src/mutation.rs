@@ -425,7 +425,7 @@ pub fn value_to_bitmap_key(val: &Value) -> Option<u64> {
 /// Convert a Value to a u32 for sort layer bit decomposition.
 pub fn value_to_sort_u32(val: &Value) -> Option<u32> {
     match val {
-        Value::Integer(v) => Some(*v as u32),
+        Value::Integer(v) => Some((*v).max(0) as u32),
         _ => None,
     }
 }

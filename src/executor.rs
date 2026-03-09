@@ -38,6 +38,7 @@ pub struct QueryExecutor<'a> {
     now_unix: u64,
     bound_cache: Option<&'a parking_lot::Mutex<BoundCacheManager>>,
     string_maps: Option<&'a StringMaps>,
+    bound_target_size: usize,
 }
 
 impl<'a> QueryExecutor<'a> {
@@ -56,6 +57,7 @@ impl<'a> QueryExecutor<'a> {
             now_unix: 0,
             bound_cache: None,
             string_maps: None,
+            bound_target_size: 10_000,
         }
     }
 
@@ -70,6 +72,13 @@ impl<'a> QueryExecutor<'a> {
     /// Bounds shrink the candidate set before sort traversal.
     pub fn with_bound_cache(mut self, bc: &'a parking_lot::Mutex<BoundCacheManager>) -> Self {
         self.bound_cache = Some(bc);
+        self
+    }
+
+    /// Set the bound target size (number of slots to fetch when forming a new bound).
+    /// Defaults to 10,000.
+    pub fn with_bound_target_size(mut self, size: usize) -> Self {
+        self.bound_target_size = size;
         self
     }
 
@@ -240,25 +249,53 @@ impl<'a> QueryExecutor<'a> {
         // Step 3: Sort and paginate — with optional bound cache (D5)
         let (ids, next_cursor) = if let Some(sort_clause) = sort {
             // D5: Try to narrow working set with bound cache before sort traversal
-            let (sort_candidates, did_use_bound) = self.apply_bound_if_available(
+            let (sort_candidates, did_use_bound, escalated_tier) = self.apply_bound_if_available(
                 &filter_arc,
                 &cache_key,
                 sort_clause,
                 cursor,
             );
 
-            let (result_ids, result_cursor) = if plan.use_simple_sort && !did_use_bound {
-                self.simple_sort_and_paginate(&sort_candidates, sort_clause, limit, cursor)?
+            // When bound was exhausted by cursor pagination, fetch extra results
+            // so the new bound covers enough range for subsequent pages.
+            let needs_bound_formation = escalated_tier > 0 && !did_use_bound;
+            let fetch_limit = if needs_bound_formation {
+                limit.max(self.bound_target_size)
             } else {
-                self.sort_and_paginate(&sort_candidates, sort_clause, limit, cursor)?
+                limit
+            };
+
+            let (mut result_ids, result_cursor) = if plan.use_simple_sort && !did_use_bound {
+                self.simple_sort_and_paginate(&sort_candidates, sort_clause, fetch_limit, cursor)?
+            } else {
+                self.sort_and_paginate(&sort_candidates, sort_clause, fetch_limit, cursor)?
             };
 
             // D2: Form or update bound from sort results (promotion_threshold = 0)
+            // If cursor was past all existing tiers, form a bound at the escalated tier
+            // using the extra results fetched above.
             if let (Some(bc), Some(ref key)) = (&self.bound_cache, &cache_key) {
-                self.form_or_update_bound(bc, key, sort_clause, &result_ids);
+                self.form_or_update_bound(bc, key, sort_clause, &result_ids, escalated_tier);
             }
 
-            (result_ids, result_cursor)
+            // Trim back to the user's requested limit
+            if result_ids.len() > limit {
+                result_ids.truncate(limit);
+            }
+
+            // Recompute cursor from the last actually-returned ID
+            let actual_cursor = if result_ids.len() == limit {
+                let last_slot = *result_ids.last().unwrap() as u32;
+                let sort_field = self.sorts.get_field(&sort_clause.field);
+                sort_field.map(|sf| crate::query::CursorPosition {
+                    sort_value: sf.reconstruct_value(last_slot) as u64,
+                    slot_id: last_slot,
+                })
+            } else {
+                result_cursor
+            };
+
+            (result_ids, actual_cursor)
         } else {
             // No sort: return in descending slot order (newest first)
             self.slot_order_paginate(&filter_arc, limit, cursor)
@@ -272,19 +309,20 @@ impl<'a> QueryExecutor<'a> {
     }
 
     /// D5: Check bound cache and narrow candidates if a matching bound exists.
-    /// Returns (narrowed_candidates, did_use_bound).
+    /// Returns (narrowed_candidates, did_use_bound, escalated_tier).
+    /// `escalated_tier` is the tier to form a bound at if cursor was past all existing tiers.
     fn apply_bound_if_available(
         &self,
         candidates: &RoaringBitmap,
         cache_key: &Option<CacheKey>,
         sort_clause: &SortClause,
         cursor: Option<&crate::query::CursorPosition>,
-    ) -> (RoaringBitmap, bool) {
+    ) -> (RoaringBitmap, bool, u32) {
         let Some(bc_mutex) = self.bound_cache else {
-            return (candidates.clone(), false);
+            return (candidates.clone(), false, 0);
         };
         let Some(ref filter_key) = cache_key else {
-            return (candidates.clone(), false);
+            return (candidates.clone(), false, 0);
         };
 
         let mut try_key = BoundKey {
@@ -296,6 +334,7 @@ impl<'a> QueryExecutor<'a> {
 
         let mut bc = bc_mutex.lock();
         let max_tiers = 4u32;
+        let mut highest_exhausted_tier = 0u32;
         for _tier in 0..max_tiers {
             let Some(entry) = bc.lookup_mut(&try_key) else {
                 break;
@@ -317,6 +356,7 @@ impl<'a> QueryExecutor<'a> {
             };
 
             if cursor_past {
+                highest_exhausted_tier = try_key.tier + 1;
                 try_key = BoundKey {
                     filter_key: try_key.filter_key,
                     sort_field: try_key.sort_field,
@@ -328,26 +368,29 @@ impl<'a> QueryExecutor<'a> {
 
             entry.touch();
             let narrowed = candidates & entry.bitmap();
-            return (narrowed, true);
+            return (narrowed, true, 0);
         }
 
-        (candidates.clone(), false)
+        (candidates.clone(), false, highest_exhausted_tier.min(max_tiers - 1))
     }
 
     /// D2: Form or update a bound from sort results.
     /// Called after every sort query with promotion_threshold = 0.
+    /// `target_tier` is the tier to form/update — usually 0, but higher when
+    /// cursor pagination has exhausted lower tiers.
     fn form_or_update_bound(
         &self,
         bc_mutex: &parking_lot::Mutex<BoundCacheManager>,
         filter_key: &CacheKey,
         sort_clause: &SortClause,
         result_ids: &[i64],
+        target_tier: u32,
     ) {
         let bound_key = BoundKey {
             filter_key: filter_key.clone(),
             sort_field: sort_clause.field.clone(),
             direction: sort_clause.direction,
-            tier: 0,
+            tier: target_tier,
         };
 
         let sort_field = match self.sorts.get_field(&sort_clause.field) {
@@ -393,7 +436,31 @@ impl<'a> QueryExecutor<'a> {
         cursor: Option<&crate::query::CursorPosition>,
         use_simple_sort: bool,
     ) -> Result<QueryResult> {
-        let limit = limit.min(self.max_page_size);
+        self.execute_from_bitmap_inner(filter_bitmap, sort, limit.min(self.max_page_size), cursor, use_simple_sort)
+    }
+
+    /// Like execute_from_bitmap but without the max_page_size clamp.
+    /// Used internally for bound cache seeding where we need 10K+ results.
+    pub fn execute_from_bitmap_unclamped(
+        &self,
+        filter_bitmap: &RoaringBitmap,
+        sort: Option<&SortClause>,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+        use_simple_sort: bool,
+    ) -> Result<QueryResult> {
+        self.execute_from_bitmap_inner(filter_bitmap, sort, limit, cursor, use_simple_sort)
+    }
+
+    fn execute_from_bitmap_inner(
+        &self,
+        filter_bitmap: &RoaringBitmap,
+        sort: Option<&SortClause>,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+        use_simple_sort: bool,
+    ) -> Result<QueryResult> {
+        let limit = limit;
 
         // Filter bitmaps are kept clean (no stale bits from deleted docs),
         // so no alive AND is needed.
