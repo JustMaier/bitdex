@@ -44,6 +44,7 @@ fn test_deferred_alive_far_future_invisible() {
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
+                    sort_field: None,
                 }),
             },
             FilterFieldConfig {
@@ -115,6 +116,7 @@ fn test_deferred_alive_past_timestamp_visible() {
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
+                    sort_field: None,
                 }),
             },
             FilterFieldConfig {
@@ -173,6 +175,7 @@ fn test_mixed_deferred_and_immediate() {
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
+                    sort_field: None,
                 }),
             },
         ],
@@ -262,26 +265,7 @@ fn make_bucket_engine() -> (ConcurrentEngine, u64) {
             FilterFieldConfig {
                 name: "sortAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                behaviors: Some(bitdex_v2::config::FieldBehaviors {
-                    deferred_alive: false,
-                    range_buckets: vec![
-                        BucketConfig {
-                            name: "24h".to_string(),
-                            duration_secs: 86400,
-                            refresh_interval_secs: 1, // 1s refresh for fast tests
-                        },
-                        BucketConfig {
-                            name: "7d".to_string(),
-                            duration_secs: 604800,
-                            refresh_interval_secs: 1,
-                        },
-                        BucketConfig {
-                            name: "30d".to_string(),
-                            duration_secs: 2592000,
-                            refresh_interval_secs: 1,
-                        },
-                    ],
-                }),
+                behaviors: None,
             },
             FilterFieldConfig {
                 name: "category".to_string(),
@@ -295,6 +279,27 @@ fn make_bucket_engine() -> (ConcurrentEngine, u64) {
             encoding: "linear".to_string(),
             bits: 32,
         }],
+        time_buckets: Some(bitdex_v2::config::TimeBucketFieldConfig {
+            filter_field: "sortAt".to_string(),
+            sort_field: "sortAt".to_string(),
+            range_buckets: vec![
+                BucketConfig {
+                    name: "24h".to_string(),
+                    duration_secs: 86400,
+                    refresh_interval_secs: 1, // 1s refresh for fast tests
+                },
+                BucketConfig {
+                    name: "7d".to_string(),
+                    duration_secs: 604800,
+                    refresh_interval_secs: 1,
+                },
+                BucketConfig {
+                    name: "30d".to_string(),
+                    duration_secs: 2592000,
+                    refresh_interval_secs: 1,
+                },
+            ],
+        }),
         max_page_size: 1000,
         flush_interval_us: 50,
         merge_interval_ms: 100,
@@ -337,9 +342,17 @@ fn make_bucket_engine() -> (ConcurrentEngine, u64) {
     wait_for_flush(&engine, 10, 2000);
     assert_eq!(engine.alive_count(), 10);
 
-    // Wait for the flush thread to rebuild time buckets (needs at least one flush cycle
-    // after data is inserted for the bucket rebuild to run)
-    thread::sleep(Duration::from_millis(200));
+    // Wait for the flush thread to rebuild time buckets. Poll until the 24h bucket
+    // is populated (verifies all buckets rebuilt, since they share a refresh cycle).
+    let ts_24h = (now - 86400) as i64;
+    let filters_24h = vec![FilterClause::Gte("sortAt".to_string(), Value::Integer(ts_24h))];
+    for _ in 0..100 {
+        let result = engine.query(&filters_24h, None, 100).unwrap();
+        if result.ids.len() >= 3 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 
     (engine, now)
 }

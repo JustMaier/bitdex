@@ -41,12 +41,26 @@ impl TimeBucket {
     pub fn len(&self) -> u64 {
         self.bitmap.len()
     }
+
+    /// Add a slot to this bucket's bitmap (live maintenance on insert).
+    pub fn insert_slot(&mut self, slot: u32) {
+        self.bitmap.insert(slot);
+    }
+
+    /// Remove a slot from this bucket's bitmap (live maintenance on delete).
+    pub fn remove_slot(&mut self, slot: u32) {
+        self.bitmap.remove(slot);
+    }
 }
 
 /// Manages all time buckets for a single timestamp field.
 pub struct TimeBucketManager {
-    /// The sort field name this manager is associated with (e.g., "sortAt").
+    /// The filter field name this manager is associated with (e.g., "sortAtUnix").
+    /// Used to match Gte filter clauses for snapping.
     field_name: String,
+    /// The sort field name used for value reconstruction (e.g., "sortAt").
+    /// Defaults to field_name if not explicitly configured.
+    sort_field_name: String,
     /// Buckets keyed by name for fast lookup.
     buckets: HashMap<String, TimeBucket>,
     /// Bucket names sorted by duration (shortest first) for snapping.
@@ -55,6 +69,14 @@ pub struct TimeBucketManager {
 
 impl TimeBucketManager {
     pub fn new(field_name: String, bucket_configs: Vec<BucketConfig>) -> Self {
+        Self::new_with_sort_field(field_name.clone(), field_name, bucket_configs)
+    }
+
+    pub fn new_with_sort_field(
+        field_name: String,
+        sort_field_name: String,
+        bucket_configs: Vec<BucketConfig>,
+    ) -> Self {
         let mut buckets = HashMap::new();
         let mut sorted_names: Vec<String> = Vec::new();
 
@@ -77,6 +99,7 @@ impl TimeBucketManager {
 
         Self {
             field_name,
+            sort_field_name,
             buckets,
             sorted_names,
         }
@@ -127,6 +150,20 @@ impl TimeBucketManager {
         self.buckets.get(name)
     }
 
+    /// Swap in a pre-built bitmap for a bucket. Used by the lock-free rebuild path
+    /// where the bitmap is computed outside the lock, then swapped in briefly.
+    pub fn rebuild_bucket_from_bitmap(
+        &mut self,
+        bucket_name: &str,
+        bitmap: RoaringBitmap,
+        now: u64,
+    ) {
+        if let Some(bucket) = self.buckets.get_mut(bucket_name) {
+            bucket.bitmap = bitmap;
+            bucket.last_refreshed = now;
+        }
+    }
+
     /// Given a duration from a range filter (e.g., now - filter_value), find the closest bucket
     /// within `tolerance_pct` (as a fraction, e.g., 0.10 for 10%). Returns the bucket name.
     pub fn snap_duration(&self, duration_secs: u64, tolerance_pct: f64) -> Option<&str> {
@@ -153,6 +190,37 @@ impl TimeBucketManager {
         best_name
     }
 
+    /// Live maintenance: add a slot to all buckets whose time window includes the given timestamp.
+    /// Called on insert/upsert when the sort field value is known.
+    pub fn insert_slot(&mut self, slot: u32, timestamp: u64, now: u64) {
+        for bucket in self.buckets.values_mut() {
+            let cutoff = now.saturating_sub(bucket.duration_secs);
+            if timestamp >= cutoff && timestamp <= now {
+                bucket.insert_slot(slot);
+            }
+        }
+    }
+
+    /// Live maintenance: remove a slot from all buckets.
+    /// Called on delete — unconditionally removes from every bucket.
+    pub fn remove_slot(&mut self, slot: u32) {
+        for bucket in self.buckets.values_mut() {
+            bucket.remove_slot(slot);
+        }
+    }
+
+    /// Returns all bucket names (for forced rebuilds after lazy sort field loading).
+    pub fn bucket_names(&self) -> Vec<String> {
+        self.sorted_names.clone()
+    }
+
+    /// Reset all buckets' last_refreshed to 0, forcing a rebuild on the next periodic check.
+    pub fn force_refresh_due(&mut self) {
+        for bucket in self.buckets.values_mut() {
+            bucket.last_refreshed = 0;
+        }
+    }
+
     pub fn bucket_count(&self) -> usize {
         self.buckets.len()
     }
@@ -166,6 +234,11 @@ impl TimeBucketManager {
 
     pub fn field_name(&self) -> &str {
         &self.field_name
+    }
+
+    /// The sort field used for value reconstruction during bucket rebuilds.
+    pub fn sort_field_name(&self) -> &str {
+        &self.sort_field_name
     }
 }
 

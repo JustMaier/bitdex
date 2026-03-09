@@ -480,6 +480,12 @@ impl WriteCoalescer {
         &self.batch.alive_inserts
     }
 
+    /// Returns the slot IDs removed from the alive bitmap in this batch.
+    /// Used for time bucket live maintenance: deleted slots are removed from all buckets.
+    pub fn alive_removes(&self) -> &[u32] {
+        &self.batch.alive_removes
+    }
+
     /// Returns the filter insert entries from the prepared batch.
     /// Used by trie cache live updates to insert mutated slots into matching entries.
     pub fn filter_insert_entries(&self) -> &HashMap<FilterGroupKey, Vec<u32>> {

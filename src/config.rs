@@ -21,6 +21,12 @@ pub struct Config {
     #[serde(default)]
     pub sort_fields: Vec<SortFieldConfig>,
 
+    /// Time bucket configuration for pre-computed time range filters.
+    /// Decoupled from filter_fields to avoid creating per-value bitmaps
+    /// for high-cardinality timestamp fields.
+    #[serde(default)]
+    pub time_buckets: Option<TimeBucketFieldConfig>,
+
     /// Maximum results per query (hard cap).
     #[serde(default = "default_max_page_size")]
     pub max_page_size: usize,
@@ -78,6 +84,7 @@ impl Default for Config {
         Self {
             filter_fields: Vec::new(),
             sort_fields: Vec::new(),
+            time_buckets: None,
             max_page_size: default_max_page_size(),
             cache: CacheConfig::default(),
             autovac_interval_secs: default_autovac_interval(),
@@ -204,6 +211,46 @@ impl Config {
             }
         }
 
+        // Validate top-level time_buckets
+        if let Some(ref tb) = self.time_buckets {
+            if tb.filter_field.is_empty() {
+                return Err(BitdexError::Config(
+                    "time_buckets.filter_field must not be empty".to_string(),
+                ));
+            }
+            if tb.sort_field.is_empty() {
+                return Err(BitdexError::Config(
+                    "time_buckets.sort_field must not be empty".to_string(),
+                ));
+            }
+            let mut bucket_names = std::collections::HashSet::new();
+            for bucket in &tb.range_buckets {
+                if bucket.name.is_empty() {
+                    return Err(BitdexError::Config(
+                        "time_buckets: bucket name must not be empty".to_string(),
+                    ));
+                }
+                if !bucket_names.insert(&bucket.name) {
+                    return Err(BitdexError::Config(format!(
+                        "time_buckets: duplicate bucket name '{}'",
+                        bucket.name
+                    )));
+                }
+                if bucket.duration_secs == 0 {
+                    return Err(BitdexError::Config(format!(
+                        "time_buckets bucket '{}': duration_secs must be > 0",
+                        bucket.name
+                    )));
+                }
+                if bucket.refresh_interval_secs == 0 {
+                    return Err(BitdexError::Config(format!(
+                        "time_buckets bucket '{}': refresh_interval_secs must be > 0",
+                        bucket.name
+                    )));
+                }
+            }
+        }
+
         // Check for duplicate sort field names and validate bits
         let mut sort_names = std::collections::HashSet::new();
         for s in &self.sort_fields {
@@ -322,6 +369,12 @@ pub struct FieldBehaviors {
     /// Pre-computed range buckets for this field (e.g., "24h", "7d", "30d").
     #[serde(default)]
     pub range_buckets: Vec<BucketConfig>,
+    /// Sort field to use for time bucket value reconstruction.
+    /// If not set, defaults to the filter field name itself.
+    /// Useful when the filter field name differs from the sort field name
+    /// (e.g., filter="sortAtUnix" but sort="sortAt").
+    #[serde(default)]
+    pub sort_field: Option<String>,
 }
 
 /// Configuration for a single time range bucket.
@@ -333,6 +386,23 @@ pub struct BucketConfig {
     pub duration_secs: u64,
     /// How often to rebuild this bucket's bitmap, in seconds.
     pub refresh_interval_secs: u64,
+}
+
+/// Top-level time bucket configuration.
+/// Maps a filter clause field name to a sort field for value reconstruction,
+/// with pre-computed range buckets. This is separate from filter_fields
+/// because timestamp fields are extremely high-cardinality and would create
+/// millions of per-value bitmaps if registered as regular filter fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeBucketFieldConfig {
+    /// The field name used in filter clauses (e.g., "sortAtUnix").
+    /// Gte/Gt clauses targeting this field will be snapped to the nearest bucket.
+    pub filter_field: String,
+    /// The sort field to use for value reconstruction during bucket rebuilds.
+    /// Must reference a registered sort field (e.g., "sortAt").
+    pub sort_field: String,
+    /// Pre-computed range buckets.
+    pub range_buckets: Vec<BucketConfig>,
 }
 
 /// Configuration for a single sort field.
@@ -976,6 +1046,7 @@ field_type = "single_value"
                 behaviors: Some(FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
+                    sort_field: None,
                 }),
             }],
             ..Config::default()
@@ -1004,6 +1075,7 @@ field_type = "single_value"
                             refresh_interval_secs: 60,
                         },
                     ],
+                    sort_field: None,
                 }),
             }],
             ..Config::default()
@@ -1025,6 +1097,7 @@ field_type = "single_value"
                         duration_secs: 0,
                         refresh_interval_secs: 60,
                     }],
+                    sort_field: None,
                 }),
             }],
             ..Config::default()
@@ -1046,6 +1119,7 @@ field_type = "single_value"
                         duration_secs: 86400,
                         refresh_interval_secs: 0,
                     }],
+                    sort_field: None,
                 }),
             }],
             ..Config::default()
@@ -1067,6 +1141,7 @@ field_type = "single_value"
                         duration_secs: 604800,
                         refresh_interval_secs: 300,
                     }],
+                    sort_field: None,
                 }),
             }],
             ..Config::default()

@@ -177,22 +177,14 @@ impl ConcurrentEngine {
         )));
         let loading_mode = Arc::new(AtomicBool::new(false));
 
-        // S3.3: Instantiate TimeBucketManager if any filter field has range_buckets configured
-        let time_buckets = {
-            let mut tb: Option<TimeBucketManager> = None;
-            for fc in &config.filter_fields {
-                if let Some(ref behaviors) = fc.behaviors {
-                    if !behaviors.range_buckets.is_empty() {
-                        tb = Some(TimeBucketManager::new(
-                            fc.name.clone(),
-                            behaviors.range_buckets.clone(),
-                        ));
-                        break; // Only one field can have range buckets
-                    }
-                }
-            }
-            tb.map(|m| Arc::new(parking_lot::Mutex::new(m)))
-        };
+        // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
+        let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
+            Arc::new(parking_lot::Mutex::new(TimeBucketManager::new_with_sort_field(
+                tb_config.filter_field.clone(),
+                tb_config.sort_field.clone(),
+                tb_config.range_buckets.clone(),
+            )))
+        });
 
         let inner_engine = InnerEngine {
             slots,
@@ -282,6 +274,15 @@ impl ConcurrentEngine {
                             LazyLoad::SortField { name, layers } => {
                                 if let Some(sf) = staging.sorts.get_field_mut(&name) {
                                     sf.load_layers(layers);
+                                    // If time buckets use this sort field, force a rebuild on the
+                                    // next periodic check (don't rebuild inline — iterating 100M+
+                                    // slots while holding the lock would block queries).
+                                    if let Some(ref tb_arc) = flush_time_buckets {
+                                        let mut tb = tb_arc.lock();
+                                        if tb.sort_field_name() == name {
+                                            tb.force_refresh_due();
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -382,6 +383,32 @@ impl ConcurrentEngine {
                                 }
                             }
 
+                            // Live maintenance for time buckets: add newly-alive slots to
+                            // qualifying buckets, remove deleted slots from all buckets.
+                            if let Some(ref tb_arc) = flush_time_buckets {
+                                let alive_inserts = coalescer.alive_inserts();
+                                let alive_removes = coalescer.alive_removes();
+                                if !alive_inserts.is_empty() || !alive_removes.is_empty() {
+                                    let now_secs = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let mut tb = tb_arc.lock();
+                                    if !alive_inserts.is_empty() {
+                                        let sort_field_name = tb.sort_field_name().to_string();
+                                        if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
+                                            for &slot in alive_inserts {
+                                                let ts = sort_field.reconstruct_value(slot) as u64;
+                                                tb.insert_slot(slot, ts, now_secs);
+                                            }
+                                        }
+                                    }
+                                    for &slot in alive_removes {
+                                        tb.remove_slot(slot);
+                                    }
+                                }
+                            }
+
                             // Cache maintenance: live updates for Eq entries, invalidation for the rest.
                             if coalescer.has_alive_mutations() {
                                 // Alive changed — invalidate all filter fields because NotEq/Not
@@ -474,34 +501,6 @@ impl ConcurrentEngine {
                                     field.merge_dirty();
                                 }
                             }
-                            // Periodic time bucket refresh: rebuild any buckets whose
-                            // refresh interval has elapsed. Uses the staging snapshot's
-                            // alive bitmap and sort field to iterate (slot, timestamp) pairs.
-                            if let Some(ref tb_arc) = flush_time_buckets {
-                                let now_secs = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-                                let mut tb = tb_arc.lock();
-                                let due = tb.refresh_due(now_secs);
-                                if !due.is_empty() {
-                                    let field_name = tb.field_name().to_string();
-                                    let due_names: Vec<String> = due.iter().map(|s| s.to_string()).collect();
-                                    if let Some(sort_field) = staging.sorts.get_field(&field_name) {
-                                        let alive = staging.slots.alive_bitmap();
-                                        for bucket_name in &due_names {
-                                            let iter = alive.iter().map(|slot| {
-                                                (slot, sort_field.reconstruct_value(slot) as u64)
-                                            });
-                                            tb.rebuild_bucket(bucket_name, iter, now_secs);
-                                        }
-                                        // Invalidate trie cache entries referencing the bucket field
-                                        // so queries re-snap with the freshly rebuilt bucket bitmaps.
-                                        cache.lock().invalidate_field(&field_name);
-                                    }
-                                }
-                            }
-
                             flush_cycle += 1;
 
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
@@ -532,6 +531,83 @@ impl ConcurrentEngine {
                     // ensure_loaded() on the query thread.
                     if lazy_loaded && bitmap_count == 0 && !is_loading {
                         inner.store(Arc::new(staging.clone()));
+                    }
+
+                    // Periodic time bucket refresh: runs independently of mutations since
+                    // bucket validity is time-based (e.g., items age out of the 24h window).
+                    // Must run even at idle to keep buckets fresh after restore from disk.
+                    //
+                    // Lock strategy: brief lock to check what's due + get config, then release
+                    // lock while iterating 100M+ slots to build bitmaps, then brief lock to swap.
+                    if !is_loading {
+                        if let Some(ref tb_arc) = flush_time_buckets {
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+
+                            // Brief lock: check which buckets need refresh and get their durations
+                            let rebuild_info: Vec<(String, u64)> = {
+                                let tb = tb_arc.lock();
+                                let due = tb.refresh_due(now_secs);
+                                if due.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    due.iter()
+                                        .filter_map(|name| {
+                                            tb.get_bucket(name).map(|b| (name.to_string(), b.duration_secs))
+                                        })
+                                        .collect()
+                                }
+                            }; // lock released
+
+                            if !rebuild_info.is_empty() {
+                                let tb_lock = tb_arc.lock();
+                                let sort_field_name = tb_lock.sort_field_name().to_string();
+                                let field_name = tb_lock.field_name().to_string();
+                                drop(tb_lock); // release before heavy work
+
+                                if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
+                                    let alive = staging.slots.alive_bitmap();
+                                    let start = std::time::Instant::now();
+
+                                    // Single pass: compute cutoffs, build all bitmaps simultaneously
+                                    let cutoffs: Vec<u64> = rebuild_info.iter()
+                                        .map(|(_, dur)| now_secs.saturating_sub(*dur))
+                                        .collect();
+                                    let mut bitmaps: Vec<roaring::RoaringBitmap> = (0..rebuild_info.len())
+                                        .map(|_| roaring::RoaringBitmap::new())
+                                        .collect();
+
+                                    for slot in alive.iter() {
+                                        let ts = sort_field.reconstruct_value(slot) as u64;
+                                        if ts <= now_secs {
+                                            for (i, cutoff) in cutoffs.iter().enumerate() {
+                                                if ts >= *cutoff {
+                                                    bitmaps[i].insert(slot);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let elapsed = start.elapsed();
+
+                                    // Brief lock: swap in the new bitmaps
+                                    {
+                                        let mut tb = tb_arc.lock();
+                                        for (i, (bucket_name, _)) in rebuild_info.iter().enumerate() {
+                                            let count = bitmaps[i].len();
+                                            tb.rebuild_bucket_from_bitmap(
+                                                bucket_name,
+                                                std::mem::take(&mut bitmaps[i]),
+                                                now_secs,
+                                            );
+                                        }
+                                    }
+                                    cache.lock().invalidate_field(&field_name);
+                                }
+                            }
+                        }
                     }
 
                     // Phase 3: Drain docstore channel and batch write

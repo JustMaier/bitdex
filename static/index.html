@@ -333,6 +333,16 @@
       <label>Page Size</label>
       <input type="number" id="limit" value="40" min="1" max="200" style="width:70px">
     </div>
+    <div class="field">
+      <label>Time Range</label>
+      <select id="f-timeRange">
+        <option value="" selected>All Time</option>
+        <option value="24h">Last 24h</option>
+        <option value="7d">Last 7 days</option>
+        <option value="30d">Last 30 days</option>
+        <option value="1y">Last year</option>
+      </select>
+    </div>
   </div>
 </div>
 
@@ -452,6 +462,14 @@ function buildQuery(cursor) {
   for (const field of ['hasMeta', 'onSite', 'poi', 'minor']) {
     const val = document.getElementById('f-' + field).value;
     if (val) filters.push({ Eq: [field, { Bool: val === 'true' }] });
+  }
+
+  // Time range filter — sends Gte on publishedAtUnix, snapped to time buckets server-side
+  const timeRange = document.getElementById('f-timeRange').value;
+  if (timeRange) {
+    const durations = { '24h': 86400, '7d': 604800, '30d': 2592000, '1y': 31536000 };
+    const cutoff = Math.floor(Date.now() / 1000) - durations[timeRange];
+    filters.push({ Gte: ['sortAtUnix', { Integer: cutoff }] });
   }
 
   const sortField = document.getElementById('sort-field').value;
@@ -752,7 +770,7 @@ function onFilterChange() {
 
 // Attach live-update listeners to all filter controls
 function attachListeners() {
-  const selectIds = ['f-type', 'f-baseModel', 'f-hasMeta', 'f-onSite', 'f-poi', 'f-minor', 'sort-field', 'sort-dir'];
+  const selectIds = ['f-type', 'f-baseModel', 'f-hasMeta', 'f-onSite', 'f-poi', 'f-minor', 'sort-field', 'sort-dir', 'f-timeRange'];
   const inputIds = ['f-tagIds', 'f-userId', 'f-modelVersionIds', 'f-toolIds', 'f-techniqueIds', 'limit'];
 
   for (const id of selectIds) {
