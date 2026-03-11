@@ -1331,6 +1331,7 @@ impl ConcurrentEngine {
         let fetch_limit = query.limit.saturating_add(offset);
 
         // Execute with ORIGINAL sort — bound narrows candidates only.
+        let bound_was_applied = effective_bitmap.len() < filter_arc.len();
         let mut result = executor.execute_from_bitmap(
             &effective_bitmap,
             query.sort.as_ref(),
@@ -1338,6 +1339,20 @@ impl ConcurrentEngine {
             query.cursor.as_ref(),
             use_simple,
         )?;
+
+        // Bound exhaustion retry: if the bound-narrowed bitmap returned 0 results
+        // but we have a cursor (meaning there should be more), retry with the full
+        // filter bitmap. This happens when the bound (global top-K) has a small
+        // intersection with a restrictive filter (e.g. 30-day time bucket).
+        if result.ids.is_empty() && query.cursor.is_some() && bound_was_applied {
+            result = executor.execute_from_bitmap(
+                &filter_arc,
+                query.sort.as_ref(),
+                fetch_limit,
+                query.cursor.as_ref(),
+                use_simple_sort,
+            )?;
+        }
 
         // Override total_matched with the accurate count from the full filter bitmap.
         // execute_from_bitmap computes total_matched from the possibly-narrowed bitmap,
