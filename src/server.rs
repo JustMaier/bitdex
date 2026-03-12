@@ -183,6 +183,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
             .route("/api/indexes/{name}/stats", get(handle_stats))
+            .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             // Utility
             .route("/api/health", get(handle_health))
             // Serve static UI
@@ -840,6 +841,7 @@ async fn handle_stats(
     };
 
     let (bound_entries, bound_bytes, meta_entries, meta_bytes) = engine.bound_cache_stats();
+    let uc = engine.unified_cache_stats();
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
@@ -847,7 +849,32 @@ async fn handle_stats(
         "bound_cache_bytes": bound_bytes,
         "meta_index_entries": meta_entries,
         "meta_index_bytes": meta_bytes,
+        "unified_cache_entries": uc.entries,
+        "unified_cache_hits": uc.hits,
+        "unified_cache_misses": uc.misses,
+        "unified_cache_bytes": uc.memory_bytes,
     })).into_response()
+}
+
+async fn handle_clear_cache(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    engine.clear_unified_cache();
+    Json(serde_json::json!({"cleared": true})).into_response()
 }
 
 // ---------------------------------------------------------------------------

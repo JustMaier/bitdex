@@ -21,5 +21,6 @@ pub mod slot;
 pub mod sort;
 pub mod time_buckets;
 pub mod types;
+pub mod unified_cache;
 pub mod versioned_bitmap;
 pub mod write_coalescer;

@@ -23,6 +23,7 @@ use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
+use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedKey};
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 
 /// Lazy-load request sent from query threads to the flush thread.
@@ -92,6 +93,8 @@ pub struct ConcurrentEngine {
     lazy_tx: Sender<LazyLoad>,
     /// Reverse string maps for MappedString field query resolution.
     string_maps: Option<Arc<StringMaps>>,
+    /// Unified cache: replaces trie cache + bound cache (migration phase).
+    unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
 }
 
 impl ConcurrentEngine {
@@ -175,6 +178,9 @@ impl ConcurrentEngine {
             config.cache.bound_max_size,
             config.cache.bound_max_count,
         )));
+        let unified_cache = Arc::new(parking_lot::Mutex::new(UnifiedCache::new(
+            UnifiedCacheConfig::default(),
+        )));
         let loading_mode = Arc::new(AtomicBool::new(false));
 
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
@@ -233,6 +239,7 @@ impl ConcurrentEngine {
             let flush_interval_us = config.flush_interval_us;
             let field_names = filter_field_names;
             let flush_bound_cache = Arc::clone(&bound_cache);
+            let flush_unified_cache = Arc::clone(&unified_cache);
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
             let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
@@ -492,6 +499,36 @@ impl ConcurrentEngine {
                                 }
                             }
 
+                            // Unified cache live maintenance.
+                            // Runs after bitmap mutations are applied to staging.
+                            {
+                                let mut uc = flush_unified_cache.lock();
+                                if !uc.is_empty() {
+                                    if coalescer.has_alive_mutations() {
+                                        uc.maintain_alive_changes();
+                                    } else {
+                                        // Filter maintenance
+                                        if !coalescer.mutated_filter_fields().is_empty() {
+                                            uc.maintain_filter_changes(
+                                                coalescer.filter_insert_entries(),
+                                                coalescer.filter_remove_entries(),
+                                                &staging.filters,
+                                                &staging.sorts,
+                                            );
+                                        }
+                                        // Sort maintenance
+                                        let sort_mutations = coalescer.mutated_sort_slots();
+                                        if !sort_mutations.is_empty() {
+                                            uc.maintain_sort_changes(
+                                                &sort_mutations,
+                                                &staging.filters,
+                                                &staging.sorts,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
                             // Periodic filter diff compaction: merge dirty diffs into
                             // bases so apply_diff/fused don't accumulate unbounded diffs.
                             // Runs every COMPACTION_INTERVAL flush cycles (~5s).
@@ -521,6 +558,7 @@ impl ConcurrentEngine {
                             c.invalidate_field(name);
                         }
                         drop(c);
+                        flush_unified_cache.lock().clear();
                         inner.store(Arc::new(staging.clone()));
                         staging_dirty = false;
                     }
@@ -592,11 +630,21 @@ impl ConcurrentEngine {
 
                                     let elapsed = start.elapsed();
 
-                                    // Brief lock: swap in the new bitmaps
+                                    // Brief lock: capture old bitmaps, swap in new ones
+                                    let mut bucket_diffs: Vec<(String, RoaringBitmap, RoaringBitmap)> = Vec::new();
                                     {
                                         let mut tb = tb_arc.lock();
                                         for (i, (bucket_name, _)) in rebuild_info.iter().enumerate() {
-                                            let count = bitmaps[i].len();
+                                            // Capture old bitmap for diff computation
+                                            let old_bm = tb.get_bucket(bucket_name)
+                                                .map(|b| b.bitmap().clone())
+                                                .unwrap_or_default();
+                                            let new_bm = &bitmaps[i];
+                                            let dropped = &old_bm - new_bm;
+                                            let added = new_bm - &old_bm;
+                                            if !dropped.is_empty() || !added.is_empty() {
+                                                bucket_diffs.push((bucket_name.clone(), dropped, added));
+                                            }
                                             tb.rebuild_bucket_from_bitmap(
                                                 bucket_name,
                                                 std::mem::take(&mut bitmaps[i]),
@@ -605,6 +653,23 @@ impl ConcurrentEngine {
                                         }
                                     }
                                     cache.lock().invalidate_field(&field_name);
+
+                                    // Push bucket diffs to unified cache
+                                    if !bucket_diffs.is_empty() {
+                                        let mut uc = flush_unified_cache.lock();
+                                        if !uc.is_empty() {
+                                            for (bucket_name, dropped, added) in &bucket_diffs {
+                                                uc.maintain_bucket_changes(
+                                                    &field_name,
+                                                    bucket_name,
+                                                    dropped,
+                                                    added,
+                                                    &staging.filters,
+                                                    &staging.sorts,
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -769,6 +834,7 @@ impl ConcurrentEngine {
             lazy_value_fields,
             lazy_tx,
             string_maps: None,
+            unified_cache,
         })
     }
 
@@ -1299,7 +1365,35 @@ impl ConcurrentEngine {
         // so no alive AND is needed.
         let full_total_matched = filter_arc.len();
 
-        // D5: Narrow filter bitmap with bound cache.
+        // Unified cache lookup: check for a cached bounded bitmap that combines
+        // filter + sort. On hit, skip the separate bound cache narrowing step.
+        // Only for sorted queries above min_filter_size threshold.
+        let (unified_key, unified_hit) = if let Some(sort_clause) = query.sort.as_ref() {
+            let mut uc = self.unified_cache.lock();
+            let min_size = uc.config().min_filter_size as u64;
+            if full_total_matched >= min_size {
+                if let Some(clauses) = cache::canonicalize(&query.filters) {
+                    let ukey = UnifiedKey {
+                        filter_clauses: clauses,
+                        sort_field: sort_clause.field.clone(),
+                        direction: sort_clause.direction,
+                    };
+                    let hit = uc.lookup(&ukey).map(|entry| {
+                        let bm = entry.bitmap().as_ref().clone();
+                        (bm, entry.has_more())
+                    });
+                    (Some(ukey), hit)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // D5: Narrow filter bitmap with bound cache (skipped on unified cache hit).
         // Synthesize implicit "__slot__" sort for filter-only queries.
         let implicit_sort;
         let bound_sort = match query.sort.as_ref() {
@@ -1312,14 +1406,22 @@ impl ConcurrentEngine {
                 Some(&implicit_sort)
             }
         };
-        let (effective_bitmap, use_simple, cache_key) = self.apply_bound(
-            &executor,
-            &filter_arc,
-            use_simple_sort,
-            bound_sort,
-            &query.filters,
-            query.cursor.as_ref(),
-        );
+
+        let (effective_bitmap, use_simple, cache_key) = if let Some((ref unified_bm, _)) = unified_hit {
+            // Unified cache hit — use bounded bitmap directly, AND with filter for freshness
+            let narrowed = &filter_arc.as_ref().clone() & unified_bm;
+            (narrowed, false, cache::canonicalize(&query.filters))
+        } else {
+            // Unified cache miss — fall through to existing bound cache path
+            self.apply_bound(
+                &executor,
+                &filter_arc,
+                use_simple_sort,
+                bound_sort,
+                &query.filters,
+                query.cursor.as_ref(),
+            )
+        };
 
         // Offset pagination: if offset is set and no cursor, request offset+limit results
         // then drop the first `offset` items. Cursor takes precedence over offset.
@@ -1393,6 +1495,27 @@ impl ConcurrentEngine {
             &filter_arc,
             &executor,
         );
+
+        // Unified cache formation: on miss with sort results, store the bounded
+        // bitmap for future queries with the same filter + sort combination.
+        if unified_hit.is_none() {
+            if let Some(ukey) = unified_key {
+                if !result.ids.is_empty() {
+                    let sort_field = snap.sorts.get_field(&ukey.sort_field);
+                    let sorted_slots: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
+                    let has_more = full_total_matched > sorted_slots.len() as u64;
+                    let value_fn = |slot: u32| -> u32 {
+                        sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                    };
+                    self.unified_cache.lock().form_and_store(
+                        ukey,
+                        &sorted_slots,
+                        has_more,
+                        value_fn,
+                    );
+                }
+            }
+        }
 
         self.post_validate(&mut result, &query.filters, &executor)?;
 
@@ -1872,9 +1995,20 @@ impl ConcurrentEngine {
         (bound_entries, bound_bytes, meta_entries, meta_bytes)
     }
 
+    /// Return unified cache stats (entries, hits, misses, memory).
+    pub fn unified_cache_stats(&self) -> crate::unified_cache::UnifiedCacheStats {
+        self.unified_cache.lock().stats()
+    }
+
+    /// Clear unified cache entries and reset counters.
+    pub fn clear_unified_cache(&self) {
+        self.unified_cache.lock().clear();
+    }
+
     /// Clear all bound cache entries (for benchmarking cold vs warm).
     pub fn clear_bound_cache(&self) {
         self.bound_cache.lock().clear();
+        self.unified_cache.lock().clear();
     }
 
     /// Enter loading mode: skip snapshot publishing and maintenance during bulk inserts.

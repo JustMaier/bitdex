@@ -7,7 +7,7 @@ Bitdex is a purpose-built, in-memory bitmap index engine written in Rust. Its pr
 **In:** Filter predicates + sort field + sort direction + limit
 **Out:** Ordered `Vec<i64>` of IDs
 
-Documents are stored on disk (via an embedded key-value store like redb) keyed by slot ID. This serves two purposes: (1) enabling efficient targeted bitmap updates on upsert by diffing old vs new field values, and (2) optionally serving document content alongside query results. Full-text search happens downstream.
+Documents are stored on disk via a custom sharded filesystem store keyed by slot ID. This serves two purposes: (1) enabling efficient targeted bitmap updates on upsert by diffing old vs new field values, and (2) optionally serving document content alongside query results. Full-text search happens downstream.
 
 ---
 
@@ -17,7 +17,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 1. **Bitmaps are the index.** All filtering and sorting is done via roaring bitmap operations. No Vecs for column storage. No skip lists. No sorted arrays. No forward maps. No reverse indexes as index structures.
 
-2. **Documents are stored on disk.** An embedded key-value store (redb) stores documents keyed by slot ID. On upsert, the old document is read from disk, diffed against the new one, and only the changed bitmaps are updated. This makes writes O(changed fields) instead of O(all bitmaps). Documents can also be served alongside query results.
+2. **Documents are stored on disk.** A custom sharded filesystem store persists documents keyed by slot ID. On upsert, the old document is read from disk, diffed against the new one, and only the changed bitmaps are updated. This makes writes O(changed fields) instead of O(all bitmaps). Documents can also be served alongside query results.
 
 3. **No sorted data structures.** No sorted Vecs, no skip lists, no B-trees for maintaining sort order. Sorting is done via bit-layer bitmap traversal. Period.
 
@@ -48,8 +48,9 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 ### Document Store
 
-- Embedded key-value store on disk (redb) keyed by slot ID
-- Stores the full document fields (filter values, sort values, multi-value arrays)
+- Custom sharded filesystem store (`src/docstore.rs`) keyed by slot ID
+- Documents grouped into shard files (512 docs/shard), zstd-compressed msgpack with per-field dictionary encoding
+- Hex-nested directory structure keeps each dir under ~1000 files at 105M+ scale
 - On PUT upsert: read old doc from disk, diff old vs new, update only changed bitmaps
 - On fresh insert (slot not alive): write doc to disk, set bitmaps directly — no diff needed
 - On DELETE: clear alive bit (doc stays on disk until autovac cleans it)
@@ -106,7 +107,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 ### Architecture & Design Docs
 
-- **ArcSwap + Redb Reconciliation**: `docs/design-arcswap-redb-reconciliation.md` — How the ArcSwap snapshot architecture and redb persistence layer work together. Two-tier storage (Tier 1 in-memory, Tier 2 moka-over-redb), startup sequence, and memory budget analysis.
+- **ArcSwap + Storage Reconciliation**: `docs/design-arcswap-redb-reconciliation.md` — How the ArcSwap snapshot architecture and filesystem persistence layer work together. Two-tier storage (Tier 1 in-memory, Tier 2 on-disk via BitmapFs + DocStore), startup sequence, and memory budget analysis.
 - **Performance & Persistence Roadmap**: `docs/roadmap-performance-and-persistence.md` — Full implementation roadmap (Prereq→A→B→C→D→E phases) with detailed task breakdowns for bitmap persistence, sort-by-slot, time handling, bound caches, and meta-index.
 - **Architecture Risk Review**: `docs/architecture-risk-review.md` — Risk analysis of architectural decisions and mitigations.
 - **Backpressure Design**: `docs/design-backpressure-implementation.md` — Backpressure and auto-throttle design for the write pipeline.
@@ -134,7 +135,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 Slot allocation, alive bitmap, filter bitmaps, sort layer bitmaps, mutation API (PUT/PATCH/DELETE/DELETE WHERE), query execution, JSON query parser, config loading. Full test coverage.
 
 ### Phase 2: Persistence — PARTIAL
-On-disk document store via redb (commit 8e3c54a). Stores documents keyed by slot ID for upsert diffing. WAL, snapshot serialization, and sidecar snapshot builder are NOT yet implemented.
+Custom filesystem storage: BitmapFs for bitmap persistence (hex-bucketed pack files), sharded DocStore for documents (zstd-compressed msgpack). WAL and sidecar snapshot builder are NOT yet implemented.
 
 ### Phase 3: Performance — COMPLETE (commits 95df2a5 through bdccbe2)
 - Cardinality-based query planning (planner.rs)
@@ -192,9 +193,9 @@ Full results: `docs/benchmark-report.md`, `docs/benchmark-comparison-loading-mod
 | **Total bitmap memory** | **~9.3 GB** |
 | **Total RSS** | **~17.4 GB** |
 
-Within the original 7-11 GB bitmap target. RSS overhead is ~48% from redb + allocator.
+Within the original 7-11 GB bitmap target. RSS overhead is ~48% from allocator + OS page cache.
 
-Document store on disk (redb): ~6 GB at 100M records.
+Document store on disk: ~6 GB at 100M records.
 
 ---
 
